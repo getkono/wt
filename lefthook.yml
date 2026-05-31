@@ -1,0 +1,31 @@
+# Lefthook git hooks — https://github.com/evilmartians/lefthook
+#
+# pre-commit auto-fixes formatting and linting; pre-push is the final gate
+# (checks + tests + coverage). cargo fmt/clippy operate on the whole workspace,
+# so the glob only triggers the command when .rs files are staged — no file
+# arguments are passed.
+
+pre-commit:
+  piped: true # run format-fix, then lint-fix (formatting can affect lint output)
+  commands:
+    format-fix:
+      priority: 1
+      glob: "**/*.rs"
+      stage_fixed: true # re-stage files modified by the fix
+      run: just format
+    lint-fix:
+      priority: 2
+      glob: "**/*.rs"
+      stage_fixed: true
+      run: just lint-fix
+
+pre-push:
+  commands:
+    format-check:
+      run: just format-check
+    lint-check:
+      run: just lint
+    test:
+      run: just test
+    coverage:
+      run: just coverage
