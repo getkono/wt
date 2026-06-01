@@ -7,6 +7,7 @@
 
 mod parse;
 mod schema;
+pub mod wtconfig;
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,7 @@ use crate::error::{Error, Result};
 
 pub use parse::parse_layer;
 pub use schema::{Config, ConfigLayer};
+pub use wtconfig::WtMeta;
 
 /// The path to the global `config.toml`, honoring `$XDG_CONFIG_HOME` and falling
 /// back to the platform config directory. `None` only if no home directory can
