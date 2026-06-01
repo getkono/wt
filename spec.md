@@ -1,7 +1,16 @@
 # `wt` — Git Worktree Manager
 
-**Version:** 1.0 (specification)
+**Version:** 1.1 (specification)
 **Status:** Requirements specification — defines *what* `wt` must do, not *how* to implement it.
+
+> **Changelog — 1.1:** consistency pass. Closed audit findings: unified TUI
+> keybinding action names (§10/§11), named the per-repo config file `.wt.toml`,
+> enumerated `list.columns` identifiers and `pr.state` values, defined exit code `3`
+> (ambiguous query / nothing selected), fixed `status --all --json` to be
+> newline-delimited, specified JSON values for detached-HEAD and missing worktrees,
+> defined hook shell/env/failure semantics, paging, color precedence, the copy source,
+> `prune --gone` offline behavior, and the `new`/`pr`/`switch` `--json` vs path-only
+> contract.
 
 ---
 
@@ -130,14 +139,24 @@ A child process cannot change its parent shell's working directory. Navigation i
 therefore the one feature that requires shell integration, and the contract below
 is a hard requirement.
 
-- **Output discipline:** for navigation commands, `wt` prints **only the resolved
-  absolute path** to **stdout**, and nothing else. All human-facing UI, prompts,
-  the TUI, logs, and errors go to **stderr**. This lets a shell wrapper safely
-  `cd "$(...)"`.
+- **Navigation commands** are the subset that exist to move the shell: `switch`,
+  `new`, `pr`, and any TUI launch (`wt` with no subcommand, `wt ui`, `wt tui`). For
+  these, `wt` prints **only the resolved absolute path** to **stdout**, and nothing
+  else. All human-facing UI, prompts, the TUI, logs, and errors go to **stderr**. This
+  lets a shell wrapper safely `cd "$(...)"`.
+- **Data commands** (`list`, `status`, `path`, `root`, `config`, …) also write their
+  result to stdout, but the wrapper does **not** `cd` into it — `path` and `root` are
+  scripting helpers, not navigation. The wrapper distinguishes the two sets by
+  subcommand name.
+- **`--json` suppresses `cd`.** When a navigation command is invoked with `--json`
+  (only `new`/`pr` accept it; see §7), it emits a JSON object to stdout instead of a
+  bare path, and the wrapper must not `cd`. `switch`, `path`, and `root` do not accept
+  `--json`.
 - **`wt shell-init <shell>`** prints a shell snippet the user sources from their
   rc file. The snippet defines a `wt` shell function that:
-  - intercepts navigation subcommands (`switch`, the no-arg TUI launch) and the
-    selection result, capturing stdout and running `cd` into it on success;
+  - intercepts the navigation subcommands above, capturing stdout and running `cd`
+    into it on success (exit code `0` with a non-empty path; see §12 — exit `3` or an
+    empty path means "nothing selected", so the wrapper must not `cd`);
   - passes every other subcommand straight through to the binary unchanged;
   - wires up completion (§9).
 - The underlying binary must remain fully usable without the wrapper; only the
@@ -158,7 +177,9 @@ default: {repo_parent}/{repo}.worktrees/{branch_slug}
 
 Available template variables: `{repo_parent}` (dir containing the repo root),
 `{repo}` (repo directory name), `{repo_root}`, `{branch}` (raw), `{branch_slug}`,
-`{home}`.
+`{home}`. For a **bare** repo these resolve against the bare repository's own
+directory: `{repo_root}` is the bare repo path, `{repo}` its directory name, and
+`{repo_parent}` its containing directory.
 
 Common presets the docs should call out:
 - **Sibling (default):** `{repo_parent}/{repo}.worktrees/{branch_slug}`
@@ -167,8 +188,16 @@ Common presets the docs should call out:
 
 Requirements:
 - Creating a worktree must create intermediate directories as needed.
-- A collision (target path exists) is an error unless the path already *is* the
-  worktree for that branch (idempotent no-op, reported as such).
+- **Collision handling** when the rendered target path already exists:
+  - It already *is* the worktree for this same branch → idempotent no-op, reported as
+    such (exit `0`).
+  - It is another branch's worktree, or a plain (non-worktree) directory/file → first
+    attempt to disambiguate by appending `-<short-hash>` (the short commit hash of the
+    base ref) to the `{branch_slug}` segment; if that path is *also* occupied, fail
+    with an error naming the conflicting path.
+  - This also covers two distinct branch names that normalize to the same slug (e.g.
+    `feature/login` and `feature_login`): the second one created gets the
+    `-<short-hash>` suffix.
 - Reject templates that would place a worktree inside the `.git` directory.
 - The store layout governs only creation. Listing, status, switch, and remove must
   work for worktrees at any location, including the primary worktree and ones made
@@ -178,11 +207,29 @@ Requirements:
 
 ## 7. CLI Command Surface
 
-General conventions: every command accepts `--json` for machine-readable output
-(except where it makes no sense), `-h/--help`, and respects config + flags (flags
-win). Commands that resolve a worktree accept a **query** that matches by branch
-name, slug, directory name, or unambiguous prefix; an ambiguous query lists the
-candidates and exits non-zero (or, if interactive, opens the picker).
+General conventions: most commands accept `--json` for machine-readable output,
+`-h/--help`, and respect config + flags (flags win).
+
+**`--json` support is per command:**
+
+| `--json` supported | `--json` rejected (errors, or no effect) |
+|--------------------|-------------------------------------------|
+| `list`, `status`, `pr list`, `prune` (reports the candidate/removed set), `config list`, `new`, `pr`, `remove` | `switch`, `path`, `root`, `completions`, `shell-init`, `ui`/`tui`, `init` |
+
+`new`, `pr`, and `remove` emit a single result object (the affected worktree's
+`list`-row schema, plus a `removed: true` flag for `remove`) rather than human text;
+for `new`/`pr` this replaces the bare path on stdout and tells the shell wrapper not to
+`cd` (§5).
+
+**Query resolution.** Commands that resolve a worktree accept a **query** matched in
+this precedence order, first non-empty tier wins:
+1. exact branch name, then exact slug, then exact directory name;
+2. unambiguous prefix across branch / slug / directory name.
+
+If a single tier yields more than one match the query is **ambiguous**: in an
+interactive context (stderr is a TTY) `wt` opens the picker (§10); otherwise it lists
+the candidates on stderr and exits with code `3` (§12). A query that matches nothing
+exits `1`.
 
 ### Global flags
 
@@ -219,14 +266,17 @@ in order:
 | Dirty | `M` if modified/staged tracked files; `?` if untracked files present; empty otherwise |
 | Branch | Full branch name, or `(HEAD detached @ <hash>)` |
 | Path | Relative path from repo root, or absolute if outside |
-| ↑↓ | `↑N ↓M` commits ahead/behind upstream; `–` if no upstream tracking branch |
+| ↑↓ (`ahead-behind`) | `↑N ↓M` commits ahead/behind upstream; `–` if no upstream tracking branch |
 | Commit | Short hash + subject (truncated to fit) + relative timestamp |
 | PR | `#N (state)` if a PR is recorded for this worktree; empty otherwise |
 
 Additional flags:
 - `--sort <field>` — sort by `branch` (default), `dirty`, `ahead`, `behind`,
   `activity` (most-recent commit first), or `path`. Prefix with `-` for descending
-  order (e.g. `--sort -ahead`).
+  order (e.g. `--sort -ahead`). Semantics: `dirty` orders modified/staged worktrees
+  first, then untracked-only, then clean; `ahead`/`behind` sort by the numeric count.
+  Worktrees with no value for the sort key (no upstream for `ahead`/`behind`, or a
+  missing worktree for `dirty`/`activity`) sort **last** regardless of direction.
 - `--filter <query>` — non-interactive fuzzy filter by branch/slug/path; same
   matching logic as the TUI `/` filter. Useful in scripts.
 
@@ -235,6 +285,7 @@ stable fields:
 
 ```json
 {
+  "schema_version": 1,
   "path": "/absolute/path",
   "branch": "feature/login",
   "slug": "feature-login",
@@ -258,9 +309,25 @@ stable fields:
 }
 ```
 
-`pr` is `null` if no PR is recorded. `ahead` and `behind` are `null` (not `0`)
-when no upstream tracking branch is configured. `upstream` and `base_ref` are `null`
-when not set.
+Field rules (apply to `list`, `status`, and the `new`/`pr`/`remove` result object):
+- `schema_version` is an integer, currently `1`; it is bumped only on a
+  breaking change so consumers can detect incompatibility (§13).
+- `pr` is `null` if no PR is recorded. `pr.state` is one of `open`, `closed`,
+  `merged`, `draft` (mirrors `gh`).
+- `ahead` and `behind` are `null` (not `0`) when no upstream tracking branch is
+  configured. `upstream` and `base_ref` are `null` when not set.
+- **Detached HEAD:** `branch` is `null` and `is_detached` is `true`. The
+  `(HEAD detached @ <hash>)` rendering is human-output only.
+- **Missing worktree** (directory deleted externally): `is_missing` is `true` and the
+  fields that require the working tree — `dirty`, `has_untracked`, `ahead`, `behind`,
+  `commit` — are `null` (they cannot be computed). `branch`, `slug`, `upstream`,
+  `base_ref`, and `pr` are still populated from Git's admin records and `wt.*` config
+  when available.
+
+**Display conventions** (apply wherever `wt` renders commits and times — `list`,
+`status`, TUI): short commit hashes are 7 characters, honoring `core.abbrev` when the
+repo sets it. Relative timestamps render as a single largest unit
+(`just now`, `5m ago`, `3h ago`, `2d ago`, `4mo ago`, `1y ago`).
 
 ### `wt switch [<query>]` (alias `sw`)
 Navigate to a worktree. With a query, resolve and print its path. With no query,
@@ -268,35 +335,57 @@ open the TUI picker (§10) and print the chosen path. This is a navigation comma
 path-only on stdout, UI on stderr. `--print-path` forces print-only even inside the
 shell wrapper.
 
-### `wt remove <query> [--force] [--keep-branch]` (alias `rm`)
+### `wt remove <query> [--force] [--keep-branch] [--no-hooks]` (alias `rm`)
 Remove a linked worktree.
-- Refuse if the working tree is dirty or has unpushed work, unless `--force`.
+- Refuse if the worktree is **dirty** or has **unpushed work**, unless `--force`
+  (see §12 for the precise, shared definitions). "Dirty" = modified or staged tracked
+  files (untracked files only when `remove.untracked_blocks` is set); "unpushed work" =
+  local commits ahead of the upstream (`ahead > 0`). A branch with no upstream is
+  treated as having unpushed work and is not removed without `--force`.
 - Never removes the primary worktree.
 - By default also deletes the local branch **only if** it is fully merged and was
-  created by `wt`; otherwise the branch is kept. `--keep-branch` always keeps it;
-  `--force` permits deleting an unmerged branch.
-- Run the pre-remove hook (§8) before deletion.
+  created by `wt`; otherwise the branch is kept. "Fully merged" means merged into the
+  branch's recorded **base ref** (§3), falling back to the repo's **default branch**
+  when no base ref is recorded. (`prune --merged` deliberately uses the default branch
+  instead — see below.) `--keep-branch` always keeps it; `--force` permits deleting an
+  unmerged branch. "Created by `wt`" is recorded in `wt.*` config at creation (§11).
+- Run the pre-remove hook (§8) before deletion, unless `--no-hooks`. A non-zero
+  pre-remove hook **aborts** the removal (exit `1`) unless `--force`, in which case it
+  is reported as a warning and removal proceeds (§8).
 - If the worktree directory is already missing, skip the `git worktree remove` step
   and run `git worktree prune` instead to clean the admin record. `--force` is not
-  required in this case.
+  required in this case, and the dirty/unpushed guards do not apply (nothing to check).
 
 ### `wt prune [--merged] [--gone] [--dry-run] [--force]`
 Bulk cleanup. Candidates:
-- `--merged`: worktrees whose branch is merged into the default branch.
-- `--gone`: worktrees whose upstream branch no longer exists on the remote, **and**
-  worktrees whose directory is missing (see "missing worktree" in §3).
+- `--merged`: worktrees whose branch is merged into the repo's **default branch**.
+  (This differs intentionally from `remove`'s per-branch base-ref check: bulk cleanup
+  uses one consistent target, the default branch.)
+- `--gone`: worktrees whose upstream branch is gone, **and** worktrees whose directory
+  is missing (see "missing worktree" in §3). "Gone" is determined **offline** from
+  Git's locally-cached upstream tracking state (the `gone` marker left by a previous
+  `git fetch --prune`); `wt` never touches the network here. To refresh which upstreams
+  are gone, the user runs `git fetch --prune` first.
 - Also reconciles Git's worktree admin metadata (equivalent to `git worktree prune`).
-Always shows what will be removed and asks for confirmation unless `--force`;
-`--dry-run` only reports. Dirty worktrees are skipped unless `--force`.
+Always shows what will be removed and asks for confirmation unless `--force`: a CLI
+list of the candidate worktrees followed by a single `Proceed? [y/N]` prompt on stderr
+(not the TUI confirm dialog). `--dry-run` only reports (and is the `--json` form's
+behavior — it prints the candidate set without removing). Dirty worktrees are skipped
+unless `--force`.
 
-### `wt pr <number | url | branch>` (alias for checkout)
+### `wt pr <number | url | branch> [--no-switch] [--no-hooks]` (alias for checkout)
 Check out a GitHub PR into its own worktree via `gh`.
+- Accepted forms: a PR **number** (`123`), a GitHub PR **URL**
+  (`https://github.com/<owner>/<repo>/pull/<n>`), or the PR's **head-branch** name.
 - Resolve the PR (including fork PRs) to a head ref, fetch it, and create a worktree
   for it under the store. Record the PR number in `wt.*` config for that worktree
-  so `list`/TUI can show PR state.
-- With no argument, open an interactive PR list (via `gh`) to choose from.
-- `wt pr list` prints open PRs (table or `--json`); selecting one checks it out.
-- Switches into the new worktree on success (same stdout path contract).
+  so `list`/TUI can show PR state, and record the PR's **base branch** as the
+  worktree's `base_ref` (§3).
+- With no argument, open the interactive PR picker (TUI, §10) that lists open PRs via
+  `gh` and **checks out** the chosen one.
+- `wt pr list` is the non-interactive listing form: it prints open PRs (table or
+  `--json`) and does **not** check anything out.
+- Switches into the new worktree on success (same stdout path contract, §5).
 
 ### `wt status [<query>]`
 Detailed status for one worktree (default: current) or, with `--all`, every
@@ -318,9 +407,14 @@ dirty:
 
 When the upstream is not configured, `branch:` shows `feature/x (no upstream)` and
 `ahead`/`behind` are omitted. `pr:` is omitted when no PR is recorded. `base:` is
-omitted when not recorded.
+omitted when not recorded. For a **missing** worktree the block shows `path`,
+`branch`, and `base`/upstream when known, plus the note `(directory already deleted)`,
+and omits the `dirty:`, `ahead`, and `behind` sections (they cannot be computed).
 
-`--json` output: same schema as `wt list --json` (a single object, not an array).
+`--json` output uses the same per-worktree schema as `wt list --json`. Without
+`--all`, a single object is emitted for the resolved worktree. With `--all`, objects
+are **newline-delimited**, one per worktree — identical framing to `wt list --json`
+(never a wrapping array).
 
 ### `wt path <query>`
 Print the absolute path of a matching worktree to stdout (scripting helper; no `cd`).
@@ -354,17 +448,36 @@ Git-ignored local files (`.env`, local config, build caches) that the user often
 needs. `wt` addresses this:
 
 - **Copy patterns:** a configurable list of glob patterns. On `new`/`pr`, matching
-  files/dirs are copied from a **source worktree** (default: the worktree the user
-  ran the command from, falling back to the primary worktree) into the new one.
-  Patterns matching tracked files are ignored (no need to copy those). Copying must
-  never overwrite existing files in the target.
-- **Hooks:** optional shell commands run with the new worktree as CWD and useful
-  context in the environment (e.g. `WT_WORKTREE_PATH`, `WT_BRANCH`, `WT_REPO_ROOT`,
-  `WT_BASE_REF`, and for PRs `WT_PR_NUMBER`):
-  - `post_create` — after creation + copy (e.g. install deps, `direnv allow`).
-  - `pre_remove` — before a worktree is removed.
-  A non-zero `post_create` exit is reported as a warning; the worktree is still
-  created. `--no-hooks` skips hooks for a single command.
+  files/dirs are copied from a **source worktree** into the new one. The default
+  source is the worktree containing the current working directory (after any `-C`); if
+  the CWD is not inside any worktree, it falls back to the primary worktree.
+  `--copy-from <query>` overrides the source. Patterns matching tracked files are
+  ignored (no need to copy those). Copying must never overwrite existing files in the
+  target; a file skipped because the target already exists is silent at default
+  verbosity and logged at `-v`.
+- **Hooks:** optional shell commands run with the new worktree as CWD. The command is
+  executed via `sh -c "<cmd>"` on Unix and `cmd /C "<cmd>"` on Windows, inheriting the
+  parent process environment plus these `WT_*` variables:
+  - `WT_WORKTREE_PATH`, `WT_BRANCH`, `WT_REPO_ROOT` — always set.
+  - `WT_BASE_REF` — set when a base ref is known.
+  - `WT_PR_NUMBER` — set **only** for PR-originated worktrees; **unset** otherwise, so
+    a hook can branch on its presence.
+
+  The two hooks:
+  - `post_create` — after creation + copy (e.g. install deps, `direnv allow`). A
+    non-zero exit is reported as a **warning** on stderr; the worktree is still
+    created and the command exits `0` (the hook failure is non-fatal).
+  - `pre_remove` — before a worktree is removed. A non-zero exit **aborts** the
+    removal and the command exits `1`, unless `--force`, in which case the failure is
+    reported as a warning, removal proceeds, and the command exits `0` on success.
+
+  `--no-hooks` skips hooks for a single command (supported by `new`, `pr`, and
+  `remove`).
+
+**Atomicity (§13):** if `post_create` fails, the worktree is kept (the failure is only
+a warning). If worktree *creation itself* fails partway through `new`/`pr` (before the
+hook), `wt` rolls back the partial state via `git worktree remove`/`prune` and reports
+the failure, leaving no half-created worktree.
 
 ---
 
@@ -382,6 +495,12 @@ Completion is a first-class requirement, both static and dynamic.
     block or error the shell if `gh` is missing).
 - Dynamic completion must be fast (sourced from `gix` reads, not the network) and
   must degrade silently if invoked outside a repository.
+- **Mechanism:** the generated completion scripts call a hidden helper,
+  `wt __complete <kind> [partial]` (e.g. `worktrees`, `branches`, `pr-numbers`), which
+  prints candidates one per line to stdout. The helper exits `0` with **no output**
+  when invoked outside a repository, or — for `pr-numbers` — when `gh` is missing or
+  unauthenticated, so the shell never sees an error or a hang. PR-number completion is
+  best-effort and must not block the prompt.
 - `wt shell-init` installs completion automatically so users get it from one line
   in their rc file; `wt completions` remains available for manual setup.
 
@@ -398,8 +517,11 @@ The TUI has three regions:
 
 1. **Worktree list (left pane)** — each row shows, in order: status marker, dirty
    marker, branch name, ahead/behind, last-commit summary + relative time, and PR
-   number/state if known. The active row is highlighted; missing worktrees appear
-   dimmed with a `!` prefix.
+   number/state if known. The dirty marker uses the same `M`/`?` glyphs as `wt list`
+   (subject to `list.show_untracked`), not a single generic indicator. The active row
+   is highlighted; missing worktrees appear dimmed with a `!` prefix. The list is
+   ordered by the same default sort as `wt list` (`branch`); see the `sort-cycle` /
+   `sort-reverse` key bindings below to change it at runtime.
 2. **Detail pane (right pane)** — shown for the selected worktree, in order:
    - Path (absolute)
    - Branch → upstream (e.g. `feature/x → origin/feature/x`, or
@@ -427,9 +549,10 @@ Loading is split so the TUI is always immediately interactive:
   counts, PR state. Each row shows a per-field spinner `…` until its async data
   arrives; there is no full-screen loading state.
 
-A failed async fetch (e.g. upstream not configured, `gh` unavailable) fills the
-affected field with `–` and does not surface as an error. `r` forces a full refresh
-of all async data.
+Until a row's async data arrives, each pending field shows a steady `…` placeholder
+(animation is an implementation choice, not a requirement). A failed async fetch (e.g.
+upstream not configured, `gh` unavailable) fills the affected field with `–` and does
+not surface as an error. `r` forces a full refresh of all async data.
 
 ### View modes
 
@@ -457,19 +580,27 @@ All bindings are configurable via `ui.keybindings` (§11). Defaults:
 | `PgDn` / `ctrl+d` | page-down | |
 | `g` / `Home` | go-to-top | |
 | `G` / `End` | go-to-bottom | |
-| `Tab` | focus-next-pane | cycles list ↔ detail pane |
+| `Tab` | focus-next-pane | cycles list → detail pane |
+| `Shift+Tab` | focus-prev-pane | cycles detail → list pane |
 | `Enter` | switch | select worktree → print path to stdout → shell `cd`s → TUI exits |
 | `/` | filter | enter Filter mode |
-| `Esc` | clear-filter / back | clears active filter; dismisses overlay modes |
+| `Esc` | clear-filter | clears active filter; dismisses overlay modes (back) |
 | `n` | new | open Create mode |
 | `d` | remove | open Confirm-remove mode |
 | `p` | pr-checkout | open PR picker mode |
-| `o` | open-editor | open selected worktree in `$EDITOR` (or `editor` config) |
+| `o` | open-editor | open selected worktree in the resolved editor (suspends the TUI) |
 | `r` | refresh | force full async refresh |
+| `s` | sort-cycle | cycle the sort field (same fields as `wt list --sort`) |
+| `S` | sort-reverse | toggle ascending/descending |
 | `?` | help | show Help overlay |
 | `q` | quit | exit TUI without switching worktree |
 | `\` | toggle-sidebar | hide/show list pane (full-screen detail) |
-| `+` / `-` | resize-sidebar | grow / shrink list pane width by one column |
+| `+` | resize-sidebar-grow | grow list pane width by one column |
+| `-` | resize-sidebar-shrink | shrink list pane width by one column |
+
+`open-editor` launches the editor in the **foreground**: `wt` leaves raw mode and the
+alternate screen, runs the editor (resolved as `editor` config → `$VISUAL` → `$EDITOR`,
+erroring if all are unset), and restores the TUI when the editor exits.
 
 ### Modal behaviors
 
@@ -511,8 +642,9 @@ fallbacks remain correct and readable when Nerd Fonts are disabled.
 - The TUI must restore the terminal on exit regardless of cause (normal quit,
   `q`, signal, panic). Raw mode and alternate screen must be cleaned up.
 - On `SIGWINCH`, the TUI redraws at the new terminal size. If the terminal shrinks
-  below 60 columns wide, the detail pane is hidden; below 5 rows tall, show an
-  error and exit cleanly.
+  below 60 columns wide, the detail pane is hidden; below 5 rows tall, the TUI
+  restores the terminal and exits cleanly, printing `terminal too small (need ≥5 rows)`
+  to stderr (exit `1`).
 
 ---
 
@@ -521,11 +653,22 @@ fallbacks remain correct and readable when Nerd Fonts are disabled.
 Two layers, merged with **flags > per-repo > global > built-in defaults**:
 - **Global:** `$XDG_CONFIG_HOME/wt/config.toml` (and the platform-appropriate
   equivalent on macOS/Windows).
-- **Per-repo:** a `wt` config file at the repo root, committed or not at the user's
-  discretion. Per-repo settings override global.
+- **Per-repo:** a `.wt.toml` file at the repo root, committed or not at the user's
+  discretion. Per-repo settings override global. `wt init` writes this file, and
+  `wt config edit` (without `--global`) opens it.
 - Per-worktree metadata that `wt` itself records (e.g. originating PR number,
   "created by wt") lives in Git config under the `wt.*` namespace, not in these
   files — keeping it tied to Git's own state.
+
+**Merge semantics across layers:**
+- **Scalars** (strings, bools) follow the precedence above: a value set at a higher
+  layer fully replaces lower ones.
+- **`ui.keybindings`** deep-merges **per action key**: a per-repo (or global) table
+  overrides only the individual bindings it names, leaving the rest at their defaults.
+- **Array values** (`copy`, `list.columns`) **replace wholesale** when set at a higher
+  layer — a per-repo `copy` list fully supersedes the global one rather than
+  concatenating. To extend rather than replace, the user re-lists the inherited
+  entries.
 
 **Configurable keys:**
 
@@ -536,27 +679,42 @@ Two layers, merged with **flags > per-repo > global > built-in defaults**:
 | `copy` | string[] | `[]` | Glob patterns to copy into new worktrees (§8) |
 | `hooks.post_create` | string | — | Shell command run after worktree creation (§8) |
 | `hooks.pre_remove` | string | — | Shell command run before worktree removal (§8) |
-| `editor` | string | `$VISUAL` / `$EDITOR` | Command used by TUI `o` / CLI open |
+| `editor` | string | `$VISUAL`, then `$EDITOR` | Command used by TUI `o` / CLI open. Resolution: this key → `$VISUAL` → `$EDITOR`; error if all unset |
 | `remove.delete_merged_branch` | bool | `true` | Delete wt-created branch on `remove` if fully merged |
 | `remove.untracked_blocks` | bool | `false` | If `true`, untracked files count as dirty for remove/prune guards |
 | `pr.default_remote` | string | `origin` | Remote used for PR fetches |
 | `list.show_untracked` | bool | `true` | Show `?` in dirty column for untracked files |
-| `list.columns` | string[] | all | Ordered list of columns to display in `wt list` |
+| `list.columns` | string[] | all | Ordered list of columns to display in `wt list`. Valid identifiers: `status`, `dirty`, `branch`, `path`, `ahead-behind`, `commit`, `pr` (default = all, in that order). An unknown identifier is a config error |
 | `ui.nerd_fonts` | bool | `false` | Enable Nerd Font glyphs in TUI (§10) |
 | `ui.mouse` | bool | `true` | Enable mouse support in TUI (§10) |
-| `ui.color` | string | `auto` | Color output: `auto`, `always`, or `never` |
+| `ui.color` | string | `auto` | Color output for both CLI and TUI: `auto`, `always`, or `never`. Same knob as the `--color` flag at a different layer; see precedence below |
 | `ui.keybindings` | table | defaults | Action-name → key-string overrides for TUI (§10) |
 
 **Keybinding configuration:** `ui.keybindings` is a TOML table mapping action
-names to key strings. Action names correspond to the TUI actions in §10 (e.g.
-`navigate-up`, `navigate-down`, `switch`, `new`, `remove`, `pr-checkout`,
-`refresh`, `filter`, `quit`, `open-editor`, `help`, `toggle-sidebar`,
-`resize-sidebar-grow`, `resize-sidebar-shrink`, `focus-next-pane`). An unknown
-action name is a config error. Key strings use standard terminal notation
-(`ctrl+c`, `alt+enter`, `f5`).
+names to key strings. The complete set of action names (identical to the §10 key
+table) is: `navigate-up`, `navigate-down`, `page-up`, `page-down`, `go-to-top`,
+`go-to-bottom`, `focus-next-pane`, `focus-prev-pane`, `switch`, `filter`,
+`clear-filter`, `new`, `remove`, `pr-checkout`, `open-editor`, `refresh`,
+`sort-cycle`, `sort-reverse`, `help`, `quit`, `toggle-sidebar`,
+`resize-sidebar-grow`, `resize-sidebar-shrink`. An unknown action name is a config
+error. Key strings use standard terminal notation (`ctrl+c`, `alt+enter`, `f5`).
 
-`wt config edit` opens the appropriate file in `$EDITOR`; invalid config produces
-a precise error (file, key, reason) and never silently ignores unknown keys.
+**Color precedence** (the `--color` flag, the `ui.color` config key, and the
+`NO_COLOR` env var are reconciled in this order, first match wins):
+1. an explicit `--color always|never` on the command line;
+2. `NO_COLOR` set and non-empty → `never`;
+3. `ui.color` (if set to `always`/`never`);
+4. otherwise `auto` — color when stdout is a TTY.
+
+`ui.color` and `--color` are the same setting at the config and flag layers; there is
+no separate CLI-only color key.
+
+**Validation timing:** configuration is parsed and validated on **every invocation**
+(at load time), not lazily. Unknown keys, unknown `ui.keybindings` action names, and
+malformed key strings are rejected immediately with a precise error (file, key,
+reason); `wt` never silently ignores unknown keys. `wt config edit` opens the
+appropriate file (`.wt.toml` per-repo, or the global config with `--global`) in the
+resolved editor.
 
 ---
 
@@ -566,14 +724,24 @@ These behaviors are required, not optional polish:
 
 - **Not in a repo:** any repo-scoped command exits non-zero with a clear message;
   completion degrades silently.
+- **`-C <path>`:** changes the effective working directory before anything else;
+  repository discovery then proceeds upward from `<path>` exactly as if `wt` had been
+  launched there. It also becomes the basis for "the worktree the command ran from"
+  in the copy step (§8).
+- **Bare repository:** a bare repo has no current worktree. `list`/TUI show no `*`
+  (current) marker. `switch`/`status` invoked with no query (which need a "current"
+  worktree) report that there is no current worktree and exit `1` rather than
+  crashing; with a query they work normally.
 - **Branch already checked out elsewhere:** report which worktree holds it; do not
   attempt a duplicate checkout (Git forbids it).
-- **Dirty worktree on remove/prune:** refuse without `--force`, and on `--force`
-  state plainly that uncommitted work may be lost. "Dirty" is defined precisely as:
-  modified tracked files or staged changes. Untracked files do *not* count as dirty
-  for safety guards by default; this is controlled by `remove.untracked_blocks`
-  (see §11). Both the CLI guards and the TUI confirm-remove dialog apply this same
-  definition.
+- **Remove/prune safety guards.** Two independent guards refuse removal without
+  `--force`, and on `--force` `wt` states plainly that work may be lost:
+  - **Dirty:** modified tracked files or staged changes. Untracked files do *not*
+    count as dirty by default; this is controlled by `remove.untracked_blocks` (§11).
+  - **Unpushed work:** local commits ahead of the upstream (`ahead > 0`). A branch
+    with no upstream is treated as having unpushed work.
+  Both the CLI guards and the TUI confirm-remove dialog apply these same definitions.
+  Missing worktrees skip both guards (there is no working tree to inspect).
 - **Untracked files:** displayed with `?` in `wt list` / TUI when `list.show_untracked`
   is `true` (default), but do not block `remove`/`prune` unless `remove.untracked_blocks`
   is set.
@@ -596,10 +764,13 @@ These behaviors are required, not optional polish:
   warn.
 - **Subprocess failures:** surface the underlying `git`/`gh` stderr; do not swallow.
 - **Exit codes:** `0` success; `1` user/operation error; `2` usage/argument error;
-  reserve a distinct code for "ambiguous query / nothing selected" so scripts and
-  the shell wrapper can avoid a spurious `cd`.
-- **Concurrency:** rely on Git's own locking for worktree mutations; detect and
-  report lock contention rather than corrupting state.
+  `3` ambiguous query / nothing selected. The shell wrapper treats exit `3` (and a `0`
+  exit with empty stdout, e.g. a cancelled picker) as "do not `cd`", avoiding a
+  spurious navigation (§5).
+- **Concurrency:** rely on Git's own locking for worktree mutations; detect lock
+  contention (a non-zero `git` exit naming a `.lock` file) and surface the underlying
+  stderr with the hint "another git process holds the worktree lock" rather than
+  corrupting state.
 
 ---
 
@@ -618,7 +789,13 @@ These behaviors are required, not optional polish:
     fan-out for read-only listing.
 - **Startup:** no network access on any command except explicit fetch/PR operations.
 - **Output:** human output is concise and respects `NO_COLOR` and non-TTY stdout
-  (auto-plain). `--json` output is stable and documented.
+  (auto-plain). `--json` output is stable and documented; every documented JSON object
+  carries a `schema_version` integer (currently `1`) that is bumped only on a breaking
+  change, so consumers can detect incompatibility.
+- **Paging:** the long human listings (`wt list`, `wt status`) page through `$PAGER`
+  (default `less -FRX`) only when stdout is a TTY and the output exceeds one screen.
+  Paging is disabled by `--no-pager`, by `--json`, and whenever stdout is not a TTY,
+  so scripts never block on a pager. No other command pages.
 - **Reliability:** all mutations are atomic from the user's perspective — on failure
   partway through `new` (e.g. hook fails), the worktree state is left consistent and
   the failure is reported; nothing is half-created without notice.
