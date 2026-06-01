@@ -25,6 +25,7 @@ pub mod query;
 pub mod slug;
 pub mod template;
 pub mod time;
+pub mod tui;
 pub mod util;
 pub mod worktree_service;
 
