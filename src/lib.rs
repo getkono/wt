@@ -12,9 +12,11 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod copy;
 pub mod cx;
 pub mod error;
 pub mod git;
+pub mod hooks;
 pub mod keys;
 pub mod model;
 pub mod output;
