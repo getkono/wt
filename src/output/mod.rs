@@ -3,3 +3,4 @@
 //! stdout/stderr discipline itself lives on [`crate::cx::Cx`].
 
 pub mod color;
+pub mod json;

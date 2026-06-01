@@ -75,6 +75,10 @@ pub enum Error {
     /// An underlying I/O error.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    /// A JSON serialization or deserialization error.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 impl Error {
@@ -138,6 +142,8 @@ mod tests {
         assert_eq!(Error::GhUnavailable("gh".into()).exit_code(), 1);
         assert_eq!(Error::operation("op").exit_code(), 1);
         assert_eq!(Error::from(std::io::Error::other("io")).exit_code(), 1);
+        let json_err = serde_json::from_str::<i32>("nope").unwrap_err();
+        assert_eq!(Error::from(json_err).exit_code(), 1);
     }
 
     #[test]
