@@ -6,8 +6,11 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+
+use tempfile::TempDir;
 
 use crate::cx::{Cx, Env, Stream};
 
@@ -72,4 +75,95 @@ pub(crate) fn test_cx(env: &[(&str, &str)], cwd: &str) -> TestCx {
         PathBuf::from(cwd),
     );
     TestCx { cx, out, err }
+}
+
+/// A real, throwaway Git repository for integration tests. Worktrees are created
+/// as siblings of the repo *inside* the same temp dir, so they are cleaned up
+/// when the [`TestRepo`] is dropped. Git runs with an isolated config so the
+/// host's `~/.gitconfig` cannot affect tests.
+pub(crate) struct TestRepo {
+    _dir: TempDir,
+    root: PathBuf,
+}
+
+// The fixture grows across stages; not every helper is used by every stage.
+#[allow(dead_code)]
+impl TestRepo {
+    /// Initializes a normal repo on branch `main` with one initial commit.
+    pub(crate) fn init() -> TestRepo {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).expect("mkdir repo");
+        run_git(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "init\n").expect("write readme");
+        run_git(&root, &["add", "-A"]);
+        run_git(&root, &["commit", "-q", "-m", "init"]);
+        TestRepo { _dir: dir, root }
+    }
+
+    /// Initializes a bare repository on branch `main`.
+    pub(crate) fn init_bare() -> TestRepo {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("bare.git");
+        std::fs::create_dir_all(&root).expect("mkdir bare");
+        run_git(&root, &["init", "-q", "--bare", "-b", "main"]);
+        TestRepo { _dir: dir, root }
+    }
+
+    /// The primary worktree (or bare repo) root.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Runs an arbitrary `git` command in the repo and returns stdout.
+    pub(crate) fn git(&self, args: &[&str]) -> String {
+        run_git(&self.root, args)
+    }
+
+    /// Creates a linked worktree for a new branch at `rel_path` (relative to the
+    /// repo root).
+    pub(crate) fn add_worktree(&self, branch: &str, rel_path: &str) {
+        run_git(
+            &self.root,
+            &["worktree", "add", "-q", "-b", branch, rel_path],
+        );
+    }
+
+    /// Writes a file (creating parent directories) in the repo's working tree.
+    pub(crate) fn write(&self, rel: &str, content: &str) {
+        let path = self.root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, content).expect("write file");
+    }
+
+    /// Stages all changes and commits them.
+    pub(crate) fn commit_all(&self, message: &str) {
+        run_git(&self.root, &["add", "-A"]);
+        run_git(&self.root, &["commit", "-q", "-m", message]);
+    }
+}
+
+/// Runs `git -C <dir> <args>` with isolated config and identity, asserting
+/// success, and returns stdout.
+fn run_git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "wt Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "wt Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
