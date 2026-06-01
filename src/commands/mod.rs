@@ -14,6 +14,7 @@ pub mod remove;
 pub mod root;
 pub mod shell_init;
 pub mod status_cmd;
+pub mod switch;
 
 use std::path::{Path, PathBuf};
 

@@ -74,6 +74,7 @@ impl Input for StdinInput {
 }
 
 /// A snapshot of environment variables, injectable for testing.
+#[derive(Clone)]
 pub struct Env {
     vars: HashMap<String, String>,
 }

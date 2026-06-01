@@ -372,12 +372,12 @@ fn apply_directory(cx: &mut Cx, dir: &Path) {
 fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
     let json = cli.global.json;
     match cli.command {
-        None | Some(Command::Ui) => stub("ui", cx),
+        None | Some(Command::Ui) => crate::commands::switch::launch_picker(cx),
         Some(Command::New(args)) => {
             crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
-        Some(Command::Switch(_)) => stub("switch", cx),
+        Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),
         Some(Command::Remove(args)) => {
             crate::commands::remove::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
@@ -394,13 +394,6 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::ShellInit(args)) => crate::commands::shell_init::run(cx, &args),
         Some(Command::Complete(args)) => crate::commands::complete::run(cx, &args),
     }
-}
-
-/// Placeholder for a not-yet-implemented command.
-fn stub(name: &str, _cx: &mut Cx) -> Result<u8> {
-    Err(Error::operation(format!(
-        "`wt {name}` is not yet implemented"
-    )))
 }
 
 #[cfg(test)]
@@ -591,20 +584,13 @@ mod tests {
     }
 
     #[test]
-    fn all_commands_route_to_handlers() {
-        // The not-yet-implemented commands; list/status/path/root have real
-        // handlers tested in their own modules.
-        for (parts, label) in [(vec!["switch", "q"], "switch"), (vec!["ui"], "ui")] {
+    fn repo_scoped_commands_fail_outside_a_repo() {
+        // From a non-repo dir, switch/ui (TUI) and the no-subcommand launch all
+        // fail at repository discovery (NotInRepo, exit 1) before any terminal I/O.
+        for parts in [vec!["switch"], vec!["ui"], vec![]] {
             let mut t = test_cx(&[], "/tmp");
             let err = dispatch(argv(&parts), &mut t.cx).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!("`wt {label}` is not yet implemented")
-            );
+            assert!(matches!(err, Error::NotInRepo), "for {parts:?}");
         }
-        // No subcommand routes to the TUI.
-        let mut t = test_cx(&[], "/tmp");
-        let err = dispatch(vec![], &mut t.cx).unwrap_err();
-        assert_eq!(err.to_string(), "`wt ui` is not yet implemented");
     }
 }

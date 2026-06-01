@@ -132,6 +132,8 @@ pub struct App {
     loaded_paths: std::collections::HashSet<PathBuf>,
     /// A transient status/error line shown in the status bar.
     pub status_message: Option<String>,
+    /// Set when the terminal became too small to continue (spec §10).
+    pub too_small: bool,
 }
 
 /// Display/config inputs for the TUI (the parts of [`crate::config::Config`]
@@ -162,6 +164,7 @@ impl App {
         App {
             loaded_paths,
             status_message: None,
+            too_small: false,
             worktrees,
             visible,
             selected,

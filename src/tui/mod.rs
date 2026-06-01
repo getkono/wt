@@ -7,7 +7,10 @@
 pub mod app;
 pub mod event;
 pub mod glyphs;
+pub mod runtime;
+pub mod terminal;
 pub mod view;
 
 pub use app::{App, Mode, Pane};
 pub use event::Effect;
+pub use runtime::run_tui;

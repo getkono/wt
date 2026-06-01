@@ -84,9 +84,10 @@ mod tests {
 
     #[test]
     fn run_maps_command_error_to_exit_code() {
-        // No subcommand routes to the (not-yet-implemented) TUI: exit 1.
+        // No subcommand launches the TUI, which fails at discovery from a
+        // non-repo dir: exit 1 with the NotInRepo message.
         let mut t = test_cx(&[], "/tmp");
         assert_eq!(run(vec![], &mut t.cx), 1);
-        assert!(t.err.contents().contains("not yet implemented"));
+        assert!(t.err.contents().contains("not in a git repository"));
     }
 }
