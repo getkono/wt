@@ -15,7 +15,63 @@ use tempfile::TempDir;
 use std::collections::VecDeque;
 
 use crate::cx::{Cx, Env, Input, Stream};
+use crate::error::Error;
+use crate::gh::{GhClient, PrSummary, PrView, RealGh};
 use crate::git::cli::{GitCli, RealGit};
+
+/// A fake [`GhClient`] returning canned PR data or simulating an unavailable
+/// `gh`.
+#[derive(Default)]
+pub(crate) struct FakeGh {
+    list: Vec<PrSummary>,
+    view: Option<PrView>,
+    available: bool,
+}
+
+#[allow(dead_code)]
+impl FakeGh {
+    /// A fake that returns `view` from `view_pr`.
+    pub(crate) fn with_view(view: PrView) -> Self {
+        FakeGh {
+            view: Some(view),
+            available: true,
+            ..Default::default()
+        }
+    }
+
+    /// A fake that returns `list` from `list_open_prs`.
+    pub(crate) fn with_list(list: Vec<PrSummary>) -> Self {
+        FakeGh {
+            list,
+            available: true,
+            ..Default::default()
+        }
+    }
+
+    /// A fake simulating a missing/unauthenticated `gh`.
+    pub(crate) fn unavailable() -> Self {
+        FakeGh::default()
+    }
+}
+
+impl GhClient for FakeGh {
+    fn list_open_prs(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<PrSummary>> {
+        if self.available {
+            Ok(self.list.clone())
+        } else {
+            Err(Error::GhUnavailable("gh unavailable".into()))
+        }
+    }
+
+    fn view_pr(&self, _dir: &std::path::Path, _target: &str) -> crate::error::Result<PrView> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.view
+            .clone()
+            .ok_or_else(|| Error::operation("no PR configured"))
+    }
+}
 
 /// An [`Input`] that returns queued lines (then empty strings), for testing
 /// confirmation prompts.
@@ -105,6 +161,7 @@ pub(crate) fn test_cx_with_git(
         Env::from_map(env_map),
         PathBuf::from(cwd),
         git,
+        Arc::new(RealGh),
         Box::new(CannedInput::default()),
     );
     TestCx { cx, out, err }

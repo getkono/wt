@@ -15,6 +15,7 @@ pub mod config;
 pub mod copy;
 pub mod cx;
 pub mod error;
+pub mod gh;
 pub mod git;
 pub mod hooks;
 pub mod keys;

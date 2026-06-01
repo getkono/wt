@@ -6,6 +6,7 @@ pub mod completions;
 pub mod list;
 pub mod new;
 pub mod path;
+pub mod pr;
 pub mod prune;
 pub mod remove;
 pub mod root;
@@ -15,12 +16,14 @@ pub mod status_cmd;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, Config};
-use crate::cx::Cx;
-use crate::error::Result;
+use crate::cx::{Cx, Env};
+use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
+use crate::template::{self, TemplateVars};
+use crate::worktree_service::build_worktrees;
 
 /// A discovered repository plus its resolved configuration, set up once per
 /// repo-scoped command.
@@ -108,4 +111,115 @@ pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
     let line = cx.input.read_line()?;
     let answer = line.trim().to_ascii_lowercase();
     Ok(answer == "y" || answer == "yes")
+}
+
+/// The git directory used for the `.git`-containment check (spec §6).
+pub fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
+    if is_bare {
+        root.to_path_buf()
+    } else {
+        root.join(".git")
+    }
+}
+
+/// Renders the worktree store path for a branch with the given slug (spec §6).
+pub fn render_target(
+    config: &Config,
+    root: &Path,
+    branch: &str,
+    slug: &str,
+    env: &Env,
+) -> Result<PathBuf> {
+    let vars = TemplateVars {
+        repo_parent: root
+            .parent()
+            .map_or_else(|| root.to_path_buf(), Path::to_path_buf),
+        repo: root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        repo_root: root.to_path_buf(),
+        branch: branch.to_string(),
+        branch_slug: slug.to_string(),
+        home: env
+            .get("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("~")),
+    };
+    template::render(&config.path_template, &vars)
+}
+
+/// Resolves the final target path: renders it, rejects the `.git` directory, and
+/// on collision with an unrelated path appends `-<short_hash>` (erroring if both
+/// are occupied). Spec §6.
+pub fn resolve_target(
+    config: &Config,
+    root: &Path,
+    branch: &str,
+    slug: &str,
+    short_hash: &str,
+    env: &Env,
+    is_bare: bool,
+) -> Result<PathBuf> {
+    let target = render_target(config, root, branch, slug, env)?;
+    template::ensure_outside_git(&target, &git_dir_of(root, is_bare))?;
+    if !target.exists() {
+        return Ok(target);
+    }
+    let alt = render_target(config, root, branch, &format!("{slug}-{short_hash}"), env)?;
+    if alt.exists() {
+        return Err(Error::operation(format!(
+            "target path already exists: {}",
+            target.display()
+        )));
+    }
+    Ok(alt)
+}
+
+/// Rolls back a partially-created worktree: removes it, prunes, and (optionally)
+/// deletes the created branch (spec §13). Best-effort.
+pub fn rollback_worktree(
+    git: &dyn GitCli,
+    root: &Path,
+    target: &Path,
+    branch: &str,
+    created_branch: bool,
+) {
+    let target_str = target.to_string_lossy();
+    let _ = git.run_raw(root, &["worktree", "remove", "--force", &target_str]);
+    let _ = git.run_raw(root, &["worktree", "prune"]);
+    if created_branch {
+        let _ = git.run_raw(root, &["branch", "-D", branch]);
+    }
+}
+
+/// Builds the [`Worktree`] row for `target` (for `--json` results).
+pub fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
+    let git = cx.git.clone();
+    let repo = Repo::discover(&cx.cwd)?;
+    let worktrees = build_worktrees(&repo, git.as_ref())?;
+    worktrees
+        .into_iter()
+        .find(|w| same_path(&w.path, target))
+        .ok_or_else(|| Error::operation("created worktree not found"))
+}
+
+/// Emits a navigation result: JSON object, the bare path (for `cd`), or a stderr
+/// note when `--no-switch` (spec §5/§7).
+pub fn emit_worktree(
+    cx: &mut Cx,
+    target: &Path,
+    json: bool,
+    no_switch: bool,
+    note: &str,
+) -> Result<u8> {
+    if json {
+        let row = build_target_row(cx, target)?;
+        cx.out.line(&row.to_json_line()?)?;
+    } else if no_switch {
+        cx.err.line(&format!("{note} {}", target.display()))?;
+    } else {
+        cx.out.line(&target.to_string_lossy())?;
+    }
+    Ok(0)
 }

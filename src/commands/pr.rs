@@ -1,0 +1,354 @@
+//! `wt pr` — check out a GitHub PR into its own worktree, or list open PRs
+//! (spec §7). PR operations go through the `gh` boundary (§4).
+
+use std::path::Path;
+
+use crate::cli::{PrArgs, PrSub};
+use crate::commands::{Session, emit_worktree, open_session, resolve_target, rollback_worktree};
+use crate::config::wtconfig;
+use crate::copy::copy_ignored_files;
+use crate::cx::Cx;
+use crate::error::{Error, Result};
+use crate::gh::GhClient;
+use crate::git::cli::GitCli;
+use crate::hooks::{HookContext, HookRunner, run_post_create};
+use crate::slug::slugify_with_fallback;
+use crate::time::{now_unix, parse_iso8601, relative};
+use crate::worktree_service::enumerate_worktrees;
+
+/// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
+pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let session = open_session(cx, git.as_ref())?;
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+
+    if matches!(args.sub, Some(PrSub::List)) {
+        return pr_list(cx, gh.as_ref(), &dir, json);
+    }
+    if let Some(target) = args.target.clone() {
+        return pr_checkout(
+            cx,
+            git.as_ref(),
+            gh.as_ref(),
+            hooks,
+            &session,
+            &dir,
+            &target,
+            args,
+            json,
+        );
+    }
+    Err(Error::operation(
+        "the interactive PR picker requires the TUI; pass a PR number, URL, or branch",
+    ))
+}
+
+/// `pr list` — print open PRs as a table or newline-delimited JSON.
+fn pr_list(cx: &mut Cx, gh: &dyn GhClient, dir: &Path, json: bool) -> Result<u8> {
+    let prs = gh.list_open_prs(dir)?;
+    if json {
+        for pr in &prs {
+            let row = serde_json::json!({
+                "number": pr.number,
+                "title": pr.title,
+                "author": pr.author.login,
+                "state": pr.pr_state().as_str(),
+                "head_ref": pr.head_ref_name,
+                "created_at": pr.created_at,
+            });
+            cx.out.line(&serde_json::to_string(&row)?)?;
+        }
+        return Ok(0);
+    }
+    if prs.is_empty() {
+        cx.err.line("no open pull requests")?;
+        return Ok(0);
+    }
+    let now = now_unix();
+    for pr in &prs {
+        let age = parse_iso8601(&pr.created_at).map_or_else(String::new, |u| relative(now, u));
+        cx.out.line(&format!(
+            "#{}  {}  ({})  {}  {age}",
+            pr.number,
+            pr.title,
+            pr.author.login,
+            pr.pr_state().as_str()
+        ))?;
+    }
+    Ok(0)
+}
+
+/// `pr <target>` — fetch the PR head and create a worktree for it.
+#[allow(clippy::too_many_arguments)]
+fn pr_checkout(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    gh: &dyn GhClient,
+    hooks: &dyn HookRunner,
+    session: &Session,
+    dir: &Path,
+    target: &str,
+    args: &PrArgs,
+    json: bool,
+) -> Result<u8> {
+    let view = gh.view_pr(dir, target)?;
+    let root = session.primary_root.clone();
+    let branch = view.head_ref_name.clone();
+    let base = view.base_ref_name.clone();
+    let number = view.number;
+    let state = view.pr_state();
+
+    // If the PR's head branch is already a worktree, just switch to it.
+    let worktrees = enumerate_worktrees(&session.repo, git)?;
+    if let Some(existing) = worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(branch.as_str()))
+    {
+        let path = existing.path.clone();
+        return emit_worktree(
+            cx,
+            &path,
+            json,
+            args.no_switch,
+            "worktree already exists at",
+        );
+    }
+
+    // Fetch the PR head (works for fork PRs too via the pull/<n>/head ref).
+    git.run(
+        &root,
+        &[
+            "fetch",
+            &session.config.pr_default_remote,
+            &format!("pull/{number}/head"),
+        ],
+    )?;
+    let head_oid = git
+        .run(&root, &["rev-parse", "FETCH_HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let short_hash = head_oid.get(..7).unwrap_or(&head_oid).to_string();
+    let slug = slugify_with_fallback(&branch, &short_hash);
+
+    let worktree_path = resolve_target(
+        &session.config,
+        &root,
+        &branch,
+        &slug,
+        &short_hash,
+        &cx.env,
+        session.repo.is_bare(),
+    )?;
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let target_str = worktree_path.to_string_lossy().into_owned();
+    git.run(
+        &root,
+        &["worktree", "add", "-b", &branch, &target_str, "FETCH_HEAD"],
+    )?;
+
+    // Record metadata + copy, rolling back on failure (§13).
+    let outcome = (|| -> Result<()> {
+        wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
+        wtconfig::write_base_ref(git, &root, &branch, &base)?;
+        wtconfig::mark_created_by_wt(git, &root, &branch)?;
+        let source = session
+            .repo
+            .current_workdir()
+            .unwrap_or_else(|| root.clone());
+        copy_ignored_files(git, &source, &worktree_path, &session.config.copy)?;
+        Ok(())
+    })();
+    if let Err(e) = outcome {
+        rollback_worktree(git, &root, &worktree_path, &branch, true);
+        return Err(e);
+    }
+
+    let ctx = HookContext {
+        worktree_path: worktree_path.clone(),
+        branch: branch.clone(),
+        repo_root: root.clone(),
+        base_ref: Some(base),
+        pr_number: Some(number),
+    };
+    run_post_create(
+        hooks,
+        cx,
+        session.config.hooks_post_create.as_deref(),
+        &ctx,
+        args.no_hooks,
+    )?;
+
+    emit_worktree(
+        cx,
+        &worktree_path,
+        json,
+        args.no_switch,
+        "checked out PR worktree at",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{PrArgs, PrSub};
+    use crate::gh::PrView;
+    use crate::hooks::RealHookRunner;
+    use crate::testutil::{FakeGh, TestRepo};
+    use std::sync::Arc;
+
+    fn pr_args(target: Option<&str>, sub: Option<PrSub>) -> PrArgs {
+        PrArgs {
+            target: target.map(str::to_string),
+            no_switch: false,
+            no_hooks: true,
+            sub,
+        }
+    }
+
+    fn view(number: u64, head: &str, base: &str) -> PrView {
+        PrView {
+            number,
+            title: "Add login".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            head_ref_name: head.into(),
+            base_ref_name: base.into(),
+        }
+    }
+
+    /// Sets up a fetchable `pull/<n>/head` ref served by an `origin` remote
+    /// pointing at the repo itself, returning the repo.
+    fn repo_with_pr(number: u64) -> TestRepo {
+        let repo = TestRepo::init();
+        // A commit to serve as the PR head.
+        repo.write("pr.txt", "from pr\n");
+        repo.commit_all("pr commit");
+        let pr_oid = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", &format!("refs/pull/{number}/head"), &pr_oid]);
+        // Reset main back so the PR commit is "ahead".
+        repo.git(&["reset", "-q", "--hard", "HEAD~1"]);
+        repo.git(&["remote", "add", "origin", repo.root().to_str().unwrap()]);
+        repo
+    }
+
+    #[test]
+    fn checks_out_pr_into_worktree() {
+        let repo = repo_with_pr(123);
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_view(view(123, "pr-feature", "main")));
+        let code = super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(Some("123"), None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let path = t.out.contents().trim().to_string();
+        assert!(std::path::Path::new(&path).is_dir());
+        assert!(path.ends_with("pr-feature"));
+        // The PR file is present (correct head fetched).
+        assert!(std::path::Path::new(&path).join("pr.txt").exists());
+        // Metadata recorded.
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.pr-feature.prNumber"])
+                .trim(),
+            "123"
+        );
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.pr-feature.baseRef"])
+                .trim(),
+            "main"
+        );
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.pr-feature.prState"])
+                .trim(),
+            "open"
+        );
+    }
+
+    #[test]
+    fn pr_list_prints_open_prs() {
+        use crate::gh::{Author, PrSummary};
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_list(vec![PrSummary {
+            number: 7,
+            title: "Fix bug".into(),
+            author: Author {
+                login: "alice".into(),
+            },
+            state: "OPEN".into(),
+            is_draft: false,
+            head_ref_name: "fix".into(),
+            created_at: String::new(),
+        }]));
+        super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(None, Some(PrSub::List)),
+            false,
+        )
+        .unwrap();
+        let out = t.out.contents();
+        assert!(out.contains("#7"));
+        assert!(out.contains("Fix bug"));
+        assert!(out.contains("alice"));
+    }
+
+    #[test]
+    fn pr_list_json() {
+        use crate::gh::{Author, PrSummary};
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_list(vec![PrSummary {
+            number: 9,
+            title: "T".into(),
+            author: Author {
+                login: "bob".into(),
+            },
+            state: "OPEN".into(),
+            is_draft: true,
+            head_ref_name: "wip".into(),
+            created_at: String::new(),
+        }]));
+        super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(None, Some(PrSub::List)),
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(t.out.contents().trim()).unwrap();
+        assert_eq!(v["number"], serde_json::json!(9));
+        assert_eq!(v["state"], serde_json::json!("draft"));
+    }
+
+    #[test]
+    fn gh_unavailable_is_actionable() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::unavailable());
+        let err = super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(None, Some(PrSub::List)),
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::GhUnavailable(_)));
+    }
+
+    #[test]
+    fn no_target_requires_tui() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let err = super::run(&mut t.cx, &RealHookRunner, &pr_args(None, None), false).unwrap_err();
+        assert!(err.to_string().contains("TUI"));
+    }
+}

@@ -49,8 +49,17 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
             Ok(names)
         }
         "branches" => local_branches(repo.gix()),
-        // PR-number completion is wired through `gh` in a later stage; until
-        // then it degrades to no candidates (still best-effort and silent).
+        "pr-numbers" => {
+            // Best-effort: silent when gh is missing/unauthenticated (§9).
+            let dir = repo.current_workdir().unwrap_or_else(|| cx.cwd.clone());
+            Ok(cx
+                .gh
+                .open_pr_numbers(&dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|n| n.to_string())
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }

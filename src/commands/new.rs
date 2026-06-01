@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::NewArgs;
-use crate::commands::{open_session, same_path};
+use crate::commands::{
+    emit_worktree, open_session, render_target, resolve_target, rollback_worktree, same_path,
+};
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
 use crate::cx::Cx;
@@ -15,8 +17,7 @@ use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
 use crate::slug::slugify_with_fallback;
-use crate::template::{self, TemplateVars};
-use crate::worktree_service::{build_worktrees, enumerate_worktrees};
+use crate::worktree_service::enumerate_worktrees;
 
 /// Creates a linked worktree for `branch` (creating the branch if needed), runs
 /// the copy step and post-create hook, and prints the new path (unless
@@ -32,8 +33,6 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     let worktrees = enumerate_worktrees(repo, git)?;
     let branch_exists = resolve_hex(repo.gix(), &format!("refs/heads/{branch}")).is_some();
 
-    // Resolve the base ref (for a new branch) and the base commit (for the slug
-    // fallback and collision disambiguation).
     let base_ref = if branch_exists {
         None
     } else {
@@ -52,24 +51,21 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     let short_hash = base_commit.get(..7).unwrap_or(&base_commit).to_string();
     let slug = slugify_with_fallback(&branch, &short_hash);
 
-    // Render the target path and reject the `.git` directory.
-    let git_dir = git_dir_of(&root, repo.is_bare());
-    let mut target = render_target(
-        &session.config.path_template,
-        &root,
-        &branch,
-        &slug,
-        &cx.env,
-    )?;
-    template::ensure_outside_git(&target, &git_dir)?;
-
     // If the branch is already checked out, either no-op (same target) or refuse.
     if let Some(existing) = worktrees
         .iter()
         .find(|w| w.branch.as_deref() == Some(branch.as_str()))
     {
-        if same_path(&existing.path, &target) {
-            return emit_result(cx, &existing.path.clone(), json, args.no_switch, true);
+        let preview = render_target(&session.config, &root, &branch, &slug, &cx.env)?;
+        if same_path(&existing.path, &preview) {
+            let path = existing.path.clone();
+            return emit_worktree(
+                cx,
+                &path,
+                json,
+                args.no_switch,
+                "worktree already exists at",
+            );
         }
         return Err(Error::operation(format!(
             "branch {branch:?} is already checked out at {}",
@@ -77,25 +73,15 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         )));
     }
 
-    // Collision with an unrelated path: disambiguate with `-<short-hash>`.
-    if target.exists() {
-        let alt_slug = format!("{slug}-{short_hash}");
-        let alt = render_target(
-            &session.config.path_template,
-            &root,
-            &branch,
-            &alt_slug,
-            &cx.env,
-        )?;
-        if alt.exists() {
-            return Err(Error::operation(format!(
-                "target path already exists: {}",
-                target.display()
-            )));
-        }
-        target = alt;
-    }
-
+    let target = resolve_target(
+        &session.config,
+        &root,
+        &branch,
+        &slug,
+        &short_hash,
+        &cx.env,
+        repo.is_bare(),
+    )?;
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -124,7 +110,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         args.copy_from.as_deref(),
     );
     if let Err(e) = outcome {
-        rollback(git, &root, &target, &branch, base_ref.is_some());
+        rollback_worktree(git, &root, &target, &branch, base_ref.is_some());
         return Err(e);
     }
 
@@ -144,7 +130,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         args.no_hooks,
     )?;
 
-    emit_result(cx, &target, json, args.no_switch, false)
+    emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
 }
 
 /// Records metadata and runs the copy step (rolled back on error).
@@ -193,42 +179,6 @@ fn resolve_base_ref(
     "HEAD".to_string()
 }
 
-/// The git directory used for the `.git`-containment check.
-fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
-    if is_bare {
-        root.to_path_buf()
-    } else {
-        root.join(".git")
-    }
-}
-
-/// Renders the worktree path for a given slug.
-fn render_target(
-    path_template: &str,
-    root: &Path,
-    branch: &str,
-    slug: &str,
-    env: &crate::cx::Env,
-) -> Result<PathBuf> {
-    let vars = TemplateVars {
-        repo_parent: root
-            .parent()
-            .map_or_else(|| root.to_path_buf(), Path::to_path_buf),
-        repo: root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        repo_root: root.to_path_buf(),
-        branch: branch.to_string(),
-        branch_slug: slug.to_string(),
-        home: env
-            .get("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~")),
-    };
-    template::render(path_template, &vars)
-}
-
 /// Resolves the copy source worktree: `--copy-from`, else the current worktree,
 /// else the primary root (spec §8).
 fn copy_source(
@@ -249,52 +199,6 @@ fn copy_source(
         };
     }
     Ok(repo.current_workdir().unwrap_or_else(|| root.to_path_buf()))
-}
-
-/// Rolls back a partially-created worktree (spec §13).
-fn rollback(git: &dyn GitCli, root: &Path, target: &Path, branch: &str, created_branch: bool) {
-    let target_str = target.to_string_lossy();
-    let _ = git.run_raw(root, &["worktree", "remove", "--force", &target_str]);
-    let _ = git.run_raw(root, &["worktree", "prune"]);
-    if created_branch {
-        let _ = git.run_raw(root, &["branch", "-D", branch]);
-    }
-}
-
-/// Emits the result: JSON object, the bare path (for `cd`), or a stderr note
-/// when `--no-switch`.
-fn emit_result(
-    cx: &mut Cx,
-    target: &Path,
-    json: bool,
-    no_switch: bool,
-    idempotent: bool,
-) -> Result<u8> {
-    if json {
-        let row = build_target_row(cx, target)?;
-        cx.out.line(&row.to_json_line()?)?;
-    } else if no_switch {
-        let verb = if idempotent {
-            "worktree already exists at"
-        } else {
-            "created worktree at"
-        };
-        cx.err.line(&format!("{verb} {}", target.display()))?;
-    } else {
-        cx.out.line(&target.to_string_lossy())?;
-    }
-    Ok(0)
-}
-
-/// Builds the [`Worktree`] row for the new worktree (for `--json`).
-fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
-    let git = cx.git.clone();
-    let repo = Repo::discover(&cx.cwd)?;
-    let worktrees = build_worktrees(&repo, git.as_ref())?;
-    worktrees
-        .into_iter()
-        .find(|w| same_path(&w.path, target))
-        .ok_or_else(|| Error::operation("created worktree not found"))
 }
 
 #[cfg(test)]
@@ -328,16 +232,21 @@ mod tests {
         let path = out.trim();
         assert!(Path::new(path).is_dir());
         assert!(path.ends_with("feature-login"));
-        // The branch exists and metadata was recorded.
         assert!(
             !repo
                 .git(&["rev-parse", "--verify", "refs/heads/feature/login"])
                 .is_empty()
         );
-        let created = repo.git(&["config", "--get", "wt.feature/login.createdByWt"]);
-        assert_eq!(created.trim(), "true");
-        let base = repo.git(&["config", "--get", "wt.feature/login.baseRef"]);
-        assert_eq!(base.trim(), "main");
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.feature/login.createdByWt"])
+                .trim(),
+            "true"
+        );
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.feature/login.baseRef"])
+                .trim(),
+            "main"
+        );
     }
 
     #[test]
@@ -347,7 +256,6 @@ mod tests {
         let (code, out, _) = run(&repo, &args("existing"), false);
         assert_eq!(code, 0);
         assert!(Path::new(out.trim()).is_dir());
-        // An existing branch records no wt.* metadata (so remove won't delete it).
         let all = repo.git(&["config", "--list"]);
         assert!(!all.contains("wt.existing"), "unexpected metadata: {all}");
     }
@@ -356,7 +264,6 @@ mod tests {
     fn idempotent_when_branch_already_at_target() {
         let repo = TestRepo::init();
         run(&repo, &args("feature/x"), false);
-        // Running again is a no-op returning the same path.
         let (code, out, _) = run(&repo, &args("feature/x"), false);
         assert_eq!(code, 0);
         assert!(out.trim().ends_with("feature-x"));
@@ -365,12 +272,9 @@ mod tests {
     #[test]
     fn refuses_branch_checked_out_elsewhere() {
         let repo = TestRepo::init();
-        // Check out `dup` at a hand-made path, then try to `new` it.
         repo.add_worktree("dup", "../manual-dup");
-        let err = {
-            let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-            super::run(&mut t.cx, &RealHookRunner, &args("dup"), false).unwrap_err()
-        };
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let err = super::run(&mut t.cx, &RealHookRunner, &args("dup"), false).unwrap_err();
         assert!(err.to_string().contains("already checked out"));
     }
 
@@ -418,8 +322,6 @@ mod tests {
         use std::path::Path as StdPath;
         use std::sync::Arc;
 
-        // A git that creates the worktree for real but fails the metadata write
-        // (`git config`), forcing the post-add rollback path (§13).
         struct FailConfig(RealGit);
         impl GitCli for FailConfig {
             fn run_raw(&self, repo: &StdPath, args: &[&str]) -> crate::error::Result<GitOutput> {
@@ -443,23 +345,17 @@ mod tests {
         let err = super::run(&mut t.cx, &RealHookRunner, &args("rollme"), false).unwrap_err();
         assert!(err.to_string().contains("simulated failure"));
 
-        // The worktree directory was rolled back and the branch deleted.
         let target = repo.root().parent().unwrap().join(format!(
             "{}.worktrees",
             repo.root().file_name().unwrap().to_string_lossy()
         ));
         assert!(!target.join("rollme").exists(), "worktree not rolled back");
-        let branches = repo.git(&["branch", "--list", "rollme"]);
-        assert!(
-            branches.trim().is_empty(),
-            "branch not rolled back: {branches}"
-        );
+        assert!(repo.git(&["branch", "--list", "rollme"]).trim().is_empty());
     }
 
     #[test]
     fn copies_ignored_files_into_new_worktree() {
         let repo = TestRepo::init();
-        // A per-repo config enabling a copy pattern, and an ignored file.
         std::fs::write(repo.root().join(".wt.toml"), "copy = [\".env\"]\n").unwrap();
         repo.write(".env", "SECRET=1\n");
         let (code, out, _) = run(&repo, &args("withenv"), false);

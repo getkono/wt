@@ -380,7 +380,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
             crate::commands::remove::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
         Some(Command::Prune(args)) => crate::commands::prune::run(cx, &args, json),
-        Some(Command::Pr(_)) => stub("pr", cx),
+        Some(Command::Pr(args)) => {
+            crate::commands::pr::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
         Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
         Some(Command::Path(args)) => crate::commands::path::run(cx, &args),
         Some(Command::Root) => crate::commands::root::run(cx),
@@ -591,7 +593,6 @@ mod tests {
         // handlers tested in their own modules.
         for (parts, label) in [
             (vec!["switch", "q"], "switch"),
-            (vec!["pr"], "pr"),
             (vec!["init"], "init"),
             (vec!["config", "list"], "config"),
             (vec!["ui"], "ui"),

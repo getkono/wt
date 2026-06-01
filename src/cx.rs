@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::gh::GhClient;
 use crate::git::cli::GitCli;
 
 /// A writable output stream (stdout or stderr) tagged with whether it is a TTY.
@@ -114,19 +115,22 @@ pub struct Cx {
     /// The `git` subprocess handle (real, or a fake in tests). Shared via `Arc`
     /// so the TUI can clone it into async tasks.
     pub git: Arc<dyn GitCli + Send + Sync>,
+    /// The `gh` subprocess handle (real, or a fake in tests).
+    pub gh: Arc<dyn GhClient + Send + Sync>,
     /// Interactive input source for confirmation prompts.
     pub input: Box<dyn Input + Send>,
 }
 
 impl Cx {
     /// Builds a context from injected streams, environment, working dir, the
-    /// `git` handle, and the input source.
+    /// `git`/`gh` handles, and the input source.
     pub fn new(
         out: Stream,
         err: Stream,
         env: Env,
         cwd: PathBuf,
         git: Arc<dyn GitCli + Send + Sync>,
+        gh: Arc<dyn GhClient + Send + Sync>,
         input: Box<dyn Input + Send>,
     ) -> Self {
         Self {
@@ -135,6 +139,7 @@ impl Cx {
             env,
             cwd,
             git,
+            gh,
             input,
         }
     }
