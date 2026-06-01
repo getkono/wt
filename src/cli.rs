@@ -382,9 +382,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::Root) => crate::commands::root::run(cx),
         Some(Command::Init(_)) => stub("init", cx),
         Some(Command::Config(_)) => stub("config", cx),
-        Some(Command::Completions(_)) => stub("completions", cx),
-        Some(Command::ShellInit(_)) => stub("shell-init", cx),
-        Some(Command::Complete(_)) => stub("__complete", cx),
+        Some(Command::Completions(args)) => crate::commands::completions::run(cx, &args),
+        Some(Command::ShellInit(args)) => crate::commands::shell_init::run(cx, &args),
+        Some(Command::Complete(args)) => crate::commands::complete::run(cx, &args),
     }
 }
 
@@ -593,10 +593,7 @@ mod tests {
             (vec!["pr"], "pr"),
             (vec!["init"], "init"),
             (vec!["config", "list"], "config"),
-            (vec!["completions", "bash"], "completions"),
-            (vec!["shell-init", "bash"], "shell-init"),
             (vec!["ui"], "ui"),
-            (vec!["__complete", "worktrees"], "__complete"),
         ] {
             let mut t = test_cx(&[], "/tmp");
             let err = dispatch(argv(&parts), &mut t.cx).unwrap_err();

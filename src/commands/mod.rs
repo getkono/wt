@@ -1,9 +1,12 @@
 //! Command handlers (spec §7). Each module implements one subcommand; this
 //! module provides the shared repository session setup and query resolution.
 
+pub mod complete;
+pub mod completions;
 pub mod list;
 pub mod path;
 pub mod root;
+pub mod shell_init;
 pub mod status_cmd;
 
 use std::path::{Path, PathBuf};
