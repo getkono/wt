@@ -17,9 +17,11 @@ pub mod git;
 pub mod keys;
 pub mod model;
 pub mod output;
+pub mod query;
 pub mod slug;
 pub mod template;
 pub mod time;
+pub mod worktree_service;
 
 #[cfg(test)]
 mod testutil;

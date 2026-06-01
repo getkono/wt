@@ -125,6 +125,29 @@ pub enum PrState {
     Draft,
 }
 
+impl PrState {
+    /// The lowercase string form (matches the JSON serialization).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Closed => "closed",
+            PrState::Merged => "merged",
+            PrState::Draft => "draft",
+        }
+    }
+
+    /// Parses a lowercase state string, or `None` if unknown.
+    pub fn parse(s: &str) -> Option<PrState> {
+        Some(match s {
+            "open" => PrState::Open,
+            "closed" => PrState::Closed,
+            "merged" => PrState::Merged,
+            "draft" => PrState::Draft,
+            _ => return None,
+        })
+    }
+}
+
 /// The `remove` result object: the worktree row plus a `removed` flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RemovedResult {
@@ -382,7 +405,10 @@ mod tests {
                 serde_json::to_value(state).unwrap(),
                 serde_json::json!(text)
             );
+            assert_eq!(state.as_str(), text);
+            assert_eq!(PrState::parse(text), Some(state));
         }
+        assert_eq!(PrState::parse("bogus"), None);
     }
 
     #[test]

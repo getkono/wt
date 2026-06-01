@@ -17,6 +17,10 @@ pub struct WtMeta {
     pub base_ref: Option<String>,
     /// Originating PR number, for PR-checkout worktrees (§7).
     pub pr_number: Option<u64>,
+    /// Cached PR state, so `wt list` can show it offline (§3).
+    pub pr_state: Option<String>,
+    /// Cached PR title.
+    pub pr_title: Option<String>,
     /// Whether the branch/worktree was created by `wt` (§10).
     pub created_by_wt: bool,
 }
@@ -35,14 +39,37 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
     let pr_number = config
         .string(key(branch, "prNumber").as_str())
         .and_then(|v| v.to_string().parse::<u64>().ok());
+    let pr_state = config
+        .string(key(branch, "prState").as_str())
+        .map(|v| v.to_string());
+    let pr_title = config
+        .string(key(branch, "prTitle").as_str())
+        .map(|v| v.to_string());
     let created_by_wt = config
         .boolean(key(branch, "createdByWt").as_str())
         .unwrap_or(false);
     WtMeta {
         base_ref,
         pr_number,
+        pr_state,
+        pr_title,
         created_by_wt,
     }
+}
+
+/// Records the full cached PR snapshot (number, state, title) for `branch`.
+pub fn write_pr(
+    git: &dyn GitCli,
+    repo_root: &Path,
+    branch: &str,
+    number: u64,
+    state: &str,
+    title: &str,
+) -> Result<()> {
+    write_pr_number(git, repo_root, branch, number)?;
+    git.run(repo_root, &["config", &key(branch, "prState"), state])?;
+    git.run(repo_root, &["config", &key(branch, "prTitle"), title])?;
+    Ok(())
 }
 
 /// Records the base ref for `branch`.
@@ -135,6 +162,16 @@ mod tests {
         assert_eq!(m.base_ref.as_deref(), Some("main"));
         assert_eq!(m.pr_number, Some(7));
         assert!(m.created_by_wt);
+    }
+
+    #[test]
+    fn write_pr_caches_number_state_and_title() {
+        let repo = TestRepo::init();
+        write_pr(&RealGit, repo.root(), "main", 99, "open", "Add feature").unwrap();
+        let m = meta(&repo, "main");
+        assert_eq!(m.pr_number, Some(99));
+        assert_eq!(m.pr_state.as_deref(), Some("open"));
+        assert_eq!(m.pr_title.as_deref(), Some("Add feature"));
     }
 
     #[test]
