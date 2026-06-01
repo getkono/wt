@@ -127,6 +127,11 @@ pub struct App {
     pub quit: bool,
     /// Set to the chosen path when the user switches (Enter).
     pub chosen: Option<PathBuf>,
+    /// Worktree paths whose async fields have loaded; rows not in this set show
+    /// the per-row spinner (spec §10). Keyed by path so it survives re-sorting.
+    loaded_paths: std::collections::HashSet<PathBuf>,
+    /// A transient status/error line shown in the status bar.
+    pub status_message: Option<String>,
 }
 
 /// Display/config inputs for the TUI (the parts of [`crate::config::Config`]
@@ -147,11 +152,16 @@ pub struct AppConfig {
 }
 
 impl App {
-    /// Builds an app over the given worktrees, selecting the current one.
+    /// Builds an app over the given worktrees, selecting the current one. All
+    /// rows start marked loaded; the runtime marks them loading before async
+    /// enrichment.
     pub fn new(worktrees: Vec<Worktree>, config: AppConfig, size: (u16, u16)) -> App {
         let visible = (0..worktrees.len()).collect();
         let selected = worktrees.iter().position(|w| w.is_current).unwrap_or(0);
+        let loaded_paths = worktrees.iter().map(|w| w.path.clone()).collect();
         App {
+            loaded_paths,
+            status_message: None,
             worktrees,
             visible,
             selected,
@@ -178,6 +188,21 @@ impl App {
         self.visible
             .get(self.selected)
             .and_then(|&i| self.worktrees.get(i))
+    }
+
+    /// Whether a worktree's async fields have loaded (else it shows a spinner).
+    pub fn is_loaded(&self, worktree: &Worktree) -> bool {
+        self.loaded_paths.contains(&worktree.path)
+    }
+
+    /// Marks all rows as loading (clears the loaded set), for the initial render.
+    pub fn mark_loading(&mut self) {
+        self.loaded_paths.clear();
+    }
+
+    /// Marks a worktree's path as loaded.
+    pub fn mark_loaded(&mut self, path: PathBuf) {
+        self.loaded_paths.insert(path);
     }
 
     /// Whether the detail pane is visible at the current size.

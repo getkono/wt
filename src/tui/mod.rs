@@ -6,6 +6,8 @@
 
 pub mod app;
 pub mod event;
+pub mod glyphs;
+pub mod view;
 
 pub use app::{App, Mode, Pane};
 pub use event::Effect;
