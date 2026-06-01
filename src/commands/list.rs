@@ -49,18 +49,15 @@ pub fn run(cx: &mut Cx, args: &ListArgs, json: bool) -> Result<u8> {
         return Ok(0);
     }
 
+    let color = cx.color_enabled(session.config.ui_color);
+    let width = terminal_width(cx);
     let ctx = RenderCtx {
         show_untracked: session.config.list_show_untracked,
         now: now_unix(),
         repo_root: &session.primary_root,
     };
-    let table = render_table(
-        &worktrees,
-        &session.config.list_columns,
-        &ctx,
-        terminal_width(cx),
-    );
-    cx.out.text(&table)?;
+    let table = render_table(&worktrees, &session.config.list_columns, &ctx, width, color);
+    crate::output::pager::page(cx, &table)?;
     Ok(0)
 }
 

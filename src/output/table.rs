@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use crate::model::{Column, Worktree};
+use crate::output::color::{ansi, paint};
 use crate::output::render::{RenderCtx, cell};
 
 /// The minimum width allotted to the (flexible) Commit column.
@@ -40,13 +41,41 @@ fn pad_right(text: &str, width: usize) -> String {
     }
 }
 
+/// Colorizes a cell's content based on its column and value (ANSI is zero-width,
+/// so this is applied after layout). Returns `None` for uncolored columns.
+fn cell_color(column: Column, value: &str) -> Option<&'static str> {
+    let trimmed = value.trim();
+    match column {
+        Column::Status => match trimmed {
+            "*" => Some(ansi::GREEN),
+            "!" => Some(ansi::RED),
+            "~" => Some(ansi::YELLOW),
+            _ => None,
+        },
+        Column::Dirty => match trimmed {
+            "M" => Some(ansi::RED),
+            "?" => Some(ansi::YELLOW),
+            _ => None,
+        },
+        Column::Pr => match () {
+            _ if trimmed.contains("(open)") => Some(ansi::GREEN),
+            _ if trimmed.contains("(merged)") => Some(ansi::MAGENTA),
+            _ if trimmed.contains("(closed)") => Some(ansi::RED),
+            _ if trimmed.contains("(draft)") => Some(ansi::DIM),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Renders the worktrees as an aligned table for the given columns and terminal
-/// width.
+/// width. ANSI color is applied to status/dirty/PR cells when `color` is set.
 pub fn render_table(
     worktrees: &[Worktree],
     columns: &[Column],
     ctx: &RenderCtx,
     width: usize,
+    color: bool,
 ) -> String {
     if worktrees.is_empty() || columns.is_empty() {
         return String::new();
@@ -84,10 +113,18 @@ pub fn render_table(
         let mut line = String::new();
         for (ci, value) in row.iter().enumerate() {
             let truncated = truncate(value, widths[ci]);
-            if ci == last {
-                line.push_str(&truncated);
+            // Pad the plain text first (ANSI is zero-width); color afterward.
+            let content = if ci == last {
+                truncated
             } else {
-                line.push_str(&pad_right(&truncated, widths[ci]));
+                pad_right(&truncated, widths[ci])
+            };
+            let painted = match cell_color(columns[ci], &content) {
+                Some(code) => paint(&content, code, color),
+                None => content,
+            };
+            line.push_str(&painted);
+            if ci != last {
                 line.push_str(SEPARATOR);
             }
         }
@@ -135,7 +172,7 @@ mod tests {
             wt("/repo", "main", true),
             wt("/repo/.worktrees/feature-x", "feature/x", false),
         ];
-        let table = render_table(&worktrees, &Column::ALL, &ctx(), 120);
+        let table = render_table(&worktrees, &Column::ALL, &ctx(), 120, false);
         let lines: Vec<&str> = table.lines().collect();
         assert_eq!(lines.len(), 2);
         // Current marker on the first row, branch names present.
@@ -153,7 +190,7 @@ mod tests {
             author: "A".into(),
             timestamp: "2024-01-15T10:30:00Z".into(),
         });
-        let table = render_table(&[w], &[Column::Branch, Column::Commit], &ctx(), 40);
+        let table = render_table(&[w], &[Column::Branch, Column::Commit], &ctx(), 40, false);
         assert!(table.contains('…'));
         // No line exceeds a reasonable width given truncation.
         for line in table.lines() {
@@ -163,13 +200,40 @@ mod tests {
 
     #[test]
     fn empty_input_renders_nothing() {
-        assert_eq!(render_table(&[], &Column::ALL, &ctx(), 80), "");
+        assert_eq!(render_table(&[], &Column::ALL, &ctx(), 80, false), "");
     }
 
     #[test]
     fn respects_column_subset() {
         let worktrees = vec![wt("/repo", "main", false)];
-        let table = render_table(&worktrees, &[Column::Branch], &ctx(), 80);
+        let table = render_table(&worktrees, &[Column::Branch], &ctx(), 80, false);
         assert_eq!(table.trim_end(), "main");
+    }
+
+    #[test]
+    fn color_wraps_markers_without_changing_visible_width() {
+        let current = [wt("/repo", "main", true)]; // status '*'
+        let plain = render_table(&current, &Column::ALL, &ctx(), 120, false);
+        let colored = render_table(&current, &Column::ALL, &ctx(), 120, true);
+        assert!(colored.contains("\x1b["));
+        assert!(!plain.contains("\x1b["));
+        // Stripping ANSI from the colored output recovers the plain output.
+        let strip = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for n in chars.by_ref() {
+                        if n == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        assert_eq!(strip(&colored), plain);
     }
 }

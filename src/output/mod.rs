@@ -4,5 +4,6 @@
 
 pub mod color;
 pub mod json;
+pub mod pager;
 pub mod render;
 pub mod table;

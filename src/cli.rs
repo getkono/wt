@@ -326,6 +326,8 @@ pub fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
     if let Some(dir) = cli.global.directory.clone() {
         apply_directory(cx, &dir);
     }
+    cx.color_flag = cli.global.color;
+    cx.no_pager = cli.global.no_pager;
 
     if cli.global.json && !cli.command_supports_json() {
         return Err(Error::usage(format!(

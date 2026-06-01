@@ -1,4 +1,33 @@
-//! Color output decision (spec §11 color precedence).
+//! Color output decision (spec §11 color precedence) and ANSI painting.
+
+/// ANSI SGR codes used by `wt`'s human output.
+pub mod ansi {
+    /// Reset all attributes.
+    pub const RESET: &str = "\x1b[0m";
+    /// Red.
+    pub const RED: &str = "\x1b[31m";
+    /// Green.
+    pub const GREEN: &str = "\x1b[32m";
+    /// Yellow.
+    pub const YELLOW: &str = "\x1b[33m";
+    /// Cyan.
+    pub const CYAN: &str = "\x1b[36m";
+    /// Magenta.
+    pub const MAGENTA: &str = "\x1b[35m";
+    /// Dim.
+    pub const DIM: &str = "\x1b[2m";
+}
+
+/// Wraps `text` in the SGR `code` when `enabled` (and `text` is not blank),
+/// otherwise returns it unchanged. ANSI codes are zero display-width, so this is
+/// safe to apply to already-laid-out cells.
+pub fn paint(text: &str, code: &str, enabled: bool) -> String {
+    if enabled && !text.trim().is_empty() {
+        format!("{code}{text}{}", ansi::RESET)
+    } else {
+        text.to_string()
+    }
+}
 
 /// How to colorize output, as selected by `--color` or the `ui.color` config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

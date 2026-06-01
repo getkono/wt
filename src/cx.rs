@@ -119,11 +119,16 @@ pub struct Cx {
     pub gh: Arc<dyn GhClient + Send + Sync>,
     /// Interactive input source for confirmation prompts.
     pub input: Box<dyn Input + Send>,
+    /// The `--color` flag value, if given (set during dispatch).
+    pub color_flag: Option<crate::output::color::ColorChoice>,
+    /// The `--no-pager` flag (set during dispatch).
+    pub no_pager: bool,
 }
 
 impl Cx {
     /// Builds a context from injected streams, environment, working dir, the
-    /// `git`/`gh` handles, and the input source.
+    /// `git`/`gh` handles, and the input source. The global flag fields
+    /// (`color_flag`, `no_pager`) default off and are set during dispatch.
     pub fn new(
         out: Stream,
         err: Stream,
@@ -141,7 +146,20 @@ impl Cx {
             git,
             gh,
             input,
+            color_flag: None,
+            no_pager: false,
         }
+    }
+
+    /// Resolves whether to emit color for stdout, given the resolved config's
+    /// `ui.color` (spec §11 precedence).
+    pub fn color_enabled(&self, ui_color: crate::output::color::ColorChoice) -> bool {
+        crate::output::color::resolve_color(
+            self.color_flag,
+            self.env.is_set_nonempty("NO_COLOR"),
+            Some(ui_color),
+            self.out.is_tty(),
+        )
     }
 }
 

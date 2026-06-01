@@ -41,9 +41,10 @@ pub fn run(cx: &mut Cx, args: &StatusArgs, json: bool) -> Result<u8> {
         return Ok(0);
     }
 
+    let mut output = String::new();
     for (n, &index) in selected.iter().enumerate() {
         if n > 0 {
-            cx.out.line("")?;
+            output.push('\n');
         }
         let worktree = &worktrees[index];
         let entries = if worktree.is_missing {
@@ -53,8 +54,9 @@ pub fn run(cx: &mut Cx, args: &StatusArgs, json: bool) -> Result<u8> {
                 .map(|s| s.entries)
                 .unwrap_or_default()
         };
-        cx.out.text(&status_block(worktree, &entries))?;
+        output.push_str(&status_block(worktree, &entries));
     }
+    crate::output::pager::page(cx, &output)?;
     Ok(0)
 }
 
