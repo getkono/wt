@@ -14,6 +14,9 @@ pub mod cx;
 pub mod error;
 pub mod model;
 pub mod output;
+pub mod slug;
+pub mod template;
+pub mod time;
 
 #[cfg(test)]
 mod testutil;
