@@ -10,6 +10,7 @@
 //! whole dispatch path testable without touching the real terminal.
 
 pub mod cli;
+pub mod config;
 pub mod cx;
 pub mod error;
 pub mod keys;
