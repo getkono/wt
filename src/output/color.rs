@@ -1,7 +1,7 @@
 //! Color output decision (spec §11 color precedence).
 
 /// How to colorize output, as selected by `--color` or the `ui.color` config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum ColorChoice {
     /// Color when the relevant stream is a TTY.
     Auto,

@@ -9,6 +9,7 @@
 //! the process exit code. Keeping the side-effecting handles in `Cx` makes the
 //! whole dispatch path testable without touching the real terminal.
 
+pub mod cli;
 pub mod cx;
 pub mod error;
 pub mod output;
@@ -22,14 +23,8 @@ pub use error::{Error, Result};
 /// Runs `wt` with the given command-line arguments (excluding `argv[0]`),
 /// writing through the provided [`Cx`], and returns the process exit code.
 pub fn run(args: Vec<String>, cx: &mut Cx) -> u8 {
-    let result = dispatch(args, cx);
+    let result = cli::dispatch(args, cx);
     finish(result, &mut cx.err)
-}
-
-/// Dispatches the parsed command. Stage 2 wires up `clap` and the subcommands;
-/// for now an empty invocation succeeds with no output.
-fn dispatch(_args: Vec<String>, _cx: &mut Cx) -> Result<u8> {
-    Ok(0)
 }
 
 /// Maps a command result to an exit code, reporting any error to `err`.
@@ -66,10 +61,17 @@ mod tests {
     }
 
     #[test]
-    fn run_empty_args_succeeds_silently() {
+    fn run_help_exits_zero_via_clap() {
         let mut t = test_cx(&[], "/tmp");
-        assert_eq!(run(vec![], &mut t.cx), 0);
-        assert!(t.out.contents().is_empty());
-        assert!(t.err.contents().is_empty());
+        assert_eq!(run(vec!["--help".to_string()], &mut t.cx), 0);
+        assert!(t.out.contents().contains("Usage"));
+    }
+
+    #[test]
+    fn run_maps_command_error_to_exit_code() {
+        // No subcommand routes to the (not-yet-implemented) TUI: exit 1.
+        let mut t = test_cx(&[], "/tmp");
+        assert_eq!(run(vec![], &mut t.cx), 1);
+        assert!(t.err.contents().contains("not yet implemented"));
     }
 }
