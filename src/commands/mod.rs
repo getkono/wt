@@ -3,6 +3,8 @@
 
 pub mod complete;
 pub mod completions;
+pub mod config_cmd;
+pub mod init;
 pub mod list;
 pub mod new;
 pub mod path;

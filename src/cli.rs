@@ -386,8 +386,8 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
         Some(Command::Path(args)) => crate::commands::path::run(cx, &args),
         Some(Command::Root) => crate::commands::root::run(cx),
-        Some(Command::Init(_)) => stub("init", cx),
-        Some(Command::Config(_)) => stub("config", cx),
+        Some(Command::Init(args)) => crate::commands::init::run(cx, &args),
+        Some(Command::Config(args)) => crate::commands::config_cmd::run(cx, &args, json),
         Some(Command::Completions(args)) => crate::commands::completions::run(cx, &args),
         Some(Command::ShellInit(args)) => crate::commands::shell_init::run(cx, &args),
         Some(Command::Complete(args)) => crate::commands::complete::run(cx, &args),
@@ -569,10 +569,11 @@ mod tests {
             crate::run(argv(&["--json", "config", "get", "k"]), &mut t.cx),
             2
         );
-        // `config list` accepts --json and reaches its (stub) handler.
+        // `config list` accepts --json (reaches the handler, which fails with
+        // NotInRepo from a non-repo dir — not a usage/--json rejection).
         let mut t2 = test_cx(&[], "/tmp");
         let err = dispatch(argv(&["--json", "config", "list"]), &mut t2.cx).unwrap_err();
-        assert!(matches!(err, Error::Operation(_)));
+        assert!(!matches!(err, Error::Usage(_)));
     }
 
     #[test]
@@ -591,12 +592,7 @@ mod tests {
     fn all_commands_route_to_handlers() {
         // The not-yet-implemented commands; list/status/path/root have real
         // handlers tested in their own modules.
-        for (parts, label) in [
-            (vec!["switch", "q"], "switch"),
-            (vec!["init"], "init"),
-            (vec!["config", "list"], "config"),
-            (vec!["ui"], "ui"),
-        ] {
+        for (parts, label) in [(vec!["switch", "q"], "switch"), (vec!["ui"], "ui")] {
             let mut t = test_cx(&[], "/tmp");
             let err = dispatch(argv(&parts), &mut t.cx).unwrap_err();
             assert_eq!(
