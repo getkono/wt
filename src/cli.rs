@@ -371,7 +371,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
     let json = cli.global.json;
     match cli.command {
         None | Some(Command::Ui) => stub("ui", cx),
-        Some(Command::New(_)) => stub("new", cx),
+        Some(Command::New(args)) => {
+            crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(_)) => stub("switch", cx),
         Some(Command::Remove(_)) => stub("remove", cx),
@@ -586,7 +588,6 @@ mod tests {
         // The not-yet-implemented commands; list/status/path/root have real
         // handlers tested in their own modules.
         for (parts, label) in [
-            (vec!["new", "b"], "new"),
             (vec!["switch", "q"], "switch"),
             (vec!["remove", "q"], "remove"),
             (vec!["prune"], "prune"),

@@ -4,6 +4,7 @@
 pub mod complete;
 pub mod completions;
 pub mod list;
+pub mod new;
 pub mod path;
 pub mod root;
 pub mod shell_init;
@@ -89,4 +90,11 @@ pub fn candidate_label(worktree: &Worktree) -> String {
         Some(branch) => branch.clone(),
         None => worktree.path.display().to_string(),
     }
+}
+
+/// Whether two paths refer to the same location, comparing canonicalized forms
+/// when possible (handles `/private` symlinks on macOS).
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
