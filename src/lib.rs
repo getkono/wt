@@ -12,6 +12,7 @@
 pub mod cli;
 pub mod cx;
 pub mod error;
+pub mod keys;
 pub mod model;
 pub mod output;
 pub mod slug;
