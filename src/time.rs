@@ -47,6 +47,12 @@ pub fn now_unix() -> i64 {
     Timestamp::now().as_second()
 }
 
+/// Parses an ISO-8601 timestamp (as produced by [`iso8601`]) back to Unix
+/// seconds, for computing relative display from the stored value.
+pub fn parse_iso8601(text: &str) -> Option<i64> {
+    text.parse::<Timestamp>().ok().map(|t| t.as_second())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +97,13 @@ mod tests {
     #[test]
     fn now_unix_is_after_2020() {
         assert!(now_unix() > 1_600_000_000);
+    }
+
+    #[test]
+    fn iso8601_round_trips_through_parse() {
+        for unix in [0, 1_705_314_600, 1_600_000_000] {
+            assert_eq!(parse_iso8601(&iso8601(unix)), Some(unix));
+        }
+        assert_eq!(parse_iso8601("not a timestamp"), None);
     }
 }

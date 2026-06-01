@@ -365,20 +365,21 @@ fn apply_directory(cx: &mut Cx, dir: &Path) {
     };
 }
 
-/// Routes the parsed command to its handler. Handlers are filled in by later
-/// stages; until then each returns an "unimplemented" error.
+/// Routes the parsed command to its handler. Handlers not yet implemented
+/// return an "unimplemented" error.
 fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
+    let json = cli.global.json;
     match cli.command {
         None | Some(Command::Ui) => stub("ui", cx),
         Some(Command::New(_)) => stub("new", cx),
-        Some(Command::List(_)) => stub("list", cx),
+        Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(_)) => stub("switch", cx),
         Some(Command::Remove(_)) => stub("remove", cx),
         Some(Command::Prune(_)) => stub("prune", cx),
         Some(Command::Pr(_)) => stub("pr", cx),
-        Some(Command::Status(_)) => stub("status", cx),
-        Some(Command::Path(_)) => stub("path", cx),
-        Some(Command::Root) => stub("root", cx),
+        Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
+        Some(Command::Path(args)) => crate::commands::path::run(cx, &args),
+        Some(Command::Root) => crate::commands::root::run(cx),
         Some(Command::Init(_)) => stub("init", cx),
         Some(Command::Config(_)) => stub("config", cx),
         Some(Command::Completions(_)) => stub("completions", cx),
@@ -532,8 +533,9 @@ mod tests {
 
     #[test]
     fn json_accepted_for_supported_commands() {
-        // These pass json validation and reach their (stub) handler, which
-        // returns an "unimplemented" error rather than a usage error.
+        // These pass json validation and reach their handler. Run from a
+        // non-repo dir so repo-scoped handlers fail with NotInRepo and stubs
+        // with Operation; either way the error is not a usage (--json) error.
         for cmd in [
             vec!["list"],
             vec!["status"],
@@ -548,8 +550,8 @@ mod tests {
             a.extend(cmd.iter().copied());
             let err = dispatch(argv(&a), &mut t.cx).unwrap_err();
             assert!(
-                matches!(err, Error::Operation(_)),
-                "expected unimplemented (json accepted) for {cmd:?}, got {err:?}"
+                !matches!(err, Error::Usage(_)),
+                "expected --json accepted for {cmd:?}, got usage error {err:?}"
             );
         }
     }
@@ -581,16 +583,14 @@ mod tests {
 
     #[test]
     fn all_commands_route_to_handlers() {
+        // The not-yet-implemented commands; list/status/path/root have real
+        // handlers tested in their own modules.
         for (parts, label) in [
             (vec!["new", "b"], "new"),
-            (vec!["list"], "list"),
             (vec!["switch", "q"], "switch"),
             (vec!["remove", "q"], "remove"),
             (vec!["prune"], "prune"),
             (vec!["pr"], "pr"),
-            (vec!["status"], "status"),
-            (vec!["path", "q"], "path"),
-            (vec!["root"], "root"),
             (vec!["init"], "init"),
             (vec!["config", "list"], "config"),
             (vec!["completions", "bash"], "completions"),

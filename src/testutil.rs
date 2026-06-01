@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 use crate::cx::{Cx, Env, Stream};
+use crate::git::cli::{GitCli, RealGit};
 
 /// A cloneable in-memory writer whose contents can be inspected after writes.
 ///
@@ -60,8 +61,18 @@ pub(crate) struct TestCx {
 }
 
 /// Builds a [`TestCx`] over in-memory buffers, the given environment pairs, and
-/// working directory. Both streams report themselves as non-TTYs.
+/// working directory, using the real `git` handle. Both streams report
+/// themselves as non-TTYs.
 pub(crate) fn test_cx(env: &[(&str, &str)], cwd: &str) -> TestCx {
+    test_cx_with_git(env, cwd, Arc::new(RealGit))
+}
+
+/// Like [`test_cx`] but with an injected `git` handle (e.g. a fake).
+pub(crate) fn test_cx_with_git(
+    env: &[(&str, &str)],
+    cwd: &str,
+    git: Arc<dyn GitCli + Send + Sync>,
+) -> TestCx {
     let out = SharedBuf::new();
     let err = SharedBuf::new();
     let env_map: HashMap<String, String> = env
@@ -73,6 +84,7 @@ pub(crate) fn test_cx(env: &[(&str, &str)], cwd: &str) -> TestCx {
         Stream::new(Box::new(err.clone()), false),
         Env::from_map(env_map),
         PathBuf::from(cwd),
+        git,
     );
     TestCx { cx, out, err }
 }

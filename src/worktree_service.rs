@@ -61,11 +61,13 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         let meta = wtconfig::read_meta(repo.gix(), &branch);
         wt.base_ref = meta.base_ref.clone();
         wt.pr = build_pr(&meta);
-        if !wt.is_missing
-            && let Some(upstream) = upstream_of(repo.gix(), &branch)
-        {
+        // Upstream is read from config and is known even for a missing worktree;
+        // ahead/behind needs the working directory, so it is computed only when
+        // the worktree exists and the upstream is not gone.
+        if let Some(upstream) = upstream_of(repo.gix(), &branch) {
             wt.upstream = Some(upstream.display.clone());
-            if !upstream.is_gone
+            if !wt.is_missing
+                && !upstream.is_gone
                 && let Ok((ahead, behind)) = ahead_behind(
                     git,
                     &wt.path,
@@ -138,6 +140,71 @@ pub fn build_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
         enrich_worktree(repo, git, abbrev, wt);
     }
     Ok(worktrees)
+}
+
+/// A comparable sort key value (text or numeric).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SortValue {
+    /// A textual key (e.g. branch, path).
+    Text(String),
+    /// A numeric key (e.g. ahead count, dirty rank, negated activity time).
+    Num(i64),
+}
+
+/// Extracts the sort key for a worktree, or `None` when the worktree has no
+/// value for that key (it sorts last).
+fn sort_value(worktree: &Worktree, key: crate::model::SortKey) -> Option<SortValue> {
+    use crate::model::SortKey;
+    match key {
+        SortKey::Branch => worktree.branch.clone().map(SortValue::Text),
+        SortKey::Path => Some(SortValue::Text(
+            worktree.path.to_string_lossy().into_owned(),
+        )),
+        SortKey::Ahead => worktree.ahead.map(|a| SortValue::Num(i64::from(a))),
+        SortKey::Behind => worktree.behind.map(|b| SortValue::Num(i64::from(b))),
+        SortKey::Dirty => dirty_rank(worktree).map(SortValue::Num),
+        // Negated so that ascending order is most-recent first (spec §7).
+        SortKey::Activity => worktree
+            .commit
+            .as_ref()
+            .and_then(|c| crate::time::parse_iso8601(&c.timestamp))
+            .map(|unix| SortValue::Num(-unix)),
+    }
+}
+
+/// The dirty-sort rank: modified/staged (0) before untracked-only (1) before
+/// clean (2); a missing worktree has no rank and sorts last.
+fn dirty_rank(worktree: &Worktree) -> Option<i64> {
+    match worktree.dirty {
+        None => None,
+        Some(true) => Some(0),
+        Some(false) => Some(if worktree.has_untracked == Some(true) {
+            1
+        } else {
+            2
+        }),
+    }
+}
+
+/// Sorts worktrees in place by the given spec (spec §7). Worktrees with no value
+/// for the sort key sort last regardless of direction.
+pub fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
+    worktrees.sort_by(|a, b| {
+        let ka = sort_value(a, spec.key);
+        let kb = sort_value(b, spec.key);
+        match (ka, kb) {
+            (Some(x), Some(y)) => {
+                if spec.descending {
+                    y.cmp(&x)
+                } else {
+                    x.cmp(&y)
+                }
+            }
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
 }
 
 /// The result of evaluating the remove/prune safety guards (spec §10/§12).
@@ -275,6 +342,89 @@ mod tests {
         w.has_untracked = untracked;
         w.ahead = ahead;
         w
+    }
+
+    #[test]
+    fn sort_by_branch_and_direction() {
+        use crate::model::{SortKey, SortSpec};
+        let mut worktrees = vec![wt_named("zebra"), wt_named("alpha"), wt_named("mango")];
+        sort_worktrees(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Branch,
+                descending: false,
+            },
+        );
+        assert_eq!(branches(&worktrees), vec!["alpha", "mango", "zebra"]);
+        sort_worktrees(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Branch,
+                descending: true,
+            },
+        );
+        assert_eq!(branches(&worktrees), vec!["zebra", "mango", "alpha"]);
+    }
+
+    #[test]
+    fn sort_nulls_last_regardless_of_direction() {
+        use crate::model::{SortKey, SortSpec};
+        let mut a = wt_named("has-upstream");
+        a.ahead = Some(5);
+        let b = wt_named("no-upstream"); // ahead None -> sorts last
+        let mut worktrees = vec![b.clone(), a.clone()];
+        sort_worktrees(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Ahead,
+                descending: false,
+            },
+        );
+        assert_eq!(branches(&worktrees), vec!["has-upstream", "no-upstream"]);
+        // Descending still keeps the null last.
+        sort_worktrees(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Ahead,
+                descending: true,
+            },
+        );
+        assert_eq!(branches(&worktrees), vec!["has-upstream", "no-upstream"]);
+    }
+
+    #[test]
+    fn sort_dirty_ranks_modified_first() {
+        use crate::model::{SortKey, SortSpec};
+        let mut modified = wt_named("modified");
+        modified.dirty = Some(true);
+        let mut untracked = wt_named("untracked");
+        untracked.dirty = Some(false);
+        untracked.has_untracked = Some(true);
+        let mut clean = wt_named("clean");
+        clean.dirty = Some(false);
+        clean.has_untracked = Some(false);
+        let mut worktrees = vec![clean, untracked, modified];
+        sort_worktrees(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Dirty,
+                descending: false,
+            },
+        );
+        assert_eq!(branches(&worktrees), vec!["modified", "untracked", "clean"]);
+    }
+
+    fn wt_named(branch: &str) -> Worktree {
+        let mut w = Worktree::new(PathBuf::from(format!("/r/{branch}")));
+        w.branch = Some(branch.to_string());
+        w
+    }
+
+    fn branches(worktrees: &[Worktree]) -> Vec<&str> {
+        worktrees
+            .iter()
+            .filter_map(|w| w.branch.as_deref())
+            .collect()
     }
 
     #[test]

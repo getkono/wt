@@ -12,8 +12,10 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::Result;
+use crate::git::cli::GitCli;
 
 /// A writable output stream (stdout or stderr) tagged with whether it is a TTY.
 pub struct Stream {
@@ -90,12 +92,28 @@ pub struct Cx {
     pub env: Env,
     /// The effective working directory (after any `-C`).
     pub cwd: PathBuf,
+    /// The `git` subprocess handle (real, or a fake in tests). Shared via `Arc`
+    /// so the TUI can clone it into async tasks.
+    pub git: Arc<dyn GitCli + Send + Sync>,
 }
 
 impl Cx {
-    /// Builds a context from injected streams, environment, and working dir.
-    pub fn new(out: Stream, err: Stream, env: Env, cwd: PathBuf) -> Self {
-        Self { out, err, env, cwd }
+    /// Builds a context from injected streams, environment, working dir, and the
+    /// `git` handle.
+    pub fn new(
+        out: Stream,
+        err: Stream,
+        env: Env,
+        cwd: PathBuf,
+        git: Arc<dyn GitCli + Send + Sync>,
+    ) -> Self {
+        Self {
+            out,
+            err,
+            env,
+            cwd,
+            git,
+        }
     }
 }
 

@@ -10,6 +10,7 @@
 //! whole dispatch path testable without touching the real terminal.
 
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod cx;
 pub mod error;
@@ -21,6 +22,7 @@ pub mod query;
 pub mod slug;
 pub mod template;
 pub mod time;
+pub mod util;
 pub mod worktree_service;
 
 #[cfg(test)]

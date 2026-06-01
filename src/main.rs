@@ -21,7 +21,8 @@ fn main() -> ExitCode {
     let out = wt::Stream::new(Box::new(std::io::stdout()), std::io::stdout().is_terminal());
     let err = wt::Stream::new(Box::new(std::io::stderr()), std::io::stderr().is_terminal());
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut cx = wt::Cx::new(out, err, wt::Env::from_real(), cwd);
+    let git = std::sync::Arc::new(wt::git::RealGit);
+    let mut cx = wt::Cx::new(out, err, wt::Env::from_real(), cwd, git);
 
     let args = std::env::args().skip(1).collect();
     ExitCode::from(wt::run(args, &mut cx))
