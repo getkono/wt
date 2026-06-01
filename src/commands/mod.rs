@@ -6,6 +6,8 @@ pub mod completions;
 pub mod list;
 pub mod new;
 pub mod path;
+pub mod prune;
+pub mod remove;
 pub mod root;
 pub mod shell_init;
 pub mod status_cmd;
@@ -97,4 +99,13 @@ pub fn candidate_label(worktree: &Worktree) -> String {
 pub fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
+}
+
+/// Prompts on stderr and reads a yes/no confirmation (default no).
+pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    cx.err.text(prompt)?;
+    cx.err.flush()?;
+    let line = cx.input.read_line()?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }

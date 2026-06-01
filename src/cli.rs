@@ -376,8 +376,10 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         }
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(_)) => stub("switch", cx),
-        Some(Command::Remove(_)) => stub("remove", cx),
-        Some(Command::Prune(_)) => stub("prune", cx),
+        Some(Command::Remove(args)) => {
+            crate::commands::remove::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
+        Some(Command::Prune(args)) => crate::commands::prune::run(cx, &args, json),
         Some(Command::Pr(_)) => stub("pr", cx),
         Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
         Some(Command::Path(args)) => crate::commands::path::run(cx, &args),
@@ -543,7 +545,7 @@ mod tests {
             vec!["status"],
             vec!["new", "b"],
             vec!["remove", "q"],
-            vec!["prune"],
+            vec!["prune", "--merged"],
             vec!["pr", "list"],
             vec!["config", "list"],
         ] {
@@ -589,8 +591,6 @@ mod tests {
         // handlers tested in their own modules.
         for (parts, label) in [
             (vec!["switch", "q"], "switch"),
-            (vec!["remove", "q"], "remove"),
-            (vec!["prune"], "prune"),
             (vec!["pr"], "pr"),
             (vec!["init"], "init"),
             (vec!["config", "list"], "config"),

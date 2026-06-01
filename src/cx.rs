@@ -53,6 +53,25 @@ impl Stream {
     }
 }
 
+/// A source of interactive input lines (e.g. `y/N` confirmations), injectable
+/// for testing.
+pub trait Input {
+    /// Reads one line of input, including any trailing newline. An empty string
+    /// signals end-of-input.
+    fn read_line(&mut self) -> Result<String>;
+}
+
+/// The production [`Input`] that reads from standard input.
+pub struct StdinInput;
+
+impl Input for StdinInput {
+    fn read_line(&mut self) -> Result<String> {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line)
+    }
+}
+
 /// A snapshot of environment variables, injectable for testing.
 pub struct Env {
     vars: HashMap<String, String>,
@@ -95,17 +114,20 @@ pub struct Cx {
     /// The `git` subprocess handle (real, or a fake in tests). Shared via `Arc`
     /// so the TUI can clone it into async tasks.
     pub git: Arc<dyn GitCli + Send + Sync>,
+    /// Interactive input source for confirmation prompts.
+    pub input: Box<dyn Input + Send>,
 }
 
 impl Cx {
-    /// Builds a context from injected streams, environment, working dir, and the
-    /// `git` handle.
+    /// Builds a context from injected streams, environment, working dir, the
+    /// `git` handle, and the input source.
     pub fn new(
         out: Stream,
         err: Stream,
         env: Env,
         cwd: PathBuf,
         git: Arc<dyn GitCli + Send + Sync>,
+        input: Box<dyn Input + Send>,
     ) -> Self {
         Self {
             out,
@@ -113,6 +135,7 @@ impl Cx {
             env,
             cwd,
             git,
+            input,
         }
     }
 }

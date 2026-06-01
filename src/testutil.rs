@@ -12,8 +12,28 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 
-use crate::cx::{Cx, Env, Stream};
+use std::collections::VecDeque;
+
+use crate::cx::{Cx, Env, Input, Stream};
 use crate::git::cli::{GitCli, RealGit};
+
+/// An [`Input`] that returns queued lines (then empty strings), for testing
+/// confirmation prompts.
+#[derive(Default)]
+pub(crate) struct CannedInput(VecDeque<String>);
+
+impl CannedInput {
+    /// Builds a canned input from the given responses (newlines are appended).
+    pub(crate) fn new(lines: &[&str]) -> Self {
+        CannedInput(lines.iter().map(|l| format!("{l}\n")).collect())
+    }
+}
+
+impl Input for CannedInput {
+    fn read_line(&mut self) -> crate::error::Result<String> {
+        Ok(self.0.pop_front().unwrap_or_default())
+    }
+}
 
 /// A cloneable in-memory writer whose contents can be inspected after writes.
 ///
@@ -85,6 +105,7 @@ pub(crate) fn test_cx_with_git(
         Env::from_map(env_map),
         PathBuf::from(cwd),
         git,
+        Box::new(CannedInput::default()),
     );
     TestCx { cx, out, err }
 }
