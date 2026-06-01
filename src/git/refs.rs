@@ -1,0 +1,162 @@
+//! Ref and branch reads via `gix` (spec §4): local branch listing, upstream
+//! resolution, ref resolution, and default-branch resolution.
+
+use crate::error::{Error, Result};
+
+/// The configured upstream of a local branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// Display form, e.g. `origin/feature/x`.
+    pub display: String,
+    /// The remote-tracking ref, e.g. `refs/remotes/origin/feature/x`.
+    pub tracking_ref: String,
+    /// Whether the tracking ref is gone (configured but no longer present).
+    pub is_gone: bool,
+}
+
+/// Lists local branch names (without the `refs/heads/` prefix).
+pub fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+    let platform = repo
+        .references()
+        .map_err(|e| Error::operation(format!("cannot read references: {e}")))?;
+    let iter = platform
+        .local_branches()
+        .map_err(|e| Error::operation(format!("cannot list branches: {e}")))?;
+    let mut names = Vec::new();
+    for reference in iter {
+        let reference =
+            reference.map_err(|e| Error::operation(format!("cannot read branch: {e}")))?;
+        names.push(reference.name().shorten().to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Resolves a revspec to an object id (hex), or `None` if it does not resolve.
+pub fn resolve_hex(repo: &gix::Repository, spec: &str) -> Option<String> {
+    repo.rev_parse_single(spec)
+        .ok()
+        .map(|id| id.detach().to_string())
+}
+
+/// Resolves the configured upstream of `branch`, or `None` if none is set.
+pub fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstream> {
+    let config = repo.config_snapshot();
+    let remote = config.string(format!("branch.{branch}.remote").as_str())?;
+    let merge = config.string(format!("branch.{branch}.merge").as_str())?;
+    let remote = remote.to_string();
+    let merge = merge.to_string();
+    let merge_branch = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+    let display = format!("{remote}/{merge_branch}");
+    let tracking_ref = format!("refs/remotes/{remote}/{merge_branch}");
+    let is_gone = resolve_hex(repo, &tracking_ref).is_none();
+    Some(Upstream {
+        display,
+        tracking_ref,
+        is_gone,
+    })
+}
+
+/// Resolves the repository's default branch (spec §7): the `origin/HEAD` target,
+/// falling back to the current branch. (`init.defaultBranch` is deliberately not
+/// consulted — it governs *new* repositories, not an existing repo's default.)
+pub fn default_branch(repo: &gix::Repository) -> Option<String> {
+    origin_head_branch(repo).or_else(|| current_branch(repo))
+}
+
+/// The current branch name, or `None` for a detached HEAD or unborn branch.
+pub fn current_branch(repo: &gix::Repository) -> Option<String> {
+    let head = repo.head().ok()?;
+    head.referent_name().map(|name| name.shorten().to_string())
+}
+
+/// The branch that `refs/remotes/origin/HEAD` points to, if any.
+fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
+    let reference = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
+    match reference.target() {
+        gix::refs::TargetRef::Symbolic(name) => {
+            // e.g. refs/remotes/origin/main -> main (handles slashes in names).
+            let full = name.as_bstr().to_string();
+            let rest = full.strip_prefix("refs/remotes/")?;
+            rest.split_once('/').map(|(_, branch)| branch.to_string())
+        }
+        gix::refs::TargetRef::Object(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::discover::Repo;
+    use crate::testutil::TestRepo;
+
+    #[test]
+    fn lists_local_branches_sorted() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "zeta"]);
+        repo.git(&["branch", "alpha"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let branches = local_branches(r.gix()).unwrap();
+        assert_eq!(branches, vec!["alpha", "main", "zeta"]);
+    }
+
+    #[test]
+    fn resolves_refs() {
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let r = Repo::discover(repo.root()).unwrap();
+        assert_eq!(resolve_hex(r.gix(), "HEAD").as_deref(), Some(head.as_str()));
+        assert_eq!(
+            resolve_hex(r.gix(), "refs/heads/main").as_deref(),
+            Some(head.as_str())
+        );
+        assert!(resolve_hex(r.gix(), "refs/heads/nope").is_none());
+    }
+
+    #[test]
+    fn upstream_present_absent_and_gone() {
+        let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        // No upstream configured.
+        assert!(upstream_of(r.gix(), "main").is_none());
+
+        // Configure an upstream with a present tracking ref.
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.git(&["config", "branch.main.remote", "origin"]);
+        repo.git(&["config", "branch.main.merge", "refs/heads/main"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let up = upstream_of(r.gix(), "main").unwrap();
+        assert_eq!(up.display, "origin/main");
+        assert_eq!(up.tracking_ref, "refs/remotes/origin/main");
+        assert!(!up.is_gone);
+
+        // Delete the tracking ref -> gone.
+        repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let up = upstream_of(r.gix(), "main").unwrap();
+        assert!(up.is_gone);
+    }
+
+    #[test]
+    fn default_branch_prefers_origin_head() {
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let r = Repo::discover(repo.root()).unwrap();
+        assert_eq!(default_branch(r.gix()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn default_branch_falls_back_to_current() {
+        let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        assert_eq!(default_branch(r.gix()).as_deref(), Some("main"));
+        assert_eq!(current_branch(r.gix()).as_deref(), Some("main"));
+    }
+}
