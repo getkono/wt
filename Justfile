@@ -6,6 +6,10 @@ default:
 run:
     cargo run
 
+# Build and install the `wt` binary to ~/.cargo/bin
+install:
+    cargo install --path .
+
 # Format the code
 format:
     cargo fmt
