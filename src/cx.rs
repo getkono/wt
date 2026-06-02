@@ -166,6 +166,20 @@ impl Cx {
             self.out.is_tty(),
         )
     }
+
+    /// Resolves whether to emit color for the TUI, which draws to the alternate
+    /// screen on stderr. The precedence (`--color`, `NO_COLOR`, `ui.color`) is
+    /// the same as [`Cx::color_enabled`], but `auto` follows stderr's TTY status
+    /// rather than stdout's (stdout is reserved for the chosen path and is
+    /// usually piped, e.g. `cd "$(wt)"`).
+    pub fn color_enabled_err(&self, ui_color: crate::output::color::ColorChoice) -> bool {
+        crate::output::color::resolve_color(
+            self.color_flag,
+            self.env.is_set_nonempty("NO_COLOR"),
+            Some(ui_color),
+            self.err.is_tty(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +219,29 @@ mod tests {
         assert!(env.is_set_nonempty("A"));
         assert!(!env.is_set_nonempty("E"));
         assert!(!env.is_set_nonempty("MISSING"));
+    }
+
+    #[test]
+    fn color_enabled_err_follows_stderr_tty() {
+        use crate::output::color::ColorChoice;
+        // stdout not a TTY (piped), stderr a TTY (where the TUI draws).
+        let mut t = test_cx(&[], "/work");
+        t.cx.err = Stream::new(Box::new(SharedBuf::new()), true);
+        // `auto` resolves against stderr for the TUI, but stdout for the CLI.
+        assert!(t.cx.color_enabled_err(ColorChoice::Auto));
+        assert!(!t.cx.color_enabled(ColorChoice::Auto));
+        // `never`/`always` and NO_COLOR keep the usual precedence.
+        assert!(!t.cx.color_enabled_err(ColorChoice::Never));
+        t.cx.color_flag = Some(ColorChoice::Always);
+        assert!(t.cx.color_enabled_err(ColorChoice::Never));
+    }
+
+    #[test]
+    fn color_enabled_err_honors_no_color() {
+        use crate::output::color::ColorChoice;
+        let mut t = test_cx(&[("NO_COLOR", "1")], "/work");
+        t.cx.err = Stream::new(Box::new(SharedBuf::new()), true);
+        assert!(!t.cx.color_enabled_err(ColorChoice::Always));
     }
 
     #[test]

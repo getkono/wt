@@ -1,17 +1,24 @@
 //! TUI rendering (spec §10): the list pane, detail pane, status bar, and modal
 //! overlays. Rendering is a pure function of [`App`] state into a ratatui
-//! [`Frame`], so it is testable with a `TestBackend`.
+//! [`Frame`], so it is testable with a `TestBackend`. Color comes from the
+//! resolved [`Theme`] (spec §11); when color is disabled the styles collapse to
+//! the monochrome look (dim/bold/reversed only).
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
-use crate::output::render::{ahead_behind_cell, branch_display};
+use crate::model::{PrState, SortKey, SortSpec, Worktree};
+use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
-use crate::tui::app::{App, CreateState, CreateStep, Mode, PrPickerState};
+use crate::tui::app::{App, CreateState, CreateStep, Mode, Pane, PrPickerState};
 use crate::tui::glyphs::Glyphs;
+use crate::tui::theme::Theme;
 
 /// Renders the whole TUI for the current state.
 pub fn render(app: &App, frame: &mut Frame) {
@@ -32,9 +39,9 @@ pub fn render(app: &App, frame: &mut Frame) {
     render_status_bar(app, frame, status);
 
     match &app.mode {
-        Mode::Help => render_help(frame, area),
-        Mode::Create(state) => render_create(state, frame, area),
-        Mode::PrPicker(state) => render_pr_picker(state, frame, area),
+        Mode::Help => render_help(app, frame, area),
+        Mode::Create(state) => render_create(app, state, frame, area),
+        Mode::PrPicker(state) => render_pr_picker(app, state, frame, area),
         Mode::ConfirmRemove(index) => render_confirm(app, *index, frame, area),
         _ => {}
     }
@@ -42,6 +49,26 @@ pub fn render(app: &App, frame: &mut Frame) {
 
 /// Renders the worktree list pane.
 fn render_list(app: &App, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
+    let focused = app.focus == Pane::List;
+    let block = Block::bordered()
+        .title(list_title(app, &theme, focused))
+        .border_style(theme.border(focused));
+
+    // Empty / no-matches state: a helpful hint rather than a blank pane.
+    if app.visible.is_empty() {
+        let msg = if app.filter.is_empty() {
+            "no worktrees".to_string()
+        } else {
+            format!("no matches for /{}", app.filter)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(msg, theme.hint_label()))).block(block),
+            area,
+        );
+        return;
+    }
+
     let glyphs = Glyphs::new(app.nerd_fonts);
     let now = now_unix();
     let items: Vec<ListItem> = app
@@ -50,7 +77,14 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
         .map(|&i| {
             let worktree = &app.worktrees[i];
             let loaded = app.is_loaded(worktree);
-            let item = ListItem::new(list_row(worktree, &glyphs, loaded, app.show_untracked, now));
+            let item = ListItem::new(list_row(
+                worktree,
+                &glyphs,
+                &theme,
+                loaded,
+                app.show_untracked,
+                now,
+            ));
             if worktree.is_missing {
                 item.style(Style::default().add_modifier(Modifier::DIM))
             } else {
@@ -60,109 +94,235 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let list = List::new(items)
-        .block(Block::bordered().title("worktrees"))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .block(block)
+        .highlight_style(theme.selection())
+        .highlight_symbol(theme.selection_symbol())
+        .highlight_spacing(HighlightSpacing::Always);
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// Builds one list-pane row.
+/// The list-pane title: name, visible/total counts, and the active sort.
+fn list_title(app: &App, theme: &Theme, focused: bool) -> Line<'static> {
+    let count = if app.visible.len() == app.worktrees.len() {
+        format!(" ({})", app.worktrees.len())
+    } else {
+        format!(" ({}/{})", app.visible.len(), app.worktrees.len())
+    };
+    Line::from(vec![
+        Span::styled("worktrees", theme.title(focused)),
+        Span::styled(count, theme.label()),
+        Span::styled(format!(" · {}", sort_label(&app.sort)), theme.label()),
+    ])
+}
+
+/// A short label for the active sort field and direction (e.g. `branch ↑`).
+fn sort_label(sort: &SortSpec) -> String {
+    let key = match sort.key {
+        SortKey::Branch => "branch",
+        SortKey::Dirty => "dirty",
+        SortKey::Ahead => "ahead",
+        SortKey::Behind => "behind",
+        SortKey::Activity => "activity",
+        SortKey::Path => "path",
+    };
+    let arrow = if sort.descending { "↓" } else { "↑" };
+    format!("{key} {arrow}")
+}
+
+/// Builds one list-pane row as colored spans.
 fn list_row(
-    worktree: &crate::model::Worktree,
+    worktree: &Worktree,
     glyphs: &Glyphs,
+    theme: &Theme,
     loaded: bool,
     show_untracked: bool,
     now: i64,
 ) -> Line<'static> {
-    let status = if worktree.is_current {
-        glyphs.current()
+    let (status, status_style) = if worktree.is_current {
+        (glyphs.current(), theme.current())
     } else if worktree.is_missing {
-        glyphs.missing()
+        (glyphs.missing(), theme.missing())
     } else if worktree.is_detached {
-        glyphs.detached()
+        (glyphs.detached(), theme.detached())
     } else {
-        " "
+        (" ", Style::default())
     };
-    let dirty = if !loaded {
-        glyphs.spinner().to_string()
+    let (dirty, dirty_style) = if !loaded {
+        (glyphs.spinner().to_string(), theme.spinner())
     } else if worktree.dirty == Some(true) {
-        glyphs.dirty().to_string()
+        (glyphs.dirty().to_string(), theme.dirty())
     } else if show_untracked && worktree.has_untracked == Some(true) {
-        glyphs.untracked().to_string()
+        (glyphs.untracked().to_string(), theme.untracked())
     } else if worktree.dirty.is_none() && !worktree.is_missing {
         // Loaded but the status read failed: the absent marker, not a blank that
         // would read as "clean" (spec §10).
-        glyphs.absent().to_string()
+        (glyphs.absent().to_string(), theme.absent())
     } else {
-        " ".to_string()
+        (" ".to_string(), Style::default())
     };
-    let ahead_behind = if loaded {
-        ahead_behind_cell(worktree)
-    } else {
-        glyphs.spinner().to_string()
-    };
-    let commit = match (&worktree.commit, loaded) {
-        (_, false) => glyphs.spinner().to_string(),
+
+    let mut spans = vec![
+        Span::styled(status.to_string(), status_style),
+        Span::styled(dirty, dirty_style),
+        Span::raw(" "),
+        Span::styled(
+            branch_display(worktree),
+            theme.branch(worktree.is_current, worktree.is_detached),
+        ),
+        Span::raw("  "),
+    ];
+    spans.extend(ahead_behind_spans(worktree, theme, loaded, glyphs));
+    spans.push(Span::raw("  "));
+    spans.extend(commit_spans(worktree, theme, loaded, glyphs, now));
+    spans.push(Span::raw("  "));
+    spans.extend(pr_spans(worktree, theme, loaded, glyphs));
+    Line::from(spans)
+}
+
+/// The ahead/behind cell as spans: green `↑N`, red `↓M`, or the absent marker
+/// (spinner while loading).
+fn ahead_behind_spans(
+    worktree: &Worktree,
+    theme: &Theme,
+    loaded: bool,
+    glyphs: &Glyphs,
+) -> Vec<Span<'static>> {
+    if !loaded {
+        return vec![Span::styled(glyphs.spinner().to_string(), theme.spinner())];
+    }
+    match (worktree.ahead, worktree.behind) {
+        (Some(ahead), Some(behind)) => vec![
+            Span::styled(format!("↑{ahead}"), theme.ahead(ahead)),
+            Span::raw(" "),
+            Span::styled(format!("↓{behind}"), theme.behind(behind)),
+        ],
+        _ => vec![Span::styled(glyphs.absent().to_string(), theme.absent())],
+    }
+}
+
+/// The commit cell as spans: orange hash, plain subject, dim relative time.
+fn commit_spans(
+    worktree: &Worktree,
+    theme: &Theme,
+    loaded: bool,
+    glyphs: &Glyphs,
+    now: i64,
+) -> Vec<Span<'static>> {
+    match (&worktree.commit, loaded) {
+        (_, false) => vec![Span::styled(glyphs.spinner().to_string(), theme.spinner())],
         (Some(c), true) => {
             let rel = parse_iso8601(&c.timestamp)
                 .map(|u| relative(now, u))
                 .unwrap_or_default();
-            format!("{} {} ({rel})", c.hash, c.subject)
+            vec![
+                Span::styled(c.hash.clone(), theme.commit_hash()),
+                Span::raw(" "),
+                Span::raw(c.subject.clone()),
+                Span::raw(" "),
+                Span::styled(format!("({rel})"), theme.time()),
+            ]
         }
         // Loaded, present, but no commit read: failed fetch → absent marker.
-        (None, true) if !worktree.is_missing => glyphs.absent().to_string(),
-        (None, true) => String::new(),
-    };
-    let pr = match (&worktree.pr, loaded) {
-        (_, false) => glyphs.spinner().to_string(),
-        (Some(pr), true) => format!("#{} ({})", pr.number, pr.state.as_str()),
-        (None, true) => String::new(),
-    };
-    Line::from(format!(
-        "{status}{dirty} {}  {ahead_behind}  {commit}  {pr}",
-        branch_display(worktree)
-    ))
+        (None, true) if !worktree.is_missing => {
+            vec![Span::styled(glyphs.absent().to_string(), theme.absent())]
+        }
+        (None, true) => Vec::new(),
+    }
+}
+
+/// The PR cell as a span, colored by PR state (spinner while loading).
+fn pr_spans(
+    worktree: &Worktree,
+    theme: &Theme,
+    loaded: bool,
+    glyphs: &Glyphs,
+) -> Vec<Span<'static>> {
+    match (&worktree.pr, loaded) {
+        (_, false) => vec![Span::styled(glyphs.spinner().to_string(), theme.spinner())],
+        (Some(pr), true) => vec![Span::styled(
+            format!("#{} ({})", pr.number, pr.state.as_str()),
+            theme.pr_state(pr.state),
+        )],
+        (None, true) => Vec::new(),
+    }
 }
 
 /// Renders the detail pane for the selected worktree (spec §10).
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
-    let block = Block::bordered().title("detail");
+    let theme = Theme::new(app.color);
+    let focused = app.focus == Pane::Detail;
+    let block = Block::bordered()
+        .title(Span::styled("detail", theme.title(focused)))
+        .border_style(theme.border(focused));
     let Some(worktree) = app.selected_worktree() else {
-        frame.render_widget(Paragraph::new("no worktree selected").block(block), area);
+        frame.render_widget(
+            Paragraph::new(Span::styled("no worktree selected", theme.hint_label())).block(block),
+            area,
+        );
         return;
     };
     let now = now_unix();
+    let glyphs = Glyphs::new(app.nerd_fonts);
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(format!("path:   {}", worktree.path.display())));
-    let branch = branch_display(worktree);
+    lines.push(Line::from(vec![
+        Span::styled("path:   ", theme.label()),
+        Span::raw(worktree.path.display().to_string()),
+    ]));
+    let branch_span = Span::styled(
+        branch_display(worktree),
+        theme.branch(worktree.is_current, worktree.is_detached),
+    );
     match &worktree.upstream {
-        Some(up) => lines.push(Line::from(format!("branch: {branch} → {up}"))),
-        None => lines.push(Line::from(format!("branch: {branch} (no upstream)"))),
+        Some(up) => lines.push(Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            branch_span,
+            Span::raw(" → "),
+            Span::styled(up.clone(), theme.accent()),
+        ])),
+        None => lines.push(Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            branch_span,
+            Span::styled(" (no upstream)", theme.label()),
+        ])),
     }
     if let Some(base) = &worktree.base_ref {
-        lines.push(Line::from(format!("base:   {base}")));
+        lines.push(Line::from(vec![
+            Span::styled("base:   ", theme.label()),
+            Span::raw(base.clone()),
+        ]));
     }
     if app.is_loaded(worktree) {
-        lines.push(Line::from(format!(
-            "status: {}  {}",
-            ahead_behind_cell(worktree),
-            dirty_label(worktree)
-        )));
-        detail_commits(&mut lines, worktree, now);
+        let mut status_spans = vec![Span::styled("status: ", theme.label())];
+        status_spans.extend(ahead_behind_spans(worktree, &theme, true, &glyphs));
+        status_spans.push(Span::raw("  "));
+        status_spans.push(dirty_label_span(worktree, &theme));
+        lines.push(Line::from(status_spans));
+        detail_commits(&mut lines, worktree, &theme, now);
         if let Some(pr) = &worktree.pr {
-            lines.push(Line::from(format!(
-                "pr:     #{} ({}) {}",
-                pr.number,
-                pr.state.as_str(),
-                pr.title
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("pr:     ", theme.label()),
+                Span::styled(
+                    format!("#{} ({}) ", pr.number, pr.state.as_str()),
+                    theme.pr_state(pr.state),
+                ),
+                Span::raw(pr.title.clone()),
+            ]));
             if let Some(url) = worktree.pr_url.as_deref().filter(|u| !u.is_empty()) {
-                lines.push(Line::from(format!("        {url}")));
+                lines.push(Line::from(vec![
+                    Span::raw("        "),
+                    Span::styled(url.to_string(), theme.url()),
+                ]));
             }
         }
     } else {
-        lines.push(Line::from("status: …"));
+        lines.push(Line::from(vec![
+            Span::styled("status: ", theme.label()),
+            Span::styled("…", theme.spinner()),
+        ]));
     }
+
+    let content_height = lines.len() as u16;
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -170,81 +330,119 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             .scroll((app.detail_scroll, 0)),
         area,
     );
+
+    // A scrollbar when the content overflows the viewport — a "more below" hint.
+    let viewport = area.height.saturating_sub(2);
+    if content_height > viewport {
+        let mut sb_state = ScrollbarState::new(content_height as usize)
+            .viewport_content_length(viewport as usize)
+            .position(app.detail_scroll as usize);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(scrollbar, area.inner(Margin::new(0, 1)), &mut sb_state);
+    }
 }
 
 /// Appends the "Last 5 commits" lines (short hash, subject, relative time) to
 /// the detail pane (spec §10), falling back to the single tip commit.
-fn detail_commits(lines: &mut Vec<Line<'static>>, worktree: &crate::model::Worktree, now: i64) {
+fn detail_commits(lines: &mut Vec<Line<'static>>, worktree: &Worktree, theme: &Theme, now: i64) {
     let rel = |ts: &str| {
         parse_iso8601(ts)
             .map(|u| relative(now, u))
             .unwrap_or_default()
     };
     if !worktree.recent_commits.is_empty() {
-        lines.push(Line::from("commits:"));
+        lines.push(Line::from(Span::styled("commits:", theme.label())));
         for c in &worktree.recent_commits {
-            lines.push(Line::from(format!(
-                "  {} {} ({})",
-                c.hash,
-                c.subject,
-                rel(&c.timestamp)
-            )));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(c.hash.clone(), theme.commit_hash()),
+                Span::raw(" "),
+                Span::raw(c.subject.clone()),
+                Span::raw(" "),
+                Span::styled(format!("({})", rel(&c.timestamp)), theme.time()),
+            ]));
         }
     } else if let Some(c) = &worktree.commit {
-        lines.push(Line::from(format!(
-            "commit: {} {} ({})",
-            c.hash,
-            c.subject,
-            rel(&c.timestamp)
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("commit: ", theme.label()),
+            Span::styled(c.hash.clone(), theme.commit_hash()),
+            Span::raw(" "),
+            Span::raw(c.subject.clone()),
+            Span::raw(" "),
+            Span::styled(format!("({})", rel(&c.timestamp)), theme.time()),
+        ]));
     }
 }
 
-/// A short dirty label for the detail pane.
-fn dirty_label(worktree: &crate::model::Worktree) -> &'static str {
+/// The dirty label span for the detail pane, colored by state.
+fn dirty_label_span(worktree: &Worktree, theme: &Theme) -> Span<'static> {
     match (worktree.dirty, worktree.has_untracked) {
-        (Some(true), _) => "modified",
-        (_, Some(true)) => "untracked",
-        (Some(false), _) => "clean",
-        _ => "",
+        (Some(true), _) => Span::styled("modified", theme.dirty()),
+        (_, Some(true)) => Span::styled("untracked", theme.untracked()),
+        (Some(false), _) => Span::styled("clean", theme.hint_label()),
+        _ => Span::raw(""),
     }
 }
 
 /// Renders the bottom status/help bar.
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let mode = match &app.mode {
+    let theme = Theme::new(app.color);
+    let mut spans = vec![Span::styled(
+        format!(" {} ", mode_label(&app.mode)),
+        theme.mode_chip(&app.mode),
+    )];
+    if !app.filter.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!("/{}", app.filter), theme.accent()));
+    }
+    spans.push(Span::raw("  "));
+    if let Some(message) = &app.status_message {
+        spans.push(Span::styled(message.clone(), theme.status(app.status_kind)));
+    } else {
+        for (i, (key, label)) in mode_hints(&app.mode).iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(*key, theme.hint_key()));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(*label, theme.hint_label()));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The short mode name shown in the status-bar chip.
+fn mode_label(mode: &Mode) -> &'static str {
+    match mode {
         Mode::List => "LIST",
         Mode::Filter => "FILTER",
         Mode::Create(_) => "CREATE",
         Mode::PrPicker(_) => "PR",
         Mode::ConfirmRemove(_) => "REMOVE",
         Mode::Help => "HELP",
-    };
-    let left = if app.filter.is_empty() {
-        format!(" {mode} ")
-    } else {
-        format!(" {mode}  /{} ", app.filter)
-    };
-    let hint = app
-        .status_message
-        .clone()
-        .unwrap_or_else(|| mode_hint(&app.mode).to_string());
-    let line = Line::from(vec![
-        Span::styled(left, Style::default().add_modifier(Modifier::REVERSED)),
-        Span::raw(format!(" {hint}")),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+    }
 }
 
-/// The right-side key hints for the current mode (spec §10 bottom bar).
-fn mode_hint(mode: &Mode) -> &'static str {
+/// The right-side key hints for the current mode (spec §10 bottom bar), as
+/// `(key, description)` pairs so the keys can be colored.
+fn mode_hints(mode: &Mode) -> &'static [(&'static str, &'static str)] {
     match mode {
-        Mode::List => "Enter switch  n new  d remove  p pr  / filter  ? help  q quit",
-        Mode::Filter => "type to filter  Enter apply  Esc clear",
-        Mode::Create(_) => "Enter next/submit  Esc cancel",
-        Mode::PrPicker(_) => "↑/↓ select  Enter checkout  Esc close",
-        Mode::ConfirmRemove(_) => "y remove  any other key cancels",
-        Mode::Help => "any key closes help",
+        Mode::List => &[
+            ("Enter", "switch"),
+            ("n", "new"),
+            ("d", "remove"),
+            ("p", "pr"),
+            ("/", "filter"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Mode::Filter => &[("type", "to filter"), ("Enter", "apply"), ("Esc", "clear")],
+        Mode::Create(_) => &[("Enter", "next/submit"), ("Esc", "cancel")],
+        Mode::PrPicker(_) => &[("↑/↓", "select"), ("Enter", "checkout"), ("Esc", "close")],
+        Mode::ConfirmRemove(_) => &[("y", "remove"), ("any other key", "cancels")],
+        Mode::Help => &[("any key", "closes help")],
     }
 }
 
@@ -261,72 +459,108 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// Renders the help overlay (the full key-binding reference).
-fn render_help(frame: &mut Frame, area: Rect) {
+fn render_help(app: &App, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
     let rect = centered(area, 56, 22);
     frame.render_widget(Clear, rect);
     let bindings = [
-        "↑/k  ↓/j        navigate",
-        "g/G            top / bottom",
-        "Enter          switch (cd) and exit",
-        "/              filter      Esc  clear / back",
-        "n              new worktree",
-        "d              remove worktree",
-        "p              PR picker",
-        "o              open in editor",
-        "r              refresh",
-        "s / S          sort cycle / reverse",
-        "Tab            switch pane",
-        "\\  + / -       sidebar toggle / resize",
-        "?              this help     q  quit",
+        ("↑/k  ↓/j", "navigate"),
+        ("g/G", "top / bottom"),
+        ("Enter", "switch (cd) and exit"),
+        ("/", "filter"),
+        ("Esc", "clear / back"),
+        ("n", "new worktree"),
+        ("d", "remove worktree"),
+        ("p", "PR picker"),
+        ("o", "open in editor"),
+        ("r", "refresh"),
+        ("s / S", "sort cycle / reverse"),
+        ("Tab", "switch pane"),
+        ("\\  + / -", "sidebar toggle / resize"),
+        ("?", "this help"),
+        ("q", "quit"),
     ];
-    let lines: Vec<Line> = bindings.iter().map(|b| Line::from(*b)).collect();
+    let lines: Vec<Line> = bindings
+        .iter()
+        .map(|(keys, desc)| {
+            Line::from(vec![
+                Span::styled(format!("{keys:<14}"), theme.hint_key()),
+                Span::styled((*desc).to_string(), theme.hint_label()),
+            ])
+        })
+        .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("help")),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("help", theme.title(true)))),
         rect,
     );
 }
 
 /// Renders the create-worktree prompt.
-fn render_create(state: &CreateState, frame: &mut Frame, area: Rect) {
+fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
     let rect = centered(area, 60, 8);
     frame.render_widget(Clear, rect);
-    let branch_label = if state.step == CreateStep::Branch {
-        "> branch:"
-    } else {
-        "  branch:"
-    };
-    let base_label = if state.step == CreateStep::Base {
-        "> base:  "
-    } else {
-        "  base:  "
+    let field = |active: bool, label: &'static str, value: &str| {
+        let (marker, style) = if active {
+            (label, theme.accent())
+        } else {
+            (label, theme.label())
+        };
+        Line::from(vec![
+            Span::styled(marker.to_string(), style),
+            Span::raw(format!(" {value}")),
+        ])
     };
     let mut lines = vec![
-        Line::from(format!("{branch_label} {}", state.branch)),
-        Line::from(format!("{base_label} {}", state.base)),
+        field(
+            state.step == CreateStep::Branch,
+            // Leading marker shows which field is active.
+            if state.step == CreateStep::Branch {
+                "> branch:"
+            } else {
+                "  branch:"
+            },
+            &state.branch,
+        ),
+        field(
+            state.step == CreateStep::Base,
+            if state.step == CreateStep::Base {
+                "> base:  "
+            } else {
+                "  base:  "
+            },
+            &state.base,
+        ),
     ];
     if let Some(err) = &state.error {
-        lines.push(Line::from(Span::styled(
-            format!("! {err}"),
-            Style::default().red(),
-        )));
+        lines.push(Line::from(Span::styled(format!("! {err}"), theme.error())));
     }
-    lines.push(Line::from("Enter: next/submit   Esc: cancel"));
+    lines.push(Line::from(Span::styled(
+        "Enter: next/submit   Esc: cancel",
+        theme.hint_label(),
+    )));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("new worktree")),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("new worktree", theme.title(true)))),
         rect,
     );
 }
 
 /// Renders the PR picker overlay.
-fn render_pr_picker(state: &PrPickerState, frame: &mut Frame, area: Rect) {
+fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
     let rect = centered(area, 70, 20);
     frame.render_widget(Clear, rect);
-    let block = Block::bordered().title("open pull requests");
+    let block = Block::bordered().title(Span::styled("open pull requests", theme.title(true)));
     if let Some(err) = &state.error {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(err.clone(), Style::default().red())),
-                Line::from("(run `gh auth login`)   Esc: close"),
+                Line::from(Span::styled(err.clone(), theme.error())),
+                Line::from(Span::styled(
+                    "(run `gh auth login`)   Esc: close",
+                    theme.hint_label(),
+                )),
             ])
             .block(block),
             rect,
@@ -334,60 +568,97 @@ fn render_pr_picker(state: &PrPickerState, frame: &mut Frame, area: Rect) {
         return;
     }
     if state.loading {
-        frame.render_widget(Paragraph::new("loading…").block(block), rect);
+        frame.render_widget(
+            Paragraph::new(Span::styled("loading…", theme.spinner())).block(block),
+            rect,
+        );
         return;
     }
     let items: Vec<ListItem> = state
         .prs
         .iter()
         .map(|pr| {
-            ListItem::new(Line::from(format!(
-                "#{}  {}  ({})  {}",
-                pr.number, pr.title, pr.author, pr.state
-            )))
+            let state_style = PrState::parse(&pr.state)
+                .map(|s| theme.pr_state(s))
+                .unwrap_or_default();
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("#{}", pr.number), theme.commit_hash()),
+                Span::raw("  "),
+                Span::raw(pr.title.clone()),
+                Span::raw("  "),
+                Span::styled(format!("({})", pr.author), theme.hint_label()),
+                Span::raw("  "),
+                Span::styled(pr.state.clone(), state_style),
+            ]))
         })
         .collect();
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .highlight_style(theme.selection())
+        .highlight_symbol(theme.selection_symbol())
+        .highlight_spacing(HighlightSpacing::Always);
     let mut list_state = ListState::default().with_selected(Some(state.selected));
     frame.render_stateful_widget(list, rect, &mut list_state);
 }
 
 /// Renders the confirm-remove dialog.
 fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
     let rect = centered(area, 60, 9);
     frame.render_widget(Clear, rect);
     let Some(worktree) = app.worktrees.get(index) else {
         return;
     };
     let mut lines = vec![
-        Line::from(format!("branch: {}", branch_display(worktree))),
-        Line::from(format!("path:   {}", worktree.path.display())),
+        Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            Span::styled(
+                branch_display(worktree),
+                theme.branch(worktree.is_current, worktree.is_detached),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("path:   ", theme.label()),
+            Span::raw(worktree.path.display().to_string()),
+        ]),
     ];
     if worktree.is_missing {
-        lines.push(Line::from("(directory already deleted)"));
+        lines.push(Line::from(Span::styled(
+            "(directory already deleted)",
+            theme.hint_label(),
+        )));
     } else {
         let guard = crate::worktree_service::guard_status(worktree, app.remove_untracked_blocks);
         if guard.dirty {
             lines.push(Line::from(Span::styled(
                 "(has uncommitted changes — data may be lost)",
-                Style::default().red(),
+                theme.error(),
             )));
         }
         // Unpushed work: a branch with no upstream is treated as unpushed and so
         // is flagged here, matching the guard (spec §10/§12).
         match worktree.ahead {
             Some(ahead) if ahead > 0 => {
-                lines.push(Line::from(format!("({ahead} unpushed commit(s))")));
+                lines.push(Line::from(Span::styled(
+                    format!("({ahead} unpushed commit(s))"),
+                    theme.warning(),
+                )));
             }
-            None => lines.push(Line::from("(no upstream — unpushed work)")),
+            None => lines.push(Line::from(Span::styled(
+                "(no upstream — unpushed work)",
+                theme.warning(),
+            ))),
             _ => {}
         }
     }
-    lines.push(Line::from("Remove this worktree? [y/N]"));
+    lines.push(Line::from(vec![
+        Span::raw("Remove this worktree? ["),
+        Span::styled("y", theme.warning()),
+        Span::raw("/N]"),
+    ]));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("confirm remove")),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("confirm remove", theme.error()))),
         rect,
     );
 }
@@ -396,17 +667,36 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::testutil::{app, wt};
-    use crate::tui::app::{CreateState, PrItem, PrPickerState};
+    use crate::tui::app::{CreateState, PrItem, PrPickerState, StatusKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
 
     /// Renders the app to a TestBackend and returns the buffer as text.
     fn render_to_text(app: &App, w: u16, h: u16) -> String {
+        buffer_text(&render_to_buffer(app, w, h))
+    }
+
+    /// Renders the app to a TestBackend and returns the raw (styled) buffer.
+    fn render_to_buffer(app: &App, w: u16, h: u16) -> Buffer {
         let backend = TestBackend::new(w, h);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(app, f)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        buffer_text(&buffer)
+        terminal.backend().buffer().clone()
+    }
+
+    /// The foreground color of the first cell rendering `symbol`.
+    fn cell_fg(buffer: &Buffer, symbol: &str) -> Color {
+        let area = buffer.area;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buffer[(x, y)].symbol() == symbol {
+                    return buffer[(x, y)].fg;
+                }
+            }
+        }
+        panic!("symbol {symbol:?} not found");
     }
 
     fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
@@ -614,5 +904,114 @@ mod tests {
         let text = render_to_text(&a, 100, 20);
         assert!(text.contains("FILTER"));
         assert!(text.contains("/feat"));
+    }
+
+    #[test]
+    fn list_markers_are_colored_and_gate_on_color_flag() {
+        let mut a = app(&[("main", true)]);
+        a.worktrees[0].ahead = Some(1);
+        a.worktrees[0].behind = Some(2);
+        a.worktrees[0].dirty = Some(true);
+        // Colored: status/dirty/ahead/behind cells carry a foreground color.
+        let buf = render_to_buffer(&a, 100, 20);
+        assert_ne!(cell_fg(&buf, "*"), Color::Reset); // current marker (green)
+        assert_ne!(cell_fg(&buf, "M"), Color::Reset); // dirty (yellow)
+        assert_ne!(cell_fg(&buf, "↑"), Color::Reset); // ahead (green)
+        assert_ne!(cell_fg(&buf, "↓"), Color::Reset); // behind (red)
+        assert_ne!(cell_fg(&buf, "↑"), cell_fg(&buf, "↓")); // distinct hues
+        // Monochrome: the same cells fall back to the default foreground.
+        a.color = false;
+        let mono = render_to_buffer(&a, 100, 20);
+        assert_eq!(cell_fg(&mono, "*"), Color::Reset);
+        assert_eq!(cell_fg(&mono, "M"), Color::Reset);
+        assert_eq!(cell_fg(&mono, "↑"), Color::Reset);
+    }
+
+    #[test]
+    fn pr_state_cell_is_colored() {
+        use crate::model::{Pr, PrState};
+        let mut a = app(&[("main", true)]);
+        a.worktrees[0].pr = Some(Pr {
+            number: 7,
+            state: PrState::Open,
+            title: "t".into(),
+        });
+        let buf = render_to_buffer(&a, 120, 20);
+        // The PR cell '#' is colored by state when color is on.
+        assert_ne!(cell_fg(&buf, "#"), Color::Reset);
+    }
+
+    #[test]
+    fn focused_pane_border_differs_from_unfocused() {
+        let mut a = app(&[("main", true)]);
+        a.focus = Pane::List;
+        let list_focused = render_to_buffer(&a, 100, 20);
+        a.focus = Pane::Detail;
+        let detail_focused = render_to_buffer(&a, 100, 20);
+        // (0,0) is the list pane's top-left border corner.
+        assert_ne!(list_focused[(0, 0)].fg, detail_focused[(0, 0)].fg);
+    }
+
+    #[test]
+    fn list_title_shows_count_and_sort() {
+        let a = app(&[("main", true), ("feature/x", false)]);
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("(2)"));
+        assert!(text.contains("branch ↑"));
+    }
+
+    #[test]
+    fn filtered_title_shows_visible_over_total() {
+        let mut a = app(&[("alpha", true), ("beta", false)]);
+        a.filter_push('a');
+        a.filter_push('l');
+        a.filter_push('p'); // matches only "alpha"
+        assert_eq!(a.visible.len(), 1);
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("(1/2)"));
+    }
+
+    #[test]
+    fn empty_filter_shows_no_matches_hint() {
+        let mut a = app(&[("alpha", true)]);
+        a.filter_push('z');
+        a.filter_push('z');
+        a.filter_push('z');
+        assert!(a.visible.is_empty());
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("no matches for /zzz"));
+    }
+
+    #[test]
+    fn detail_scrollbar_appears_when_content_overflows() {
+        use crate::model::Commit;
+        let mut a = app(&[("main", true)]);
+        a.worktrees[0].recent_commits = (0..40)
+            .map(|i| Commit {
+                hash: format!("h{i:05}"),
+                subject: "s".into(),
+                author: "a".into(),
+                timestamp: "2024-01-15T10:30:00Z".into(),
+            })
+            .collect();
+        // A short pane forces overflow; the scrollbar thumb glyph appears.
+        let text = render_to_text(&a, 100, 12);
+        assert!(text.contains('█'));
+    }
+
+    #[test]
+    fn status_message_colored_by_kind() {
+        let mut a = app(&[("main", true)]);
+        a.set_status("ZEBRA", StatusKind::Success);
+        let ok = render_to_buffer(&a, 100, 20);
+        a.set_status("ZEBRA", StatusKind::Error);
+        let err = render_to_buffer(&a, 100, 20);
+        a.set_status("ZEBRA", StatusKind::Info);
+        let info = render_to_buffer(&a, 100, 20);
+        // 'Z' only appears in the status message, so it locates the cell.
+        assert_ne!(cell_fg(&ok, "Z"), Color::Reset); // success colored
+        assert_ne!(cell_fg(&err, "Z"), Color::Reset); // error colored
+        assert_eq!(cell_fg(&info, "Z"), Color::Reset); // info uncolored
+        assert_ne!(cell_fg(&ok, "Z"), cell_fg(&err, "Z")); // success != error
     }
 }

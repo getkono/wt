@@ -40,6 +40,18 @@ pub enum Pane {
     Detail,
 }
 
+/// The severity of a transient status-bar message, used to color it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusKind {
+    /// A neutral, uncolored message.
+    #[default]
+    Info,
+    /// A successful action (e.g. "created feature/x").
+    Success,
+    /// A failed action (e.g. a git error).
+    Error,
+}
+
 /// The create-worktree prompt state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateState {
@@ -126,6 +138,8 @@ pub struct App {
     pub nerd_fonts: bool,
     /// Whether mouse support is enabled.
     pub mouse: bool,
+    /// Whether color output is enabled (spec §11 precedence, resolved once).
+    pub color: bool,
     /// Set when the user quits without switching.
     pub quit: bool,
     /// Set to the chosen path when the user switches (Enter).
@@ -135,6 +149,8 @@ pub struct App {
     loaded_paths: std::collections::HashSet<PathBuf>,
     /// A transient status/error line shown in the status bar.
     pub status_message: Option<String>,
+    /// The severity of `status_message`, used to color it.
+    pub status_kind: StatusKind,
     /// Set when the terminal became too small to continue (spec §10).
     pub too_small: bool,
 }
@@ -156,6 +172,8 @@ pub struct AppConfig {
     pub nerd_fonts: bool,
     /// Whether mouse support is enabled.
     pub mouse: bool,
+    /// Whether color output is enabled (spec §11 precedence, resolved once).
+    pub color: bool,
 }
 
 impl App {
@@ -169,6 +187,7 @@ impl App {
         App {
             loaded_paths,
             status_message: None,
+            status_kind: StatusKind::Info,
             too_small: false,
             worktrees,
             visible,
@@ -187,9 +206,16 @@ impl App {
             remove_untracked_blocks: config.remove_untracked_blocks,
             nerd_fonts: config.nerd_fonts,
             mouse: config.mouse,
+            color: config.color,
             quit: false,
             chosen: None,
         }
+    }
+
+    /// Sets the transient status-bar message and its severity (for coloring).
+    pub fn set_status(&mut self, message: impl Into<String>, kind: StatusKind) {
+        self.status_message = Some(message.into());
+        self.status_kind = kind;
     }
 
     /// The currently selected worktree, if any.
@@ -392,6 +418,7 @@ pub(crate) mod testutil {
                 remove_untracked_blocks: false,
                 nerd_fonts: false,
                 mouse: true,
+                color: true,
             },
             (100, 30),
         )
