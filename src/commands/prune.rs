@@ -260,10 +260,12 @@ mod tests {
     fn gone_prunes_missing_worktrees() {
         let repo = TestRepo::init();
         make_wt(&repo, "goner");
-        let wt_path = repo.root().parent().unwrap().join(format!(
-            "{}.worktrees/goner",
-            repo.root().file_name().unwrap().to_string_lossy()
-        ));
+        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
+        let wt_path = repo
+            .root()
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}.worktrees/{repo_name}-goner"));
         std::fs::remove_dir_all(&wt_path).unwrap();
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
         super::run(&mut t.cx, &prune_args(false, true, false, true), false).unwrap();

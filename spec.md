@@ -172,7 +172,7 @@ New worktrees are placed according to a configurable **path template**. The defa
 keeps worktrees adjacent to the repo but out of it:
 
 ```
-default: {repo_parent}/{repo}.worktrees/{branch_slug}
+default: {repo_parent}/{repo}.worktrees/{repo}-{branch_slug}
 ```
 
 Available template variables: `{repo_parent}` (dir containing the repo root),
@@ -182,7 +182,7 @@ directory: `{repo_root}` is the bare repo path, `{repo}` its directory name, and
 `{repo_parent}` its containing directory.
 
 Common presets the docs should call out:
-- **Sibling (default):** `{repo_parent}/{repo}.worktrees/{branch_slug}`
+- **Sibling (default):** `{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}`
 - **Subdir:** `{repo_root}/.worktrees/{branch_slug}` (recommend adding to `.gitignore`)
 - **Central:** `{home}/worktrees/{repo}/{branch_slug}`
 
@@ -674,7 +674,7 @@ Two layers, merged with **flags > per-repo > global > built-in defaults**:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `path_template` | string | `{repo_parent}/{repo}.worktrees/{branch_slug}` | Worktree store template (§6) |
+| `path_template` | string | `{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}` | Worktree store template (§6) |
 | `default_base` | string | resolved default branch | Base ref for `new` when branch is created |
 | `copy` | string[] | `[]` | Glob patterns to copy into new worktrees (§8) |
 | `hooks.post_create` | string | — | Shell command run after worktree creation (§8) |
