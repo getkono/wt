@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 
 /// The default worktree-store template (spec §6 "Sibling").
-pub const DEFAULT_TEMPLATE: &str = "{repo_parent}/{repo}.worktrees/{branch_slug}";
+pub const DEFAULT_TEMPLATE: &str = "{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}";
 
 /// The values substituted into a path template. For a bare repository these
 /// resolve against the bare repo's own directory (spec §6).
@@ -109,7 +109,7 @@ mod tests {
         let p = render(DEFAULT_TEMPLATE, &vars()).unwrap();
         assert_eq!(
             p,
-            PathBuf::from("/home/u/code/proj.worktrees/feature-login")
+            PathBuf::from("/home/u/code/proj.worktrees/proj-feature-login")
         );
     }
 

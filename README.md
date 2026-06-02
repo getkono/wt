@@ -79,8 +79,9 @@ These are the things worth knowing up front; the rest is discoverable from
 `--help` and the TUI.
 
 - **Where worktrees are created.** New worktrees follow a configurable path
-  template. The default keeps them beside the repo, out of it:
-  `{repo_parent}/{repo}.worktrees/{branch_slug}`. Change it with
+  template. The default keeps them beside the repo, out of it, and prefixes each
+  worktree directory with the repo name so it's obvious which repo you're in:
+  `{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}`. Change it with
   `wt config set path_template …`. Common alternatives: a subdir inside the repo,
   `{repo_root}/.worktrees/{branch_slug}` (add it to `.gitignore`), or a central
   store, `{home}/worktrees/{repo}/{branch_slug}`. Worktrees you made by hand

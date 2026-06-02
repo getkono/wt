@@ -45,7 +45,7 @@ fn default_contents(path_template: Option<&str>) -> String {
     match path_template {
         Some(template) => out.push_str(&format!("path_template = \"{template}\"\n")),
         None => out.push_str(
-            "# path_template = \"{repo_parent}/{repo}.worktrees/{branch_slug}\"\n\
+            "# path_template = \"{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}\"\n\
              # copy = [\".env\"]\n",
         ),
     }
@@ -145,7 +145,7 @@ mod tests {
             Some(".worktrees/".to_string())
         );
         assert_eq!(
-            super::subdir_store("{repo_parent}/{repo}.worktrees/{branch_slug}"),
+            super::subdir_store("{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}"),
             None
         );
     }

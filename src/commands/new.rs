@@ -351,11 +351,19 @@ mod tests {
         let err = super::run(&mut t.cx, &RealHookRunner, &args("rollme"), false).unwrap_err();
         assert!(err.to_string().contains("simulated failure"));
 
-        let target = repo.root().parent().unwrap().join(format!(
-            "{}.worktrees",
-            repo.root().file_name().unwrap().to_string_lossy()
-        ));
-        assert!(!target.join("rollme").exists(), "worktree not rolled back");
+        let repo_name = repo
+            .root()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let target = repo
+            .root()
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}.worktrees"));
+        let leaf = format!("{repo_name}-rollme");
+        assert!(!target.join(leaf).exists(), "worktree not rolled back");
         assert!(repo.git(&["branch", "--list", "rollme"]).trim().is_empty());
     }
 

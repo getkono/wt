@@ -295,11 +295,11 @@ mod tests {
     }
 
     fn wt_dir(repo: &TestRepo, branch: &str) -> std::path::PathBuf {
-        repo.root().parent().unwrap().join(format!(
-            "{}.worktrees/{}",
-            repo.root().file_name().unwrap().to_string_lossy(),
-            branch
-        ))
+        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
+        repo.root()
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
     }
 
     #[test]
