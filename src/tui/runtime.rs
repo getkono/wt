@@ -19,14 +19,15 @@ use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::hooks::RealHookRunner;
 use crate::model::{SortSpec, Worktree};
-use crate::tui::app::{App, AppConfig, Mode, PrItem};
+use crate::tui::app::{App, AppConfig, Mode, PrItem, StatusKind};
 use crate::tui::event::Effect;
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
 use crate::worktree_service::{build_worktrees, enumerate_worktrees};
 
-/// Builds the [`AppConfig`] from the resolved configuration.
-pub(crate) fn app_config(config: &Config) -> AppConfig {
+/// Builds the [`AppConfig`] from the resolved configuration and the resolved
+/// color decision (spec §11 precedence).
+pub(crate) fn app_config(config: &Config, color: bool) -> AppConfig {
     AppConfig {
         keymap: config.keymap(),
         sort: SortSpec::default(),
@@ -35,6 +36,7 @@ pub(crate) fn app_config(config: &Config) -> AppConfig {
         remove_untracked_blocks: config.remove_untracked_blocks,
         nerd_fonts: config.ui_nerd_fonts,
         mouse: config.ui_mouse,
+        color,
     }
 }
 
@@ -44,7 +46,10 @@ pub fn run_tui(cx: &mut Cx) -> Result<Option<PathBuf>> {
     let session = open_session(cx, git.as_ref())?;
     let sync_worktrees = enumerate_worktrees(&session.repo, git.as_ref())?;
     let size = crossterm::terminal::size().unwrap_or((100, 30));
-    let mut app = App::new(sync_worktrees, app_config(&session.config), size);
+    // The TUI draws to the alternate screen on stderr, so resolve color against
+    // stderr (stdout is reserved for the chosen path and is usually piped).
+    let color = cx.color_enabled_err(session.config.ui_color);
+    let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
     app.mark_loading();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -227,12 +232,12 @@ pub(crate) fn do_create(
     match commands::new::run(cx, &RealHookRunner, &args, false) {
         Ok(_) => {
             app.mode = Mode::List;
-            app.status_message = Some(format!("created {branch}"));
+            app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, &session.primary_root);
         }
         Err(e) => match &mut app.mode {
             Mode::Create(state) => state.error = Some(e.to_string()),
-            _ => app.status_message = Some(e.to_string()),
+            _ => app.set_status(e.to_string(), StatusKind::Error),
         },
     }
 }
@@ -259,8 +264,8 @@ pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: us
         no_hooks: false,
     };
     match commands::remove::remove_query(cx, &RealHookRunner, &query, &opts, false) {
-        Ok(_) => app.status_message = Some(format!("removed {query}")),
-        Err(e) => app.status_message = Some(e.to_string()),
+        Ok(_) => app.set_status(format!("removed {query}"), StatusKind::Success),
+        Err(e) => app.set_status(e.to_string(), StatusKind::Error),
     }
     app.mode = Mode::List;
     do_refresh(cx, app, &session.primary_root);
@@ -277,12 +282,12 @@ pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, numb
     match commands::pr::run(cx, &RealHookRunner, &args, false) {
         Ok(_) => {
             app.mode = Mode::List;
-            app.status_message = Some(format!("checked out PR #{number}"));
+            app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
             do_refresh(cx, app, &session.primary_root);
         }
         Err(e) => match &mut app.mode {
             Mode::PrPicker(state) => state.error = Some(e.to_string()),
-            _ => app.status_message = Some(e.to_string()),
+            _ => app.set_status(e.to_string(), StatusKind::Error),
         },
     }
 }
@@ -313,7 +318,7 @@ mod tests {
         let t = test_cx(&[], repo.root().to_str().unwrap());
         let session = open_session(&t.cx, &crate::git::RealGit).unwrap();
         let worktrees = build_worktrees(&session.repo, &crate::git::RealGit).unwrap();
-        let app = App::new(worktrees, app_config(&session.config), (100, 30));
+        let app = App::new(worktrees, app_config(&session.config, true), (100, 30));
         (t, session, app)
     }
 
@@ -324,9 +329,11 @@ mod tests {
             ui_mouse: false,
             ..Config::default()
         };
-        let cfg = app_config(&config);
+        let cfg = app_config(&config, false);
         assert!(cfg.nerd_fonts);
         assert!(!cfg.mouse);
+        assert!(!cfg.color);
+        assert!(app_config(&config, true).color);
     }
 
     #[test]
