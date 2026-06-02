@@ -18,7 +18,8 @@ You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on you
 just install        # cargo install --path .  → installs `wt` to ~/.cargo/bin
 ```
 
-Make sure `~/.cargo/bin` is on your `PATH`.
+Make sure `~/.cargo/bin` is on your `PATH`. Then enable shell integration
+(below) — that single step also gives you the best tab completion.
 
 ### 2. Enable shell integration (required for navigation)
 
@@ -37,10 +38,17 @@ wt shell-init fish | source
 wt shell-init powershell | Out-String | Invoke-Expression
 ```
 
-This also wires up tab completion. **Without it, `switch`, `new`, `pr`, and the
-TUI just print a path instead of moving you.** Supported shells: bash, zsh, fish,
-powershell, elvish. On anything else, `wt switch --print-path` lets you build your
-own `cd` alias.
+**Without it, `switch`, `new`, `pr`, and the TUI just print a path instead of
+moving you.** Supported shells: bash, zsh, fish, powershell, elvish. On anything
+else, `wt switch --print-path` lets you build your own `cd` alias.
+
+This is also the recommended way to get tab completion. The `shell-init` snippet
+installs *dynamic* completions that suggest live values — real worktree names,
+branches, and PR numbers (via `wt __complete`) — not just the static command and
+flag list. Because you need to source it for navigation anyway, it's the single
+step that sets up everything; there's no separate completions install. (A static,
+values-unaware script is still available via `wt completions <shell>` if you want
+to manage it yourself.)
 
 ### 3. Authenticate `gh` (only for PR commands)
 

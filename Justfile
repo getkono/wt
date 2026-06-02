@@ -9,6 +9,12 @@ run:
 # Build and install the `wt` binary to ~/.cargo/bin
 install:
     cargo install --path .
+    @echo ''
+    @echo '✓ Installed wt to ~/.cargo/bin'
+    @echo 'Next: enable shell integration for navigation + dynamic tab completion.'
+    @echo 'Add to your shell rc (see README → "Enable shell integration"):'
+    @echo '  eval "$(wt shell-init bash)"    # bash / zsh'
+    @echo '  wt shell-init fish | source     # fish'
 
 # Format the code
 format:
