@@ -1,7 +1,10 @@
 //! Ref and branch reads via `gix` (spec §4): local branch listing, upstream
 //! resolution, ref resolution, and default-branch resolution.
 
+use std::path::Path;
+
 use crate::error::{Error, Result};
+use crate::git::cli::GitCli;
 
 /// The configured upstream of a local branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +58,15 @@ pub fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstream> {
         tracking_ref,
         is_gone,
     })
+}
+
+/// Whether commit-ish `a` is an ancestor of `b` (i.e. `a` is fully merged into
+/// `b`), determined offline via `git merge-base --is-ancestor`. Returns `false`
+/// if a ref is missing or the command errors.
+pub fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
+    git.run_raw(root, &["merge-base", "--is-ancestor", a, b])
+        .map(|o| o.success)
+        .unwrap_or(false)
 }
 
 /// Resolves the repository's default branch (spec §7): the `origin/HEAD` target,
@@ -158,5 +170,48 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         assert_eq!(default_branch(r.gix()).as_deref(), Some("main"));
         assert_eq!(current_branch(r.gix()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn is_ancestor_true_when_merged_false_when_divergent() {
+        use crate::git::cli::RealGit;
+        let repo = TestRepo::init();
+        // `topic` branches off main with no extra commits: an ancestor of main.
+        repo.git(&["branch", "topic"]);
+        assert!(is_ancestor(
+            &RealGit,
+            repo.root(),
+            "refs/heads/topic",
+            "refs/heads/main"
+        ));
+        // Add a commit on `topic` so it diverges: no longer an ancestor of main.
+        repo.git(&["checkout", "topic"]);
+        repo.write("t.txt", "1\n");
+        repo.commit_all("topic work");
+        assert!(!is_ancestor(
+            &RealGit,
+            repo.root(),
+            "refs/heads/topic",
+            "refs/heads/main"
+        ));
+        // ...but main is still an ancestor of topic.
+        assert!(is_ancestor(
+            &RealGit,
+            repo.root(),
+            "refs/heads/main",
+            "refs/heads/topic"
+        ));
+    }
+
+    #[test]
+    fn is_ancestor_false_for_missing_ref() {
+        use crate::git::cli::RealGit;
+        let repo = TestRepo::init();
+        assert!(!is_ancestor(
+            &RealGit,
+            repo.root(),
+            "refs/heads/nope",
+            "refs/heads/main"
+        ));
     }
 }

@@ -9,7 +9,7 @@ use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::default_branch;
+use crate::git::{default_branch, is_ancestor};
 use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
 use crate::worktree_service::{build_worktrees, guard_status};
@@ -200,13 +200,6 @@ fn maybe_delete_branch(
         return false;
     }
     git.run_raw(root, &["branch", "-D", branch]).is_ok()
-}
-
-/// Whether `a` is an ancestor of `b` (i.e. `a` is fully merged into `b`).
-fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
-    git.run_raw(root, &["merge-base", "--is-ancestor", a, b])
-        .map(|o| o.success)
-        .unwrap_or(false)
 }
 
 /// Clears the worktree's `wt.*` metadata, best-effort.
