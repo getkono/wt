@@ -346,9 +346,10 @@ impl App {
         }
     }
 
-    /// Sorts `worktrees` by the current spec.
+    /// Sorts `worktrees` by the current spec, keeping the base (primary)
+    /// worktree pinned first (issue #4).
     fn apply_sort(&mut self) {
-        crate::worktree_service::sort_worktrees(&mut self.worktrees, self.sort);
+        crate::worktree_service::sort_worktrees_base_first(&mut self.worktrees, self.sort);
     }
 
     /// Recomputes `visible` from the filter, clamping the selection.
@@ -480,6 +481,35 @@ mod tests {
         assert_eq!(
             a.selected_worktree().unwrap().branch.as_deref(),
             Some("alpha")
+        );
+    }
+
+    #[test]
+    fn base_worktree_stays_first_after_sort() {
+        let mut a = app(&[("zebra", false), ("main", true), ("alpha", false)]);
+        // Mark "main" as the primary (base) worktree.
+        let base = a
+            .worktrees
+            .iter()
+            .position(|w| w.branch.as_deref() == Some("main"))
+            .unwrap();
+        a.worktrees[base].is_main = true;
+        a.sort = SortSpec {
+            key: SortKey::Branch,
+            descending: false,
+        };
+        a.resort_preserving_selection();
+        // The base is pinned first; the rest follow in sorted order.
+        let order: Vec<&str> = a
+            .visible
+            .iter()
+            .map(|&i| a.worktrees[i].branch.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["main", "alpha", "zebra"]);
+        // The current worktree (main) remains selected after the resort.
+        assert_eq!(
+            a.selected_worktree().unwrap().branch.as_deref(),
+            Some("main")
         );
     }
 

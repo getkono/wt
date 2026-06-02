@@ -219,6 +219,19 @@ pub fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) 
     });
 }
 
+/// Sorts worktrees by `spec`, then pins the primary ("base") worktree to the
+/// front so the TUI always shows it first regardless of the active sort
+/// (issue #4). The CLI's `list` calls [`sort_worktrees`] directly and keeps the
+/// pure `--sort` order.
+pub fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
+    sort_worktrees(worktrees, spec);
+    // Stable move-to-front of the primary worktree, preserving the sorted order
+    // of the remaining rows.
+    if let Some(pos) = worktrees.iter().position(|w| w.is_main) {
+        worktrees[..=pos].rotate_right(1);
+    }
+}
+
 /// The result of evaluating the remove/prune safety guards (spec §10/§12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuardStatus {
@@ -430,6 +443,50 @@ mod tests {
             },
         );
         assert_eq!(branches(&worktrees), vec!["modified", "untracked", "clean"]);
+    }
+
+    #[test]
+    fn base_first_pins_primary_regardless_of_sort_direction() {
+        use crate::model::{SortKey, SortSpec};
+        let mut base = wt_named("main");
+        base.is_main = true;
+        // The base sits in the middle of the input and would sort to the
+        // middle by branch name; it must still come out first.
+        let mut worktrees = vec![wt_named("zebra"), base, wt_named("alpha")];
+        sort_worktrees_base_first(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Branch,
+                descending: false,
+            },
+        );
+        // Base first, then the rest in ascending order.
+        assert_eq!(branches(&worktrees), vec!["main", "alpha", "zebra"]);
+        sort_worktrees_base_first(
+            &mut worktrees,
+            SortSpec {
+                key: SortKey::Branch,
+                descending: true,
+            },
+        );
+        // Base still first, the rest now descending.
+        assert_eq!(branches(&worktrees), vec!["main", "zebra", "alpha"]);
+    }
+
+    #[test]
+    fn base_first_is_plain_sort_when_no_primary() {
+        use crate::model::{SortKey, SortSpec};
+        let spec = SortSpec {
+            key: SortKey::Branch,
+            descending: false,
+        };
+        let mut pinned = vec![wt_named("zebra"), wt_named("alpha"), wt_named("mango")];
+        let mut plain = pinned.clone();
+        sort_worktrees_base_first(&mut pinned, spec);
+        sort_worktrees(&mut plain, spec);
+        // With no `is_main` worktree, base-first is identical to a plain sort.
+        assert_eq!(branches(&pinned), branches(&plain));
+        assert_eq!(branches(&pinned), vec!["alpha", "mango", "zebra"]);
     }
 
     fn wt_named(branch: &str) -> Worktree {
