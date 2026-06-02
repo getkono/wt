@@ -602,32 +602,105 @@ fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: R
 }
 
 /// Renders the confirm-remove dialog.
+///
+/// Beyond the branch, path, and safety warnings, this surfaces the same
+/// glanceable context as the detail pane — upstream/base, ahead/behind and
+/// working-tree state, the tip commit with its age, and any recorded PR — so a
+/// deletion decision can be made without leaving the dialog (issue #7). All of
+/// this is already on the [`crate::model::Worktree`] row; nothing new is read
+/// from git. The dialog grows to fit its content.
 fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
     let theme = Theme::new(app.color);
-    let rect = centered(area, 60, 9);
-    frame.render_widget(Clear, rect);
     let Some(worktree) = app.worktrees.get(index) else {
         return;
     };
-    let mut lines = vec![
-        Line::from(vec![
+    let now = now_unix();
+    let glyphs = Glyphs::new(app.nerd_fonts);
+    let loaded = app.is_loaded(worktree);
+
+    // Branch + upstream (or "(no upstream)"), mirroring the detail pane.
+    let branch_span = Span::styled(
+        branch_display(worktree),
+        theme.branch(worktree.is_current, worktree.is_detached),
+    );
+    let mut lines = match &worktree.upstream {
+        Some(up) => vec![Line::from(vec![
             Span::styled("branch: ", theme.label()),
-            Span::styled(
-                branch_display(worktree),
-                theme.branch(worktree.is_current, worktree.is_detached),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("path:   ", theme.label()),
-            Span::raw(worktree.path.display().to_string()),
-        ]),
-    ];
+            branch_span,
+            Span::raw(" → "),
+            Span::styled(up.clone(), theme.accent()),
+        ])],
+        None => vec![Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            branch_span,
+            Span::styled(" (no upstream)", theme.label()),
+        ])],
+    };
+    lines.push(Line::from(vec![
+        Span::styled("path:   ", theme.label()),
+        Span::raw(worktree.path.display().to_string()),
+    ]));
+    if let Some(base) = &worktree.base_ref {
+        lines.push(Line::from(vec![
+            Span::styled("base:   ", theme.label()),
+            Span::raw(base.clone()),
+        ]));
+    }
+
     if worktree.is_missing {
+        // No working tree to read — the safety marker is all the context there is.
         lines.push(Line::from(Span::styled(
             "(directory already deleted)",
             theme.hint_label(),
         )));
     } else {
+        // Glanceable status / commit / PR, gated on the async load like the
+        // detail pane: a spinner until the row's fields are available.
+        if loaded {
+            let mut status_spans = vec![Span::styled("status: ", theme.label())];
+            status_spans.extend(ahead_behind_spans(worktree, &theme, true, &glyphs));
+            status_spans.push(Span::raw("  "));
+            status_spans.push(dirty_label_span(worktree, &theme));
+            lines.push(Line::from(status_spans));
+            if let Some(c) = &worktree.commit {
+                let rel = parse_iso8601(&c.timestamp)
+                    .map(|u| relative(now, u))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("commit: ", theme.label()),
+                    Span::styled(c.hash.clone(), theme.commit_hash()),
+                    Span::raw(" "),
+                    Span::raw(c.subject.clone()),
+                    Span::raw(" "),
+                    Span::styled(format!("({rel})"), theme.time()),
+                ]));
+            }
+            if let Some(pr) = &worktree.pr {
+                lines.push(Line::from(vec![
+                    Span::styled("pr:     ", theme.label()),
+                    Span::styled(
+                        format!("#{} ({}) ", pr.number, pr.state.as_str()),
+                        theme.pr_state(pr.state),
+                    ),
+                    Span::raw(pr.title.clone()),
+                ]));
+                if let Some(url) = worktree.pr_url.as_deref().filter(|u| !u.is_empty()) {
+                    lines.push(Line::from(vec![
+                        Span::raw("        "),
+                        Span::styled(url.to_string(), theme.url()),
+                    ]));
+                }
+            }
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("status: ", theme.label()),
+                Span::styled("…", theme.spinner()),
+            ]));
+        }
+
+        // Safety warnings, layered on top of the neutral context above for
+        // emphasis. The dirty warning mirrors the remove guard; the unpushed
+        // warning treats a branch with no upstream as unpushed (spec §10/§12).
         let guard = crate::worktree_service::guard_status(worktree, app.remove_untracked_blocks);
         if guard.dirty {
             lines.push(Line::from(Span::styled(
@@ -635,8 +708,6 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
                 theme.error(),
             )));
         }
-        // Unpushed work: a branch with no upstream is treated as unpushed and so
-        // is flagged here, matching the guard (spec §10/§12).
         match worktree.ahead {
             Some(ahead) if ahead > 0 => {
                 lines.push(Line::from(Span::styled(
@@ -651,14 +722,23 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
             _ => {}
         }
     }
+
+    lines.push(Line::from(""));
     lines.push(Line::from(vec![
         Span::raw("Remove this worktree? ["),
         Span::styled("y", theme.warning()),
         Span::raw("/N]"),
     ]));
+
+    // Size to the content (plus the top/bottom border); `centered` clamps to the
+    // available area, and `Wrap` keeps long paths/subjects/titles from overflowing.
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(Span::styled("confirm remove", theme.error()))),
+            .block(Block::bordered().title(Span::styled("confirm remove", theme.error())))
+            .wrap(Wrap { trim: false }),
         rect,
     );
 }
@@ -845,6 +925,124 @@ mod tests {
         a.worktrees.push(wt_un);
         a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
         assert!(!render_to_text(&a, 100, 30).contains("data may be lost"));
+    }
+
+    #[test]
+    fn confirm_remove_shows_glanceable_context() {
+        // A clean, fully-merged branch: the dialog surfaces upstream, base, the
+        // tip commit, ahead/behind, and the PR — and raises no data-loss alarm.
+        use crate::model::{Commit, Pr, PrState};
+        let mut w = wt("feature/login", false);
+        w.dirty = Some(false);
+        w.has_untracked = Some(false);
+        w.ahead = Some(0);
+        w.behind = Some(0);
+        w.upstream = Some("origin/feature/login".into());
+        w.base_ref = Some("main".into());
+        w.commit = Some(Commit {
+            hash: "abc1234".into(),
+            subject: "Add login page".into(),
+            author: "Alice".into(),
+            timestamp: "2024-01-15T10:30:00Z".into(),
+        });
+        w.pr = Some(Pr {
+            number: 42,
+            state: PrState::Merged,
+            title: "Add login page".into(),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("origin/feature/login"));
+        assert!(text.contains("base:"));
+        assert!(text.contains("abc1234"));
+        assert!(text.contains("Add login page"));
+        assert!(text.contains("#42 (merged)"));
+        assert!(text.contains("↑0"));
+        assert!(!text.contains("data may be lost"));
+        assert!(text.contains("[y/N]"));
+    }
+
+    #[test]
+    fn confirm_remove_layers_warnings_over_context() {
+        // Dirty + ahead + an open PR: the neutral context lines AND both safety
+        // warnings appear together (the ahead/unpushed overlap is intentional).
+        use crate::model::{Commit, Pr, PrState};
+        let mut w = wt("feature/x", false);
+        w.dirty = Some(true);
+        w.ahead = Some(2);
+        w.behind = Some(0);
+        w.upstream = Some("origin/feature/x".into());
+        w.commit = Some(Commit {
+            hash: "def5678".into(),
+            subject: "WIP work".into(),
+            author: "Bob".into(),
+            timestamp: "2024-02-20T08:00:00Z".into(),
+        });
+        w.pr = Some(Pr {
+            number: 7,
+            state: PrState::Open,
+            title: "Feature x".into(),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("def5678"));
+        assert!(text.contains("#7 (open)"));
+        assert!(text.contains("data may be lost"));
+        assert!(text.contains("2 unpushed commit(s)"));
+    }
+
+    #[test]
+    fn confirm_remove_missing_skips_status_lines() {
+        // A missing worktree has no working tree to read: the dialog shows only
+        // the deletion marker, never the commit context (even if a tip commit
+        // happens to be recorded on the row).
+        use crate::model::Commit;
+        let mut w = wt("feature/gone", false);
+        w.is_missing = true;
+        w.base_ref = Some("main".into());
+        w.commit = Some(Commit {
+            hash: "ccc9999".into(),
+            subject: "Gone branch tip".into(),
+            author: "Dan".into(),
+            timestamp: "2024-04-01T00:00:00Z".into(),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("directory already deleted"));
+        assert!(!text.contains("ccc9999"));
+        assert!(!text.contains("Gone branch tip"));
+    }
+
+    #[test]
+    fn confirm_remove_shows_spinner_until_loaded() {
+        // Before the row's async fields load, the dialog shows a spinner and must
+        // not leak commit content (matching the detail pane).
+        use crate::model::Commit;
+        let mut w = wt("feature/loading", false);
+        w.commit = Some(Commit {
+            hash: "aaa0000".into(),
+            subject: "Secret subject".into(),
+            author: "Carol".into(),
+            timestamp: "2024-03-01T00:00:00Z".into(),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loading(); // pushed row is unloaded anyway, but be explicit
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        // The dialog rendered (its branch is shown) but the commit is withheld.
+        assert!(text.contains("feature/loading"));
+        assert!(!text.contains("Secret subject"));
+        assert!(!text.contains("aaa0000"));
     }
 
     #[test]
