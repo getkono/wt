@@ -11,6 +11,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::gh::GhClient;
 use crate::git::cli::GitCli;
+use crate::git::resolve_hex;
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::slug::slugify_with_fallback;
 use crate::time::{now_unix, parse_iso8601, relative};
@@ -102,13 +103,18 @@ fn pr_checkout(
     let number = view.number;
     let state = view.pr_state();
 
-    // If the PR's head branch is already a worktree, just switch to it.
+    // If the PR's head branch is already a worktree, record/refresh its PR
+    // metadata (§7) and switch to it. The worktree was not necessarily created
+    // by `wt`, so this does not mark it "created by wt".
     let worktrees = enumerate_worktrees(&session.repo, git)?;
     if let Some(existing) = worktrees
         .iter()
         .find(|w| w.branch.as_deref() == Some(branch.as_str()))
     {
         let path = existing.path.clone();
+        wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
+        wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
+        wtconfig::write_base_ref(git, &root, &branch, &base)?;
         return emit_worktree(
             cx,
             &path,
@@ -128,11 +134,14 @@ fn pr_checkout(
         ],
     )?;
     let head_oid = git
-        .run(&root, &["rev-parse", "FETCH_HEAD"])
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+        .run(&root, &["rev-parse", "FETCH_HEAD"])?
+        .trim()
+        .to_string();
     let short_hash = head_oid.get(..7).unwrap_or(&head_oid).to_string();
     let slug = slugify_with_fallback(&branch, &short_hash);
+    // If a local branch of this name already exists (but has no worktree), check
+    // it out as-is rather than failing on `-b` (mirrors `wt new`).
+    let branch_exists = resolve_hex(session.repo.gix(), &format!("refs/heads/{branch}")).is_some();
 
     let worktree_path = resolve_target(
         &session.config,
@@ -147,27 +156,35 @@ fn pr_checkout(
         std::fs::create_dir_all(parent)?;
     }
     let target_str = worktree_path.to_string_lossy().into_owned();
-    git.run(
-        &root,
-        &["worktree", "add", "-b", &branch, &target_str, "FETCH_HEAD"],
-    )?;
+    if branch_exists {
+        git.run(&root, &["worktree", "add", &target_str, &branch])?;
+    } else {
+        git.run(
+            &root,
+            &["worktree", "add", "-b", &branch, &target_str, "FETCH_HEAD"],
+        )?;
+    }
 
     // Record metadata + copy, rolling back on failure (§13).
-    let outcome = (|| -> Result<()> {
+    let copy_outcome = match (|| -> Result<crate::copy::CopyOutcome> {
         wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
+        wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
         wtconfig::write_base_ref(git, &root, &branch, &base)?;
         wtconfig::mark_created_by_wt(git, &root, &branch)?;
         let source = session
             .repo
             .current_workdir()
             .unwrap_or_else(|| root.clone());
-        copy_ignored_files(git, &source, &worktree_path, &session.config.copy)?;
-        Ok(())
-    })();
-    if let Err(e) = outcome {
-        rollback_worktree(git, &root, &worktree_path, &branch, true);
-        return Err(e);
-    }
+        copy_ignored_files(git, &source, &worktree_path, &session.config.copy)
+    })() {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // Only delete the branch on rollback if we created it here (§13).
+            rollback_worktree(git, &root, &worktree_path, &branch, !branch_exists);
+            return Err(e);
+        }
+    };
+    crate::commands::log_copy_outcome(cx, &copy_outcome);
 
     let ctx = HookContext {
         worktree_path: worktree_path.clone(),
@@ -218,6 +235,7 @@ mod tests {
             is_draft: false,
             head_ref_name: head.into(),
             base_ref_name: base.into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
         }
     }
 
@@ -270,6 +288,70 @@ mod tests {
                 .trim(),
             "open"
         );
+        assert!(
+            repo.git(&["config", "--get", "wt.pr-feature.prUrl"])
+                .contains("pull/123")
+        );
+    }
+
+    #[test]
+    fn pr_on_existing_worktree_records_metadata_without_marking_created() {
+        // Re-running `wt pr <n>` on a branch that already has a worktree records
+        // the PR metadata (§7) without marking the worktree as created by wt.
+        let repo = repo_with_pr(55);
+        repo.add_worktree("pr-feature", "../pf");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_view(view(55, "pr-feature", "main")));
+        let code = super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(Some("55"), None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.pr-feature.prNumber"])
+                .trim(),
+            "55"
+        );
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.pr-feature.baseRef"])
+                .trim(),
+            "main"
+        );
+        assert!(
+            repo.git(&["config", "--get", "wt.pr-feature.prUrl"])
+                .contains("pull/55")
+        );
+        // Not marked created-by-wt (the worktree predates this command). Keys are
+        // lowercased in `config --list`.
+        assert!(
+            !repo
+                .git(&["config", "--list"])
+                .contains("wt.pr-feature.createdbywt")
+        );
+    }
+
+    #[test]
+    fn pr_checks_out_existing_local_branch_without_a_worktree() {
+        // A local branch of the PR head name exists but has no worktree: check it
+        // out (no `-b`) rather than failing.
+        let repo = repo_with_pr(77);
+        repo.git(&["branch", "pr-feature"]);
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_view(view(77, "pr-feature", "main")));
+        let code = super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(Some("77"), None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let path = t.out.contents().trim().to_string();
+        assert!(std::path::Path::new(&path).is_dir());
+        assert!(path.ends_with("pr-feature"));
     }
 
     #[test]

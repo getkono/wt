@@ -10,7 +10,7 @@ use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::cli::{NewArgs, PrArgs, RemoveArgs};
+use crate::cli::{NewArgs, PrArgs};
 use crate::commands::{self, Session, open_session};
 use crate::config::Config;
 use crate::cx::Cx;
@@ -32,6 +32,7 @@ pub(crate) fn app_config(config: &Config) -> AppConfig {
         sort: SortSpec::default(),
         columns: config.list_columns.clone(),
         show_untracked: config.list_show_untracked,
+        remove_untracked_blocks: config.remove_untracked_blocks,
         nerd_fonts: config.ui_nerd_fonts,
         mouse: config.ui_mouse,
     }
@@ -61,6 +62,12 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App) -> Result<()> {
     install_panic_hook();
     let mut tui = Tui::enter(app.mouse)?;
     app.size = tui.size();
+    // Refuse to drive a terminal that is already too short, before the first
+    // paint (spec §10); the `Tui` guard restores the terminal on drop.
+    if app.size.1 < crate::tui::app::MIN_HEIGHT {
+        app.too_small = true;
+        return Ok(());
+    }
     tui.draw(app)?;
 
     // Load async data in the background and stream the result in.
@@ -230,7 +237,10 @@ pub(crate) fn do_create(
     }
 }
 
-/// Removes the worktree at `index` (force semantics) and refreshes.
+/// Removes the worktree at `index` and refreshes. The confirm dialog is itself
+/// the guard, so the worktree is removed even if dirty/unpushed; but an unmerged
+/// branch is never force-deleted here (spec §10/§12) — only a fully-merged
+/// wt-created branch is cleaned up.
 pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: usize) {
     let Some(worktree) = app.worktrees.get(index) else {
         return;
@@ -242,13 +252,13 @@ pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: us
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
-    let args = RemoveArgs {
-        query: query.clone(),
-        force: true,
+    let opts = commands::remove::RemoveOptions {
+        force_remove: true,
+        force_branch: false,
         keep_branch: false,
         no_hooks: false,
     };
-    match commands::remove::run(cx, &RealHookRunner, &args, false) {
+    match commands::remove::remove_query(cx, &RealHookRunner, &query, &opts, false) {
         Ok(_) => app.status_message = Some(format!("removed {query}")),
         Err(e) => app.status_message = Some(e.to_string()),
     }

@@ -32,7 +32,7 @@ wt() {
     switch|sw|new|pr|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
-        if [ "$__wt_arg" = "--json" ]; then command wt "$@"; return $?; fi
+        if [ "$__wt_arg" = "--json" ] || [ "$__wt_arg" = "--print-path" ]; then command wt "$@"; return $?; fi
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
@@ -79,7 +79,7 @@ wt() {
     switch|sw|new|pr|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
-        if [[ "$__wt_arg" == "--json" ]]; then command wt "$@"; return $?; fi
+        if [[ "$__wt_arg" == "--json" || "$__wt_arg" == "--print-path" ]]; then command wt "$@"; return $?; fi
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
@@ -113,7 +113,7 @@ const FISH: &str = r#"# wt shell integration (fish) — source this from your co
 function wt
     set -l cmd $argv[1]
     if test (count $argv) -eq 0; or contains -- "$cmd" switch sw new pr ui tui
-        if contains -- --json $argv
+        if contains -- --json $argv; or contains -- --print-path $argv
             command wt $argv
             return $status
         end
@@ -146,7 +146,7 @@ function wt {
     $nav = @('switch','sw','new','pr','ui','tui')
     $exe = (Get-Command wt -CommandType Application | Select-Object -First 1).Source
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
-        if ($args -contains '--json') { & $exe @args; return }
+        if ($args -contains '--json' -or $args -contains '--print-path') { & $exe @args; return }
         $out = & $exe @args
         if ($LASTEXITCODE -eq 0 -and $out) { Set-Location -- $out }
         elseif ($out) { Write-Output $out }
@@ -173,7 +173,7 @@ const ELVISH: &str = r#"# wt shell integration (elvish) — source this from you
 fn wt {|@a|
     var nav = [switch sw new pr ui tui]
     if (or (== (count $a) 0) (and (> (count $a) 0) (has-value $nav $a[0]))) {
-        if (has-value $a --json) {
+        if (or (has-value $a --json) (has-value $a --print-path)) {
             (external wt) $@a
             return
         }
@@ -226,6 +226,27 @@ mod tests {
                 "no dynamic completion for {shell:?}"
             );
             assert!(s.contains("switch"));
+            // `--print-path` forces print-only inside the wrapper (spec §5).
+            assert!(
+                s.contains("--print-path"),
+                "no --print-path passthrough for {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wrapper_passes_through_print_path() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            assert!(
+                snippet(shell).contains("--print-path"),
+                "{shell:?} wrapper ignores --print-path"
+            );
         }
     }
 

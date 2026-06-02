@@ -112,6 +112,9 @@ fn is_candidate(
     if args.merged
         && let Some(branch) = &worktree.branch
         && let Some(default) = default
+        // The default branch is an ancestor of itself; never prune a worktree
+        // that is checked out on the default branch.
+        && branch != default
         && is_ancestor(git, root, &format!("refs/heads/{branch}"), default)
     {
         return true;

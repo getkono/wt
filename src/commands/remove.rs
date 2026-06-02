@@ -14,21 +14,71 @@ use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
 use crate::worktree_service::{build_worktrees, guard_status};
 
-/// Removes the worktree matching `query`, applying the safety guards, running
-/// the pre-remove hook, and optionally deleting a fully-merged wt-created branch.
+/// Options controlling a removal. The worktree-removal force (skip the
+/// dirty/unpushed guards) is decoupled from the branch-deletion force (delete a
+/// branch that is not fully merged). The CLI's `--force` sets both; the TUI
+/// confirm dialog sets only `force_remove` — the dialog is itself the guard, so
+/// `y` may remove a dirty/unpushed worktree, but it must never silently
+/// force-delete an unmerged branch (spec §10/§12).
+pub struct RemoveOptions {
+    /// Skip the dirty/unpushed guards and pass `--force` to `git worktree remove`.
+    pub force_remove: bool,
+    /// Permit deleting a branch that is not fully merged into its base.
+    pub force_branch: bool,
+    /// Always keep the local branch.
+    pub keep_branch: bool,
+    /// Skip the pre-remove hook.
+    pub no_hooks: bool,
+}
+
+impl RemoveOptions {
+    /// Builds options from the CLI flags, where `--force` forces both removal
+    /// and unmerged-branch deletion.
+    pub fn from_args(args: &RemoveArgs) -> Self {
+        RemoveOptions {
+            force_remove: args.force,
+            force_branch: args.force,
+            keep_branch: args.keep_branch,
+            no_hooks: args.no_hooks,
+        }
+    }
+}
+
+/// Removes the worktree matching `args.query`, applying the safety guards,
+/// running the pre-remove hook, and optionally deleting a fully-merged
+/// wt-created branch.
 pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -> Result<u8> {
+    remove_query(
+        cx,
+        hooks,
+        &args.query,
+        &RemoveOptions::from_args(args),
+        json,
+    )
+}
+
+/// Resolves `query` to a worktree and removes it under the given options.
+/// Shared by the CLI (`run`) and the TUI confirm-remove dialog, which differ
+/// only in their [`RemoveOptions`].
+pub fn remove_query(
+    cx: &mut Cx,
+    hooks: &dyn HookRunner,
+    query: &str,
+    opts: &RemoveOptions,
+    json: bool,
+) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
     let root = session.primary_root.clone();
     let worktrees = build_worktrees(&session.repo, git)?;
 
-    let index = match resolve_query(cx, &worktrees, &args.query) {
+    let index = match resolve_query(cx, &worktrees, query) {
         Resolution::Found(index) => index,
         Resolution::Ambiguous => return Ok(3),
         Resolution::NotFound => {
             return Err(Error::NotFound {
-                query: args.query.clone(),
+                query: query.to_string(),
             });
         }
     };
@@ -54,7 +104,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
             &worktree,
             &meta,
             &session.config,
-            args,
+            opts,
             &default,
         );
         clear_metadata(git, &root, &worktree);
@@ -63,7 +113,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
 
     // Safety guards (spec §10/§12).
     let guard = guard_status(&worktree, session.config.remove_untracked_blocks);
-    if guard.blocks() && !args.force {
+    if guard.blocks() && !opts.force_remove {
         let mut reasons = Vec::new();
         if guard.dirty {
             reasons.push("has uncommitted changes");
@@ -76,7 +126,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
             reasons.join(" and ")
         )));
     }
-    if guard.blocks() && args.force {
+    if guard.blocks() && opts.force_remove {
         cx.err
             .line("warning: removing with uncommitted or unpushed work; data may be lost")?;
     }
@@ -94,13 +144,13 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
         cx,
         session.config.hooks_pre_remove.as_deref(),
         &ctx,
-        args.no_hooks,
-        args.force,
+        opts.no_hooks,
+        opts.force_remove,
     )?;
 
     // Remove the worktree.
     let path = worktree.path.to_string_lossy().into_owned();
-    if args.force {
+    if opts.force_remove {
         git.run(&root, &["worktree", "remove", "--force", &path])?;
     } else {
         git.run(&root, &["worktree", "remove", &path])?;
@@ -112,7 +162,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
         &worktree,
         &meta,
         &session.config,
-        args,
+        opts,
         &default,
     );
     clear_metadata(git, &root, &worktree);
@@ -120,21 +170,21 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
 }
 
 /// Deletes the branch if it is wt-created and either fully merged (and the
-/// config allows it) or `--force` (for an unmerged branch). Returns whether the
-/// branch was deleted.
+/// config allows it) or `force_branch` (for an unmerged branch). Returns whether
+/// the branch was deleted.
 fn maybe_delete_branch(
     git: &dyn GitCli,
     root: &Path,
     worktree: &Worktree,
     meta: &WtMeta,
     config: &Config,
-    args: &RemoveArgs,
+    opts: &RemoveOptions,
     default: &Option<String>,
 ) -> bool {
     let Some(branch) = &worktree.branch else {
         return false;
     };
-    if args.keep_branch || !meta.created_by_wt {
+    if opts.keep_branch || !meta.created_by_wt {
         return false;
     }
     let base = meta.base_ref.clone().or_else(|| default.clone());
@@ -144,7 +194,7 @@ fn maybe_delete_branch(
     let should_delete = if merged {
         config.remove_delete_merged_branch
     } else {
-        args.force
+        opts.force_branch
     };
     if !should_delete {
         return false;
@@ -317,6 +367,57 @@ mod tests {
         let (code, _, _) = run(&repo, &args("gone", false, false), false).unwrap();
         assert_eq!(code, 0);
         assert!(!repo.git(&["worktree", "list"]).contains("gone"));
+    }
+
+    /// Commits a new file on a worktree's branch so it is no longer merged into
+    /// its base.
+    fn make_unmerged(repo: &TestRepo, branch: &str) {
+        let wt = wt_dir(repo, branch);
+        std::fs::write(wt.join("change.txt"), "x\n").unwrap();
+        let dir = wt.to_string_lossy().into_owned();
+        repo.git(&["-C", &dir, "add", "-A"]);
+        repo.git(&["-C", &dir, "commit", "-q", "-m", "unmerged change"]);
+    }
+
+    #[test]
+    fn tui_force_remove_keeps_unmerged_branch() {
+        // The TUI confirm dialog removes a dirty/unpushed worktree (force_remove)
+        // but must never force-delete an unmerged branch (force_branch = false).
+        let repo = TestRepo::init();
+        make_wt(&repo, "tuionly");
+        make_unmerged(&repo, "tuionly");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let opts = super::RemoveOptions {
+            force_remove: true,
+            force_branch: false,
+            keep_branch: false,
+            no_hooks: true,
+        };
+        let code =
+            super::remove_query(&mut t.cx, &RealHookRunner, "tuionly", &opts, false).unwrap();
+        assert_eq!(code, 0);
+        assert!(!repo.git(&["worktree", "list"]).contains("tuionly"));
+        // The unmerged branch survives (no data loss).
+        assert!(
+            !repo.git(&["branch", "--list", "tuionly"]).trim().is_empty(),
+            "unmerged branch must not be force-deleted by the TUI"
+        );
+    }
+
+    #[test]
+    fn cli_force_remove_deletes_unmerged_branch() {
+        // By contrast, the CLI `--force` deletes the unmerged branch.
+        let repo = TestRepo::init();
+        make_wt(&repo, "cliforce");
+        make_unmerged(&repo, "cliforce");
+        let (code, _, _) = run(&repo, &args("cliforce", true, false), false).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            repo.git(&["branch", "--list", "cliforce"])
+                .trim()
+                .is_empty(),
+            "--force should delete the unmerged branch"
+        );
     }
 
     #[test]

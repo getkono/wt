@@ -17,7 +17,7 @@ pub mod worktrees;
 
 pub use aheadbehind::ahead_behind;
 pub use cli::{GitCli, GitOutput, RealGit};
-pub use commit::{CommitInfo, abbrev_len, commit_info};
+pub use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
 pub use discover::Repo;
 pub use porcelain::{RawWorktree, parse_worktree_list};
 pub use refs::{Upstream, default_branch, local_branches, resolve_hex, upstream_of};

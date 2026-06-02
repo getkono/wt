@@ -12,7 +12,8 @@ use crate::error::Result;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    abbrev_len, ahead_behind, commit_info, enumerate, resolve_hex, status_of, upstream_of,
+    abbrev_len, ahead_behind, commit_info, enumerate, recent_commits, resolve_hex, status_of,
+    upstream_of,
 };
 use crate::model::{Commit, Pr, PrState, Worktree};
 use crate::slug::slugify;
@@ -61,6 +62,7 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         let meta = wtconfig::read_meta(repo.gix(), &branch);
         wt.base_ref = meta.base_ref.clone();
         wt.pr = build_pr(&meta);
+        wt.pr_url = meta.pr_url.clone();
         // Upstream is read from config and is known even for a missing worktree;
         // ahead/behind needs the working directory, so it is computed only when
         // the worktree exists and the upstream is not gone.
@@ -90,15 +92,25 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         wt.has_untracked = Some(status.has_untracked);
     }
 
-    if let Some(oid) = tip_oid(repo, git, wt)
-        && let Ok(info) = commit_info(repo.gix(), &oid, abbrev)
-    {
-        wt.commit = Some(Commit {
-            hash: info.hash,
-            subject: info.subject,
-            author: info.author,
-            timestamp: iso8601(info.timestamp_unix),
-        });
+    if let Some(oid) = tip_oid(repo, git, wt) {
+        if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
+            wt.commit = Some(Commit {
+                hash: info.hash,
+                subject: info.subject,
+                author: info.author,
+                timestamp: iso8601(info.timestamp_unix),
+            });
+        }
+        // The last few commits power the TUI detail pane (spec §10).
+        wt.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
+            .into_iter()
+            .map(|info| Commit {
+                hash: info.hash,
+                subject: info.subject,
+                author: info.author,
+                timestamp: iso8601(info.timestamp_unix),
+            })
+            .collect();
     }
 }
 
@@ -227,7 +239,10 @@ impl GuardStatus {
 /// modified/staged tracked files (plus untracked when `untracked_blocks`);
 /// "unpushed" is `ahead > 0`, and a branch with no upstream counts as unpushed.
 pub fn guard_status(worktree: &Worktree, untracked_blocks: bool) -> GuardStatus {
-    let dirty = worktree.dirty.unwrap_or(false)
+    // An unknown dirty state on a *present* worktree (e.g. the status read
+    // failed) is treated as dirty so the guard fails safe; a missing worktree's
+    // `None` is legitimate and must not block (it skips the guards entirely).
+    let dirty = worktree.dirty.unwrap_or(!worktree.is_missing)
         || (untracked_blocks && worktree.has_untracked.unwrap_or(false));
     let unpushed = worktree.ahead.is_none_or(|ahead| ahead > 0);
     GuardStatus { dirty, unpushed }
@@ -255,6 +270,9 @@ mod tests {
         assert_eq!(main.dirty, Some(false));
         assert!(main.commit.is_some());
         assert_eq!(main.commit.as_ref().unwrap().subject, "init");
+        // The detail-pane recent-commits list is populated (spec §10).
+        assert_eq!(main.recent_commits.len(), 1);
+        assert_eq!(main.recent_commits[0].subject, "init");
 
         let feat = worktrees
             .iter()
@@ -442,5 +460,16 @@ mod tests {
         assert!(guard_status(&guard_wt(Some(false), Some(false), Some(3)), false).unpushed);
         // No upstream (ahead None) counts as unpushed.
         assert!(guard_status(&guard_wt(Some(false), Some(false), None), false).unpushed);
+    }
+
+    #[test]
+    fn guard_unknown_dirty_fails_safe_for_present_worktree() {
+        // A present worktree with an unknown dirty state (status read failed)
+        // is treated as dirty so removal fails safe.
+        let mut wt = guard_wt(None, None, Some(0));
+        assert!(guard_status(&wt, false).dirty);
+        // A missing worktree's `None` dirty is legitimate and must not block.
+        wt.is_missing = true;
+        assert!(!guard_status(&wt, false).dirty);
     }
 }

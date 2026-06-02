@@ -57,7 +57,7 @@ impl GhClient for RealGh {
                 "view",
                 target,
                 "--json",
-                "number,title,state,isDraft,headRefName,baseRefName",
+                "number,title,state,isDraft,headRefName,baseRefName,url",
             ],
         )?;
         serde_json::from_str(&output).map_err(Error::from)

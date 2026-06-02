@@ -21,6 +21,8 @@ pub struct WtMeta {
     pub pr_state: Option<String>,
     /// Cached PR title.
     pub pr_title: Option<String>,
+    /// Cached PR URL, for the TUI detail pane (§10).
+    pub pr_url: Option<String>,
     /// Whether the branch/worktree was created by `wt` (§10).
     pub created_by_wt: bool,
 }
@@ -45,6 +47,9 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
     let pr_title = config
         .string(key(branch, "prTitle").as_str())
         .map(|v| v.to_string());
+    let pr_url = config
+        .string(key(branch, "prUrl").as_str())
+        .map(|v| v.to_string());
     let created_by_wt = config
         .boolean(key(branch, "createdByWt").as_str())
         .unwrap_or(false);
@@ -53,6 +58,7 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
         pr_number,
         pr_state,
         pr_title,
+        pr_url,
         created_by_wt,
     }
 }
@@ -69,6 +75,12 @@ pub fn write_pr(
     write_pr_number(git, repo_root, branch, number)?;
     git.run(repo_root, &["config", &key(branch, "prState"), state])?;
     git.run(repo_root, &["config", &key(branch, "prTitle"), title])?;
+    Ok(())
+}
+
+/// Records the PR URL for `branch` (shown in the TUI detail pane).
+pub fn write_pr_url(git: &dyn GitCli, repo_root: &Path, branch: &str, url: &str) -> Result<()> {
+    git.run(repo_root, &["config", &key(branch, "prUrl"), url])?;
     Ok(())
 }
 

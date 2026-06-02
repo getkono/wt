@@ -179,8 +179,10 @@ pub fn resolve_target(
     Ok(alt)
 }
 
-/// Rolls back a partially-created worktree: removes it, prunes, and (optionally)
-/// deletes the created branch (spec §13). Best-effort.
+/// Rolls back a partially-created worktree: removes it, prunes, and (when the
+/// branch was created here) deletes the branch and clears the `wt.*` metadata
+/// written during creation, so nothing half-created is left behind (spec §13).
+/// Best-effort.
 pub fn rollback_worktree(
     git: &dyn GitCli,
     root: &Path,
@@ -193,6 +195,9 @@ pub fn rollback_worktree(
     let _ = git.run_raw(root, &["worktree", "prune"]);
     if created_branch {
         let _ = git.run_raw(root, &["branch", "-D", branch]);
+        // Remove the metadata written before the failure (else a later plain-git
+        // worktree on this branch name would show stale PR/base info).
+        let _ = crate::config::wtconfig::clear_meta(git, root, branch);
     }
 }
 
@@ -205,6 +210,23 @@ pub fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
         .into_iter()
         .find(|w| same_path(&w.path, target))
         .ok_or_else(|| Error::operation("created worktree not found"))
+}
+
+/// Logs the copy step's outcome to stderr at `-v` (spec §8: copied files and
+/// files skipped because the target already exists are silent by default and
+/// logged at verbose).
+pub fn log_copy_outcome(cx: &mut Cx, outcome: &crate::copy::CopyOutcome) {
+    if cx.verbose == 0 {
+        return;
+    }
+    for path in &outcome.copied {
+        let _ = cx.err.line(&format!("copied {}", path.display()));
+    }
+    for path in &outcome.skipped_existing {
+        let _ = cx
+            .err
+            .line(&format!("skipped (target exists) {}", path.display()));
+    }
 }
 
 /// Emits a navigation result: JSON object, the bare path (for `cd`), or a stderr

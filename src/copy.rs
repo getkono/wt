@@ -35,7 +35,7 @@ pub fn copy_ignored_files(
         return Ok(outcome);
     }
     let globset = build_globset(patterns)?;
-    let tracked = tracked_files(git, source);
+    let tracked = tracked_files(git, source)?;
 
     for rel in walk_files(source) {
         if !globset.is_match(&rel) || tracked.contains(&rel) {
@@ -74,17 +74,16 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     })
 }
 
-/// The set of tracked files (relative paths) in `source`, best-effort.
-fn tracked_files(git: &dyn GitCli, source: &Path) -> HashSet<PathBuf> {
-    git.run(source, &["ls-files", "-z"])
-        .map(|output| {
-            output
-                .split('\0')
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default()
+/// The set of tracked files (relative paths) in `source`. A failure to list
+/// them is propagated rather than swallowed: copying would otherwise risk
+/// overwriting/duplicating tracked files, which spec §8 forbids.
+fn tracked_files(git: &dyn GitCli, source: &Path) -> Result<HashSet<PathBuf>> {
+    let output = git.run(source, &["ls-files", "-z"])?;
+    Ok(output
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect())
 }
 
 /// Recursively lists files under `root` (relative paths), skipping the `.git`
@@ -188,5 +187,36 @@ mod tests {
         let files = walk_files(repo.root());
         assert!(files.iter().all(|p| !p.starts_with(".git")));
         assert!(files.contains(&PathBuf::from("README.md")));
+    }
+
+    #[test]
+    fn ls_files_failure_is_propagated_not_silent() {
+        use crate::git::cli::{GitCli, GitOutput};
+        // A git that fails `ls-files` must abort the copy (so tracked files are
+        // never copied), not silently treat the tracked set as empty (spec §8).
+        struct FailLs;
+        impl GitCli for FailLs {
+            fn run_raw(&self, _repo: &Path, args: &[&str]) -> Result<GitOutput> {
+                if args.first() == Some(&"ls-files") {
+                    return Ok(GitOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "boom".into(),
+                    });
+                }
+                Ok(GitOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let repo = TestRepo::init();
+        repo.write(".env", "x\n");
+        let target = repo.root().parent().unwrap().join("tfail");
+        std::fs::create_dir_all(&target).unwrap();
+        let err =
+            copy_ignored_files(&FailLs, repo.root(), &target, &[".env".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::Subprocess { .. }));
     }
 }

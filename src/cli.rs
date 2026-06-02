@@ -328,6 +328,7 @@ pub fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
     }
     cx.color_flag = cli.global.color;
     cx.no_pager = cli.global.no_pager;
+    cx.verbose = cli.global.verbose;
 
     if cli.global.json && !cli.command_supports_json() {
         return Err(Error::usage(format!(

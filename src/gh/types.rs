@@ -60,6 +60,9 @@ pub struct PrView {
     /// The PR's base branch name (recorded as the worktree's base ref).
     #[serde(rename = "baseRefName")]
     pub base_ref_name: String,
+    /// The PR's web URL (shown in the TUI detail pane).
+    #[serde(default)]
+    pub url: String,
 }
 
 impl PrView {

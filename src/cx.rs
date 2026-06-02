@@ -124,6 +124,9 @@ pub struct Cx {
     pub color_flag: Option<crate::output::color::ColorChoice>,
     /// The `--no-pager` flag (set during dispatch).
     pub no_pager: bool,
+    /// The `-v`/`--verbose` count: extra diagnostics to stderr (set during
+    /// dispatch). `0` is the default (quiet).
+    pub verbose: u8,
 }
 
 impl Cx {
@@ -149,6 +152,7 @@ impl Cx {
             input,
             color_flag: None,
             no_pager: false,
+            verbose: 0,
         }
     }
 

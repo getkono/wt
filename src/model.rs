@@ -53,6 +53,15 @@ pub struct Worktree {
     pub commit: Option<Commit>,
     /// Recorded pull request; `None` when none.
     pub pr: Option<Pr>,
+    /// Up to the last five commits, for the TUI detail pane only. Not part of
+    /// the §7 JSON schema (which carries only the tip `commit`), so it is skipped
+    /// during serialization.
+    #[serde(skip)]
+    pub recent_commits: Vec<Commit>,
+    /// The recorded PR URL, for the TUI detail pane only. Not part of the §7
+    /// `pr` object, so it is skipped during serialization.
+    #[serde(skip)]
+    pub pr_url: Option<String>,
 }
 
 impl Worktree {
@@ -77,6 +86,8 @@ impl Worktree {
             base_ref: None,
             commit: None,
             pr: None,
+            recent_commits: Vec::new(),
+            pr_url: None,
         }
     }
 
@@ -336,6 +347,8 @@ mod tests {
                 state: PrState::Open,
                 title: "Add login page".into(),
             }),
+            recent_commits: Vec::new(),
+            pr_url: None,
         }
     }
 

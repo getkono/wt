@@ -101,10 +101,10 @@ impl App {
         };
         let page = (self.size.1 as isize - 3).max(1);
         match action {
-            KeyAction::NavigateUp => self.move_selection(-1),
-            KeyAction::NavigateDown => self.move_selection(1),
-            KeyAction::PageUp => self.move_selection(-page),
-            KeyAction::PageDown => self.move_selection(page),
+            KeyAction::NavigateUp => self.nav_or_scroll(-1),
+            KeyAction::NavigateDown => self.nav_or_scroll(1),
+            KeyAction::PageUp => self.nav_or_scroll(-page),
+            KeyAction::PageDown => self.nav_or_scroll(page),
             KeyAction::GoToTop => self.select_edge(false),
             KeyAction::GoToBottom => self.select_edge(true),
             KeyAction::FocusNextPane | KeyAction::FocusPrevPane => self.toggle_focus(),
@@ -243,19 +243,37 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // The bottom row is the status/help bar; clicks there select nothing.
+                let status_row = self.size.1.saturating_sub(1);
+                if mouse.row >= status_row {
+                    return Effect::None;
+                }
                 if self.show_sidebar && mouse.column < self.sidebar_width {
-                    let row = mouse.row.saturating_sub(LIST_TOP) as usize;
-                    self.select_row(row);
+                    // Only content rows select; the top border/title row (row 0)
+                    // does not.
+                    if mouse.row >= LIST_TOP {
+                        self.select_row((mouse.row - LIST_TOP) as usize);
+                    }
                     self.focus = Pane::List;
                 } else {
                     self.focus = Pane::Detail;
                 }
             }
-            MouseEventKind::ScrollUp => self.move_selection(-1),
-            MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::ScrollUp => self.nav_or_scroll(-1),
+            MouseEventKind::ScrollDown => self.nav_or_scroll(1),
             _ => {}
         }
         Effect::None
+    }
+
+    /// Routes a vertical movement to the detail-pane scroll when that pane has
+    /// focus, else to the list selection (spec §10).
+    fn nav_or_scroll(&mut self, delta: isize) {
+        if self.focus == Pane::Detail {
+            self.scroll_detail(delta);
+        } else {
+            self.move_selection(delta);
+        }
     }
 
     /// Toggles pane focus.
@@ -506,5 +524,49 @@ mod tests {
         assert_eq!(a.focus, Pane::List);
         a.handle_event(press(KeyCode::Tab));
         assert_eq!(a.focus, Pane::Detail);
+    }
+
+    #[test]
+    fn navigation_scrolls_detail_when_focused() {
+        let mut a = app(&[("a", true), ("b", false)]);
+        a.worktrees[0].recent_commits = vec![crate::model::Commit {
+            hash: "h".into(),
+            subject: "s".into(),
+            author: "x".into(),
+            timestamp: "2024-01-15T10:30:00Z".into(),
+        }];
+        a.handle_event(press(KeyCode::Tab)); // focus the detail pane
+        a.handle_event(press(KeyCode::Char('j'))); // scrolls detail, not list
+        assert_eq!(a.detail_scroll, 1);
+        assert_eq!(a.selected, 0);
+        a.handle_event(press(KeyCode::Char('k')));
+        assert_eq!(a.detail_scroll, 0);
+        // Back on the list, navigation moves the selection and resets scroll.
+        a.handle_event(press(KeyCode::Tab));
+        a.detail_scroll = 3;
+        a.handle_event(press(KeyCode::Char('j')));
+        assert_eq!(a.selected, 1);
+        assert_eq!(a.detail_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_click_on_status_bar_and_title_row_select_nothing() {
+        let mut a = app(&[("a", true), ("b", false), ("c", false)]);
+        a.size = (100, 30);
+        a.selected = 1;
+        // Click the bottom status bar row (row 29): no selection change.
+        let click = |row: u16| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        a.handle_event(click(29));
+        assert_eq!(a.selected, 1);
+        // Click the list title/border row (row 0): no selection change.
+        a.handle_event(click(0));
+        assert_eq!(a.selected, 1);
     }
 }

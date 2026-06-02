@@ -58,6 +58,27 @@ pub fn commit_info(repo: &gix::Repository, oid_hex: &str, abbrev: usize) -> Resu
     })
 }
 
+/// Reads up to `max` recent commits starting at `start_hex` (newest first) by
+/// walking ancestry via `gix` (spec §4 reads). Best-effort: an invalid start or
+/// an unreadable commit simply truncates the result.
+pub fn recent_commits(
+    repo: &gix::Repository,
+    start_hex: &str,
+    abbrev: usize,
+    max: usize,
+) -> Vec<CommitInfo> {
+    let Ok(id) = ObjectId::from_hex(start_hex.as_bytes()) else {
+        return Vec::new();
+    };
+    let Ok(walk) = repo.rev_walk([id]).all() else {
+        return Vec::new();
+    };
+    walk.take(max)
+        .filter_map(std::result::Result::ok)
+        .filter_map(|info| commit_info(repo, &info.id.to_string(), abbrev).ok())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +133,24 @@ mod tests {
         let repo = TestRepo::init();
         let r = Repo::discover(repo.root()).unwrap();
         assert!(commit_info(r.gix(), "not-hex", 7).is_err());
+    }
+
+    #[test]
+    fn recent_commits_walks_newest_first_and_caps() {
+        let repo = TestRepo::init(); // one commit: "init"
+        repo.write("a.txt", "1\n");
+        repo.commit_all("second");
+        repo.write("b.txt", "2\n");
+        repo.commit_all("third");
+        let oid = head_oid(&repo);
+        let r = Repo::discover(repo.root()).unwrap();
+        let commits = recent_commits(r.gix(), &oid, 7, 5);
+        assert_eq!(commits.len(), 3);
+        assert_eq!(commits[0].subject, "third"); // newest first
+        assert_eq!(commits[2].subject, "init");
+        // The cap is honored.
+        assert_eq!(recent_commits(r.gix(), &oid, 7, 2).len(), 2);
+        // An invalid start yields nothing.
+        assert!(recent_commits(r.gix(), "not-hex", 7, 5).is_empty());
     }
 }

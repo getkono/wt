@@ -119,6 +119,9 @@ pub struct App {
     pub columns: Vec<Column>,
     /// Whether untracked files show `?`.
     pub show_untracked: bool,
+    /// Whether untracked-only files count as "dirty" for the remove guard
+    /// (the confirm dialog mirrors `remove.untracked_blocks`, not `show_untracked`).
+    pub remove_untracked_blocks: bool,
     /// Whether Nerd Font glyphs are enabled.
     pub nerd_fonts: bool,
     /// Whether mouse support is enabled.
@@ -147,6 +150,8 @@ pub struct AppConfig {
     pub columns: Vec<Column>,
     /// Whether untracked files show `?`.
     pub show_untracked: bool,
+    /// Whether untracked-only files count as "dirty" for the remove guard.
+    pub remove_untracked_blocks: bool,
     /// Whether Nerd Font glyphs are enabled.
     pub nerd_fonts: bool,
     /// Whether mouse support is enabled.
@@ -179,6 +184,7 @@ impl App {
             keymap: config.keymap,
             columns: config.columns,
             show_untracked: config.show_untracked,
+            remove_untracked_blocks: config.remove_untracked_blocks,
             nerd_fonts: config.nerd_fonts,
             mouse: config.mouse,
             quit: false,
@@ -225,7 +231,8 @@ impl App {
         }
     }
 
-    /// Moves the selection by `delta`, clamped to the visible range.
+    /// Moves the selection by `delta`, clamped to the visible range. Changing
+    /// the selection resets the detail-pane scroll.
     pub fn move_selection(&mut self, delta: isize) {
         if self.visible.is_empty() {
             return;
@@ -233,6 +240,7 @@ impl App {
         let max = self.visible.len() as isize - 1;
         let next = (self.selected as isize + delta).clamp(0, max);
         self.selected = next as usize;
+        self.detail_scroll = 0;
     }
 
     /// Selects the first / last visible row.
@@ -241,13 +249,26 @@ impl App {
             return;
         }
         self.selected = if last { self.visible.len() - 1 } else { 0 };
+        self.detail_scroll = 0;
     }
 
     /// Selects the visible row at display position `row`, if any.
     pub fn select_row(&mut self, row: usize) {
         if row < self.visible.len() {
             self.selected = row;
+            self.detail_scroll = 0;
         }
+    }
+
+    /// Scrolls the detail pane by `delta` lines (spec §10), clamped to roughly
+    /// the selected worktree's detail content so it cannot scroll into the void.
+    pub fn scroll_detail(&mut self, delta: isize) {
+        let max = self.selected_worktree().map_or(0, |w| {
+            // path/branch/base/status + the commit block + the PR block.
+            (w.recent_commits.len() + 10) as isize
+        });
+        let next = (self.detail_scroll as isize + delta).clamp(0, max.max(0));
+        self.detail_scroll = next as u16;
     }
 
     /// Cycles the sort field (spec §10 sort-cycle).
@@ -368,6 +389,7 @@ pub(crate) mod testutil {
                 sort: SortSpec::default(),
                 columns: Column::ALL.to_vec(),
                 show_untracked: true,
+                remove_untracked_blocks: false,
                 nerd_fonts: false,
                 mouse: true,
             },

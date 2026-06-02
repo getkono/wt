@@ -89,6 +89,10 @@ fn list_row(
         glyphs.dirty().to_string()
     } else if show_untracked && worktree.has_untracked == Some(true) {
         glyphs.untracked().to_string()
+    } else if worktree.dirty.is_none() && !worktree.is_missing {
+        // Loaded but the status read failed: the absent marker, not a blank that
+        // would read as "clean" (spec §10).
+        glyphs.absent().to_string()
     } else {
         " ".to_string()
     };
@@ -105,6 +109,8 @@ fn list_row(
                 .unwrap_or_default();
             format!("{} {} ({rel})", c.hash, c.subject)
         }
+        // Loaded, present, but no commit read: failed fetch → absent marker.
+        (None, true) if !worktree.is_missing => glyphs.absent().to_string(),
         (None, true) => String::new(),
     };
     let pr = match (&worktree.pr, loaded) {
@@ -118,13 +124,14 @@ fn list_row(
     ))
 }
 
-/// Renders the detail pane for the selected worktree.
+/// Renders the detail pane for the selected worktree (spec §10).
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     let block = Block::bordered().title("detail");
     let Some(worktree) = app.selected_worktree() else {
         frame.render_widget(Paragraph::new("no worktree selected").block(block), area);
         return;
     };
+    let now = now_unix();
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(format!("path:   {}", worktree.path.display())));
     let branch = branch_display(worktree);
@@ -141,9 +148,7 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             ahead_behind_cell(worktree),
             dirty_label(worktree)
         )));
-        if let Some(c) = &worktree.commit {
-            lines.push(Line::from(format!("commit: {} {}", c.hash, c.subject)));
-        }
+        detail_commits(&mut lines, worktree, now);
         if let Some(pr) = &worktree.pr {
             lines.push(Line::from(format!(
                 "pr:     #{} ({}) {}",
@@ -151,6 +156,9 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
                 pr.state.as_str(),
                 pr.title
             )));
+            if let Some(url) = worktree.pr_url.as_deref().filter(|u| !u.is_empty()) {
+                lines.push(Line::from(format!("        {url}")));
+            }
         }
     } else {
         lines.push(Line::from("status: …"));
@@ -158,9 +166,38 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll, 0)),
         area,
     );
+}
+
+/// Appends the "Last 5 commits" lines (short hash, subject, relative time) to
+/// the detail pane (spec §10), falling back to the single tip commit.
+fn detail_commits(lines: &mut Vec<Line<'static>>, worktree: &crate::model::Worktree, now: i64) {
+    let rel = |ts: &str| {
+        parse_iso8601(ts)
+            .map(|u| relative(now, u))
+            .unwrap_or_default()
+    };
+    if !worktree.recent_commits.is_empty() {
+        lines.push(Line::from("commits:"));
+        for c in &worktree.recent_commits {
+            lines.push(Line::from(format!(
+                "  {} {} ({})",
+                c.hash,
+                c.subject,
+                rel(&c.timestamp)
+            )));
+        }
+    } else if let Some(c) = &worktree.commit {
+        lines.push(Line::from(format!(
+            "commit: {} {} ({})",
+            c.hash,
+            c.subject,
+            rel(&c.timestamp)
+        )));
+    }
 }
 
 /// A short dirty label for the detail pane.
@@ -191,12 +228,24 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let hint = app
         .status_message
         .clone()
-        .unwrap_or_else(|| "Enter switch  n new  d remove  p pr  / filter  ? help  q quit".into());
+        .unwrap_or_else(|| mode_hint(&app.mode).to_string());
     let line = Line::from(vec![
         Span::styled(left, Style::default().add_modifier(Modifier::REVERSED)),
         Span::raw(format!(" {hint}")),
     ]);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The right-side key hints for the current mode (spec §10 bottom bar).
+fn mode_hint(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::List => "Enter switch  n new  d remove  p pr  / filter  ? help  q quit",
+        Mode::Filter => "type to filter  Enter apply  Esc clear",
+        Mode::Create(_) => "Enter next/submit  Esc cancel",
+        Mode::PrPicker(_) => "↑/↓ select  Enter checkout  Esc close",
+        Mode::ConfirmRemove(_) => "y remove  any other key cancels",
+        Mode::Help => "any key closes help",
+    }
 }
 
 /// Centers a popup `width`×`height` within `area`.
@@ -319,16 +368,21 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
     if worktree.is_missing {
         lines.push(Line::from("(directory already deleted)"));
     } else {
-        let guard = crate::worktree_service::guard_status(worktree, app.show_untracked);
+        let guard = crate::worktree_service::guard_status(worktree, app.remove_untracked_blocks);
         if guard.dirty {
             lines.push(Line::from(Span::styled(
                 "(has uncommitted changes — data may be lost)",
                 Style::default().red(),
             )));
         }
-        let ahead = worktree.ahead.unwrap_or(0);
-        if ahead > 0 {
-            lines.push(Line::from(format!("({ahead} unpushed commit(s))")));
+        // Unpushed work: a branch with no upstream is treated as unpushed and so
+        // is flagged here, matching the guard (spec §10/§12).
+        match worktree.ahead {
+            Some(ahead) if ahead > 0 => {
+                lines.push(Line::from(format!("({ahead} unpushed commit(s))")));
+            }
+            None => lines.push(Line::from("(no upstream — unpushed work)")),
+            _ => {}
         }
     }
     lines.push(Line::from("Remove this worktree? [y/N]"));
@@ -470,6 +524,86 @@ mod tests {
         assert!(text.contains("confirm remove"));
         assert!(text.contains("data may be lost"));
         assert!(text.contains("[y/N]"));
+    }
+
+    #[test]
+    fn confirm_remove_flags_no_upstream_as_unpushed() {
+        // A clean worktree with no upstream is still flagged as unpushed work,
+        // matching the remove guard (spec §10/§12).
+        let mut clean = wt("topic", false);
+        clean.dirty = Some(false);
+        clean.has_untracked = Some(false);
+        clean.ahead = None; // no upstream
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(clean);
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("no upstream"));
+        assert!(!text.contains("data may be lost")); // not dirty
+    }
+
+    #[test]
+    fn confirm_remove_honors_remove_untracked_blocks() {
+        // Untracked-only is NOT dirty by default (remove.untracked_blocks=false),
+        // so the dialog must not claim data loss — even though show_untracked is on.
+        let mut wt_un = wt("topic", false);
+        wt_un.dirty = Some(false);
+        wt_un.has_untracked = Some(true);
+        wt_un.ahead = Some(0);
+        let mut a = app(&[("main", true)]);
+        assert!(a.show_untracked && !a.remove_untracked_blocks);
+        a.worktrees.push(wt_un);
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        assert!(!render_to_text(&a, 100, 30).contains("data may be lost"));
+    }
+
+    #[test]
+    fn failed_dirty_read_shows_absent_marker_not_blank() {
+        // A loaded, present worktree whose dirty state is unknown renders "–"
+        // (not a blank that would read as clean).
+        let mut unknown = wt("topic", false);
+        unknown.dirty = None; // status read failed
+        unknown.ahead = Some(0);
+        unknown.behind = Some(0); // so ahead/behind is not the only "–"
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(unknown);
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains('–'));
+    }
+
+    #[test]
+    fn status_bar_hints_are_per_mode() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrPicker(PrPickerState {
+            loading: false,
+            ..Default::default()
+        });
+        // The PR-picker overlay is empty here, so the bottom bar hint shows.
+        assert!(render_to_text(&a, 100, 30).contains("checkout"));
+    }
+
+    #[test]
+    fn detail_pane_shows_recent_commits_and_pr_url() {
+        use crate::model::{Commit, Pr, PrState};
+        let mut a = app(&[("main", true)]);
+        let c = |hash: &str, subject: &str| Commit {
+            hash: hash.into(),
+            subject: subject.into(),
+            author: "x".into(),
+            timestamp: "2024-01-15T10:30:00Z".into(),
+        };
+        a.worktrees[0].recent_commits = vec![c("aaaaaaa", "newest"), c("bbbbbbb", "older")];
+        a.worktrees[0].pr = Some(Pr {
+            number: 42,
+            state: PrState::Open,
+            title: "Add login".into(),
+        });
+        a.worktrees[0].pr_url = Some("https://github.com/o/r/pull/42".into());
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("commits:"));
+        assert!(text.contains("newest"));
+        assert!(text.contains("older"));
+        assert!(text.contains("pull/42"));
     }
 
     #[test]

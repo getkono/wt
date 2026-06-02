@@ -98,7 +98,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     }
 
     // Steps after creation but before the hook are rolled back on failure (§13).
-    let outcome = post_create_steps(
+    let copy_outcome = match post_create_steps(
         git,
         repo,
         &worktrees,
@@ -108,11 +108,14 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         &base_ref,
         &target,
         args.copy_from.as_deref(),
-    );
-    if let Err(e) = outcome {
-        rollback_worktree(git, &root, &target, &branch, base_ref.is_some());
-        return Err(e);
-    }
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            rollback_worktree(git, &root, &target, &branch, base_ref.is_some());
+            return Err(e);
+        }
+    };
+    crate::commands::log_copy_outcome(cx, &copy_outcome);
 
     // The post-create hook: a failure is a warning, not a rollback (§8).
     let ctx = HookContext {
@@ -133,7 +136,8 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
 }
 
-/// Records metadata and runs the copy step (rolled back on error).
+/// Records metadata and runs the copy step (rolled back on error), returning the
+/// copy outcome for `-v` logging.
 #[allow(clippy::too_many_arguments)]
 fn post_create_steps(
     git: &dyn GitCli,
@@ -145,15 +149,14 @@ fn post_create_steps(
     base_ref: &Option<String>,
     target: &Path,
     copy_from: Option<&str>,
-) -> Result<()> {
+) -> Result<crate::copy::CopyOutcome> {
     if let Some(base) = base_ref {
         // A wt-created branch records its base and "created by wt" (§3/§10).
         wtconfig::write_base_ref(git, root, branch, base)?;
         wtconfig::mark_created_by_wt(git, root, branch)?;
     }
     let source = copy_source(repo, worktrees, copy_from, root)?;
-    copy_ignored_files(git, &source, target, &config.copy)?;
-    Ok(())
+    copy_ignored_files(git, &source, target, &config.copy)
 }
 
 /// Resolves the base ref for a new branch: `--from`, then `default_base`, then
@@ -358,10 +361,25 @@ mod tests {
         let repo = TestRepo::init();
         std::fs::write(repo.root().join(".wt.toml"), "copy = [\".env\"]\n").unwrap();
         repo.write(".env", "SECRET=1\n");
-        let (code, out, _) = run(&repo, &args("withenv"), false);
+        let (code, out, err) = run(&repo, &args("withenv"), false);
         assert_eq!(code, 0);
         let env_path = Path::new(out.trim()).join(".env");
         assert!(env_path.exists());
         assert_eq!(std::fs::read_to_string(env_path).unwrap(), "SECRET=1\n");
+        // Silent at the default verbosity (spec §8).
+        assert!(!err.contains("copied"));
+    }
+
+    #[test]
+    fn verbose_logs_copied_files() {
+        let repo = TestRepo::init();
+        std::fs::write(repo.root().join(".wt.toml"), "copy = [\".env\"]\n").unwrap();
+        repo.write(".env", "SECRET=1\n");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.verbose = 1;
+        super::run(&mut t.cx, &RealHookRunner, &args("withenv2"), false).unwrap();
+        let err = t.err.contents();
+        assert!(err.contains("copied"), "expected copy log at -v: {err}");
+        assert!(err.contains(".env"));
     }
 }
