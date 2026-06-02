@@ -111,7 +111,10 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     ) {
         Ok(outcome) => outcome,
         Err(e) => {
-            rollback_worktree(git, &root, &target, &branch, base_ref.is_some());
+            // Metadata is written only for a wt-created branch, so delete the
+            // branch and clear metadata together on that condition.
+            let created = base_ref.is_some();
+            rollback_worktree(git, &root, &target, &branch, created, created);
             return Err(e);
         }
     };

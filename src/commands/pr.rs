@@ -170,7 +170,12 @@ fn pr_checkout(
         wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
         wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
         wtconfig::write_base_ref(git, &root, &branch, &base)?;
-        wtconfig::mark_created_by_wt(git, &root, &branch)?;
+        // Only mark "created by wt" when we actually created the branch here; a
+        // pre-existing branch belongs to the user and must not be branch-deleted
+        // by a later `remove` (spec §10).
+        if !branch_exists {
+            wtconfig::mark_created_by_wt(git, &root, &branch)?;
+        }
         let source = session
             .repo
             .current_workdir()
@@ -179,8 +184,9 @@ fn pr_checkout(
     })() {
         Ok(outcome) => outcome,
         Err(e) => {
-            // Only delete the branch on rollback if we created it here (§13).
-            rollback_worktree(git, &root, &worktree_path, &branch, !branch_exists);
+            // Delete the branch only if we created it here, but always clear the
+            // metadata this command wrote (§13).
+            rollback_worktree(git, &root, &worktree_path, &branch, !branch_exists, true);
             return Err(e);
         }
     };
@@ -352,6 +358,67 @@ mod tests {
         let path = t.out.contents().trim().to_string();
         assert!(std::path::Path::new(&path).is_dir());
         assert!(path.ends_with("pr-feature"));
+        // The user's pre-existing branch is NOT marked created-by-wt (so a later
+        // `remove` will not delete it).
+        assert!(
+            !repo
+                .git(&["config", "--list"])
+                .contains("wt.pr-feature.createdbywt")
+        );
+    }
+
+    #[test]
+    fn pr_rollback_on_existing_branch_keeps_branch_and_clears_metadata() {
+        use crate::git::cli::{GitCli, GitOutput, RealGit};
+        use std::path::Path as StdPath;
+        // A git that fails the copy step's `ls-files` after the metadata writes
+        // succeed, forcing a rollback on the pre-existing-branch path.
+        struct FailLs(RealGit);
+        impl GitCli for FailLs {
+            fn run_raw(&self, repo: &StdPath, args: &[&str]) -> crate::error::Result<GitOutput> {
+                if args.first() == Some(&"ls-files") {
+                    return Ok(GitOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "boom".into(),
+                    });
+                }
+                self.0.run_raw(repo, args)
+            }
+        }
+
+        let repo = repo_with_pr(88);
+        repo.git(&["branch", "pr-feature"]);
+        // A copy pattern so the (failing) copy step runs.
+        std::fs::write(repo.root().join(".wt.toml"), "copy = [\".env\"]\n").unwrap();
+        repo.write(".env", "X=1\n");
+        let mut t = crate::testutil::test_cx_with_git(
+            &[],
+            repo.root().to_str().unwrap(),
+            Arc::new(FailLs(RealGit)),
+        );
+        t.cx.gh = Arc::new(FakeGh::with_view(view(88, "pr-feature", "main")));
+        let err = super::run(
+            &mut t.cx,
+            &RealHookRunner,
+            &pr_args(Some("88"), None),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        // The user's branch survives the rollback...
+        assert!(
+            !repo
+                .git(&["branch", "--list", "pr-feature"])
+                .trim()
+                .is_empty(),
+            "pre-existing branch must not be deleted on rollback"
+        );
+        // ...and the metadata written before the failure is cleared (no orphans).
+        assert!(
+            !repo.git(&["config", "--list"]).contains("wt.pr-feature."),
+            "rollback must clear the wt.* metadata it wrote"
+        );
     }
 
     #[test]

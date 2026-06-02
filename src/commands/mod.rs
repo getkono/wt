@@ -179,24 +179,30 @@ pub fn resolve_target(
     Ok(alt)
 }
 
-/// Rolls back a partially-created worktree: removes it, prunes, and (when the
-/// branch was created here) deletes the branch and clears the `wt.*` metadata
-/// written during creation, so nothing half-created is left behind (spec §13).
-/// Best-effort.
+/// Rolls back a partially-created worktree (spec §13): removes the worktree and
+/// prunes, optionally deletes the branch (only when it was created here), and
+/// optionally clears the `wt.*` metadata written during the operation, so
+/// nothing half-created is left behind. The two flags are independent: `wt pr`
+/// on a *pre-existing* branch keeps the branch but still clears the metadata it
+/// wrote. Best-effort.
 pub fn rollback_worktree(
     git: &dyn GitCli,
     root: &Path,
     target: &Path,
     branch: &str,
-    created_branch: bool,
+    delete_branch: bool,
+    clear_metadata: bool,
 ) {
     let target_str = target.to_string_lossy();
     let _ = git.run_raw(root, &["worktree", "remove", "--force", &target_str]);
     let _ = git.run_raw(root, &["worktree", "prune"]);
-    if created_branch {
+    if delete_branch {
         let _ = git.run_raw(root, &["branch", "-D", branch]);
-        // Remove the metadata written before the failure (else a later plain-git
-        // worktree on this branch name would show stale PR/base info).
+    }
+    if clear_metadata {
+        // Remove the metadata written before the failure (else a later worktree
+        // on this branch name would show stale PR/base info, or a wrongly-set
+        // `createdByWt` could cause its branch to be deleted on remove).
         let _ = crate::config::wtconfig::clear_meta(git, root, branch);
     }
 }
