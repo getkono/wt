@@ -12,10 +12,10 @@ use crate::error::Result;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    abbrev_len, ahead_behind, commit_info, enumerate, recent_commits, resolve_hex, status_of,
-    upstream_of,
+    Upstream, abbrev_len, ahead_behind, commit_info, default_branch, enumerate, is_ancestor,
+    recent_commits, resolve_hex, status_of, upstream_of,
 };
-use crate::model::{Commit, Pr, PrState, Worktree};
+use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
 use crate::time::iso8601;
 
@@ -66,20 +66,27 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         // Upstream is read from config and is known even for a missing worktree;
         // ahead/behind needs the working directory, so it is computed only when
         // the worktree exists and the upstream is not gone.
-        if let Some(upstream) = upstream_of(repo.gix(), &branch) {
-            wt.upstream = Some(upstream.display.clone());
+        let upstream = upstream_of(repo.gix(), &branch);
+        if let Some(up) = &upstream {
+            wt.upstream = Some(up.display.clone());
             if !wt.is_missing
-                && !upstream.is_gone
+                && !up.is_gone
                 && let Ok((ahead, behind)) = ahead_behind(
                     git,
                     &wt.path,
-                    &upstream.tracking_ref,
+                    &up.tracking_ref,
                     &format!("refs/heads/{branch}"),
                 )
             {
                 wt.ahead = Some(ahead);
                 wt.behind = Some(behind);
             }
+        }
+        // Offline merge-state for delete-safety messaging; unknowable for a
+        // missing worktree (no checkout to query), left `None` there.
+        if !wt.is_missing {
+            let state = compute_merge_state(repo, git, wt, &branch, upstream.as_ref());
+            wt.merge_state = state;
         }
     }
 
@@ -125,6 +132,64 @@ fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
     }
+}
+
+/// Determines a branch worktree's offline merge state (spec §10) for the TUI's
+/// delete-safety messaging. The checks are tried in order — first match wins —
+/// so the result is the strongest available evidence:
+///
+/// 1. a live upstream → [`MergeState::Tracked`] (ahead/behind carries detail);
+/// 2. the tip is an ancestor of the recorded `base_ref`, then the default branch
+///    → [`MergeState::Merged`] naming that ref (a regular merge / fast-forward);
+/// 3. a recorded merged PR → [`MergeState::Merged`] with no ref (catches a
+///    squash/rebase merge, whose commit hash differs so ancestry cannot prove it);
+/// 4. an upstream configured but gone → [`MergeState::UpstreamGone`];
+/// 5. otherwise → [`MergeState::NoUpstreamLocal`].
+///
+/// Callers must skip missing worktrees (there is no checkout to query).
+fn compute_merge_state(
+    repo: &Repo,
+    git: &dyn GitCli,
+    wt: &Worktree,
+    branch: &str,
+    upstream: Option<&Upstream>,
+) -> Option<MergeState> {
+    // A live (present) upstream: ahead/behind already describes the state.
+    if let Some(up) = upstream
+        && !up.is_gone
+    {
+        return Some(MergeState::Tracked);
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    // Ancestry needs a resolvable tip; without one, fall through to the
+    // upstream/no-upstream signals below.
+    if resolve_hex(repo.gix(), &branch_ref).is_some() {
+        let mut tried: Vec<String> = Vec::new();
+        for target in [wt.base_ref.clone(), default_branch(repo.gix())]
+            .into_iter()
+            .flatten()
+        {
+            // The branch is trivially an ancestor of itself; never report that.
+            if target == branch || tried.contains(&target) {
+                continue;
+            }
+            if is_ancestor(git, &wt.path, &branch_ref, &target) {
+                return Some(MergeState::Merged { into: Some(target) });
+            }
+            tried.push(target);
+        }
+    }
+    // A merged PR proves the merge even when ancestry cannot (squash/rebase).
+    if wt.pr.as_ref().map(|pr| pr.state) == Some(PrState::Merged) {
+        return Some(MergeState::Merged { into: None });
+    }
+    // Reaching here with an upstream means it was configured but gone (a present
+    // upstream returned `Tracked` above) — a strong "remote branch deleted after
+    // merge" hint, distinct from never having had an upstream.
+    if upstream.is_some() {
+        return Some(MergeState::UpstreamGone);
+    }
+    Some(MergeState::NoUpstreamLocal)
 }
 
 /// Builds the PR row from cached `wt.*` metadata, if a PR number is recorded.
@@ -357,6 +422,137 @@ mod tests {
         assert!(gone.dirty.is_none());
         assert!(gone.ahead.is_none());
         assert!(gone.commit.is_none());
+        // Merge state is unknowable without a checkout to query.
+        assert!(gone.merge_state.is_none());
+    }
+
+    /// Builds a worktree row pointing at `repo` for a direct `compute_merge_state`
+    /// call: branch + path set, with optional recorded base and PR.
+    fn merge_wt(
+        repo: &TestRepo,
+        branch: &str,
+        base: Option<&str>,
+        pr: Option<PrState>,
+    ) -> Worktree {
+        let mut wt = Worktree::new(repo.root().to_path_buf());
+        wt.branch = Some(branch.to_string());
+        wt.base_ref = base.map(str::to_string);
+        wt.pr = pr.map(|state| Pr {
+            number: 1,
+            state,
+            title: String::new(),
+        });
+        wt
+    }
+
+    /// Checks out a new branch off the current tip, adds a commit so it diverges,
+    /// and returns to `main`. The branch is then NOT an ancestor of `main`.
+    fn divergent_branch(repo: &TestRepo, branch: &str) {
+        repo.git(&["checkout", "-q", "-b", branch]);
+        repo.write(&format!("{branch}.txt"), "x\n");
+        repo.commit_all("diverge");
+        repo.git(&["checkout", "-q", "main"]);
+    }
+
+    #[test]
+    fn merge_state_tracked_with_live_upstream() {
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.git(&["config", "branch.main.remote", "origin"]);
+        repo.git(&["config", "branch.main.merge", "refs/heads/main"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let up = upstream_of(r.gix(), "main");
+        let wt = merge_wt(&repo, "main", None, None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "main", up.as_ref()),
+            Some(MergeState::Tracked)
+        );
+    }
+
+    #[test]
+    fn merge_state_merged_into_base() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "feat"]); // at main's tip → ancestor of main
+        let r = Repo::discover(repo.root()).unwrap();
+        let wt = merge_wt(&repo, "feat", Some("main"), None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::Merged {
+                into: Some("main".into())
+            })
+        );
+    }
+
+    #[test]
+    fn merge_state_merged_into_default_branch() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "feat"]); // ancestor of main (the default branch)
+        let r = Repo::discover(repo.root()).unwrap();
+        // No base recorded: the default-branch fallback must still detect it.
+        let wt = merge_wt(&repo, "feat", None, None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::Merged {
+                into: Some("main".into())
+            })
+        );
+    }
+
+    #[test]
+    fn merge_state_merged_via_pr_when_not_ancestor() {
+        let repo = TestRepo::init();
+        divergent_branch(&repo, "feat"); // NOT an ancestor of main
+        let r = Repo::discover(repo.root()).unwrap();
+        let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::Merged { into: None })
+        );
+    }
+
+    #[test]
+    fn merge_state_upstream_gone() {
+        let repo = TestRepo::init();
+        divergent_branch(&repo, "feat");
+        // Configure an upstream whose tracking ref does not exist → gone.
+        repo.git(&["config", "branch.feat.remote", "origin"]);
+        repo.git(&["config", "branch.feat.merge", "refs/heads/feat"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let up = upstream_of(r.gix(), "feat");
+        assert!(up.as_ref().unwrap().is_gone);
+        let wt = merge_wt(&repo, "feat", Some("main"), None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", up.as_ref()),
+            Some(MergeState::UpstreamGone)
+        );
+    }
+
+    #[test]
+    fn merge_state_no_upstream_local() {
+        let repo = TestRepo::init();
+        divergent_branch(&repo, "feat");
+        let r = Repo::discover(repo.root()).unwrap();
+        let wt = merge_wt(&repo, "feat", Some("main"), None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::NoUpstreamLocal)
+        );
+    }
+
+    #[test]
+    fn merge_state_ancestry_wins_over_merged_pr() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "feat"]); // ancestor of main
+        let r = Repo::discover(repo.root()).unwrap();
+        // Both an ancestor of base AND a merged PR: the named ancestry wins.
+        let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::Merged {
+                into: Some("main".into())
+            })
+        );
     }
 
     #[test]

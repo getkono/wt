@@ -62,6 +62,12 @@ pub struct Worktree {
     /// `pr` object, so it is skipped during serialization.
     #[serde(skip)]
     pub pr_url: Option<String>,
+    /// Offline merge/tracking state, for delete-safety messaging in the TUI
+    /// only. `None` until enrichment runs (and for a missing worktree, where it
+    /// cannot be computed). Not part of the §7 JSON schema, so it is skipped
+    /// during serialization.
+    #[serde(skip)]
+    pub merge_state: Option<MergeState>,
 }
 
 impl Worktree {
@@ -88,6 +94,7 @@ impl Worktree {
             pr: None,
             recent_commits: Vec::new(),
             pr_url: None,
+            merge_state: None,
         }
     }
 
@@ -96,6 +103,31 @@ impl Worktree {
     pub fn to_json_line(&self) -> Result<String> {
         Ok(serde_json::to_string(self)?)
     }
+}
+
+/// How a branch's commits relate to the rest of the repo, for delete-safety
+/// messaging in the TUI. Computed offline (no fetch): from ancestry against the
+/// base/default branch, a recorded merged PR, and whether the configured
+/// upstream's tracking ref is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeState {
+    /// Fully merged, so deletion is safe. `into` names the ref it merged into
+    /// (e.g. `main`); `None` means only a merged PR proves it (a squash/rebase
+    /// merge, whose commit hash differs so ancestry cannot confirm it).
+    Merged {
+        /// The ref the branch merged into, or `None` when only a merged PR
+        /// proves the merge.
+        into: Option<String>,
+    },
+    /// An upstream was configured but its remote-tracking ref is gone and the
+    /// merge could not be confirmed — most likely merged with the remote branch
+    /// auto-deleted afterwards.
+    UpstreamGone,
+    /// No upstream was ever configured and the branch is not merged: genuinely
+    /// local-only work that would be lost on deletion.
+    NoUpstreamLocal,
+    /// A live upstream exists; the ahead/behind counts carry the detail.
+    Tracked,
 }
 
 /// Tip-commit metadata for display (spec §7).
@@ -349,6 +381,7 @@ mod tests {
             }),
             recent_commits: Vec::new(),
             pr_url: None,
+            merge_state: None,
         }
     }
 

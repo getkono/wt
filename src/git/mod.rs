@@ -20,6 +20,6 @@ pub use cli::{GitCli, GitOutput, RealGit};
 pub use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
 pub use discover::Repo;
 pub use porcelain::{RawWorktree, parse_worktree_list};
-pub use refs::{Upstream, default_branch, local_branches, resolve_hex, upstream_of};
+pub use refs::{Upstream, default_branch, is_ancestor, local_branches, resolve_hex, upstream_of};
 pub use status::{StatusSummary, status_of};
 pub use worktrees::{enumerate, primary_root};

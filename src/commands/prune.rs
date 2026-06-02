@@ -8,7 +8,7 @@ use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{default_branch, upstream_of};
+use crate::git::{default_branch, is_ancestor, upstream_of};
 use crate::model::Worktree;
 use crate::worktree_service::{build_worktrees, guard_status};
 
@@ -159,13 +159,6 @@ fn delete_merged_branch(
     if merged {
         let _ = git.run_raw(root, &["branch", "-D", branch]);
     }
-}
-
-/// Whether `a` is an ancestor of `b`.
-fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
-    git.run_raw(root, &["merge-base", "--is-ancestor", a, b])
-        .map(|o| o.success)
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

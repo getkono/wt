@@ -13,7 +13,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use crate::model::{PrState, SortKey, SortSpec, Worktree};
+use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{App, CreateState, CreateStep, Mode, Pane, PrPickerState};
@@ -298,6 +298,10 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         status_spans.push(Span::raw("  "));
         status_spans.push(dirty_label_span(worktree, &theme));
         lines.push(Line::from(status_spans));
+        // Reassuring/informative merge note only (no destructive-flow warnings).
+        if let Some(line) = merge_state_note(worktree, &theme, false) {
+            lines.push(line);
+        }
         detail_commits(&mut lines, worktree, &theme, now);
         if let Some(pr) = &worktree.pr {
             lines.push(Line::from(vec![
@@ -383,6 +387,46 @@ fn dirty_label_span(worktree: &Worktree, theme: &Theme) -> Span<'static> {
         (_, Some(true)) => Span::styled("untracked", theme.untracked()),
         (Some(false), _) => Span::styled("clean", theme.hint_label()),
         _ => Span::raw(""),
+    }
+}
+
+/// The single-line note describing a worktree's merge / unpushed state, shared by
+/// the confirm dialog and the detail pane. The reassuring/informative states
+/// (merged, upstream-gone) are always returned; the alarming "unpushed work"
+/// states (no-upstream-local, and a real ahead count when tracked) are returned
+/// only when `include_warnings` is set — i.e. in the destructive confirm flow —
+/// so the passive detail pane stays calm. Returns `None` when there is nothing to
+/// say (or the row is not yet loaded).
+fn merge_state_note(
+    worktree: &Worktree,
+    theme: &Theme,
+    include_warnings: bool,
+) -> Option<Line<'static>> {
+    match &worktree.merge_state {
+        Some(MergeState::Merged { into: Some(base) }) => Some(Line::from(Span::styled(
+            format!("(merged into {base} — safe to delete)"),
+            theme.success(),
+        ))),
+        Some(MergeState::Merged { into: None }) => Some(Line::from(Span::styled(
+            "(merged via PR — safe to delete)",
+            theme.success(),
+        ))),
+        Some(MergeState::UpstreamGone) => Some(Line::from(Span::styled(
+            "(upstream branch deleted — likely merged)",
+            theme.label(),
+        ))),
+        Some(MergeState::NoUpstreamLocal) if include_warnings => Some(Line::from(Span::styled(
+            "(no upstream — local-only, unpushed work)",
+            theme.warning(),
+        ))),
+        Some(MergeState::Tracked) | None if include_warnings => match worktree.ahead {
+            Some(ahead) if ahead > 0 => Some(Line::from(Span::styled(
+                format!("({ahead} unpushed commit(s))"),
+                theme.warning(),
+            ))),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -699,8 +743,8 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
         }
 
         // Safety warnings, layered on top of the neutral context above for
-        // emphasis. The dirty warning mirrors the remove guard; the unpushed
-        // warning treats a branch with no upstream as unpushed (spec §10/§12).
+        // emphasis. The dirty warning mirrors the remove guard; dirtiness is
+        // orthogonal to mergedness, so a merged-but-dirty tree still warns.
         let guard = crate::worktree_service::guard_status(worktree, app.remove_untracked_blocks);
         if guard.dirty {
             lines.push(Line::from(Span::styled(
@@ -708,18 +752,12 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
                 theme.error(),
             )));
         }
-        match worktree.ahead {
-            Some(ahead) if ahead > 0 => {
-                lines.push(Line::from(Span::styled(
-                    format!("({ahead} unpushed commit(s))"),
-                    theme.warning(),
-                )));
-            }
-            None => lines.push(Line::from(Span::styled(
-                "(no upstream — unpushed work)",
-                theme.warning(),
-            ))),
-            _ => {}
+        // The unpushed message is driven by the offline merge state so a branch
+        // that was simply merged (into its base/default, or via a PR) is not
+        // flagged as alarming "unpushed work" (spec §10). A confirmed merge
+        // suppresses the unpushed warning entirely.
+        if let Some(line) = merge_state_note(worktree, &theme, true) {
+            lines.push(line);
         }
     }
 
@@ -898,18 +936,113 @@ mod tests {
 
     #[test]
     fn confirm_remove_flags_no_upstream_as_unpushed() {
-        // A clean worktree with no upstream is still flagged as unpushed work,
-        // matching the remove guard (spec §10/§12).
+        // A clean, local-only branch (no upstream, not merged) is still flagged as
+        // unpushed work, matching the remove guard (spec §10/§12).
         let mut clean = wt("topic", false);
         clean.dirty = Some(false);
         clean.has_untracked = Some(false);
         clean.ahead = None; // no upstream
+        clean.merge_state = Some(MergeState::NoUpstreamLocal);
         let mut a = app(&[("main", true)]);
         a.worktrees.push(clean);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
         a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
         let text = render_to_text(&a, 100, 30);
         assert!(text.contains("no upstream"));
+        assert!(text.contains("local-only"));
         assert!(!text.contains("data may be lost")); // not dirty
+    }
+
+    #[test]
+    fn confirm_remove_merged_into_base_is_safe() {
+        // A branch merged into its base: reassuring note, no unpushed alarm.
+        let mut w = wt("feature/done", false);
+        w.dirty = Some(false);
+        w.has_untracked = Some(false);
+        w.ahead = None;
+        w.merge_state = Some(MergeState::Merged {
+            into: Some("main".into()),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("merged into main"));
+        assert!(text.contains("safe to delete"));
+        // The alarming unpushed warning is suppressed (the branch header may
+        // still note the absence of an upstream — that is not the warning).
+        assert!(!text.contains("unpushed"));
+    }
+
+    #[test]
+    fn confirm_remove_merged_via_pr_is_safe() {
+        // A squash/rebase PR merge (ancestry can't prove it) → "merged via PR".
+        let mut w = wt("feature/squashed", false);
+        w.dirty = Some(false);
+        w.has_untracked = Some(false);
+        w.ahead = None;
+        w.merge_state = Some(MergeState::Merged { into: None });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("merged via PR"));
+        assert!(!text.contains("unpushed"));
+    }
+
+    #[test]
+    fn confirm_remove_upstream_gone_is_soft() {
+        // Upstream configured but gone: softened "likely merged", not an alarm.
+        let mut w = wt("feature/pushed", false);
+        w.dirty = Some(false);
+        w.has_untracked = Some(false);
+        w.ahead = None;
+        w.merge_state = Some(MergeState::UpstreamGone);
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("upstream branch deleted"));
+        assert!(text.contains("likely merged"));
+        assert!(!text.contains("unpushed work"));
+    }
+
+    #[test]
+    fn confirm_remove_merged_but_dirty_still_warns() {
+        // Mergedness is orthogonal to dirtiness: a merged-but-dirty tree shows
+        // both the reassuring merge note AND the data-loss warning.
+        let mut w = wt("feature/dirty-merged", false);
+        w.dirty = Some(true);
+        w.ahead = None;
+        w.merge_state = Some(MergeState::Merged {
+            into: Some("main".into()),
+        });
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("safe to delete"));
+        assert!(text.contains("data may be lost"));
+    }
+
+    #[test]
+    fn confirm_remove_tracked_ahead_still_warns() {
+        // A tracked branch with real unpushed commits keeps the unpushed warning.
+        let mut w = wt("feature/ahead", false);
+        w.dirty = Some(false);
+        w.ahead = Some(2);
+        w.upstream = Some("origin/feature/ahead".into());
+        w.merge_state = Some(MergeState::Tracked);
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(w);
+        a.mark_loaded(a.worktrees[a.worktrees.len() - 1].path.clone());
+        a.mode = Mode::ConfirmRemove(a.worktrees.len() - 1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("2 unpushed commit(s)"));
     }
 
     #[test]
@@ -1092,6 +1225,30 @@ mod tests {
         assert!(text.contains("newest"));
         assert!(text.contains("older"));
         assert!(text.contains("pull/42"));
+    }
+
+    #[test]
+    fn detail_pane_shows_merged_note() {
+        // The detail pane mirrors the reassuring merge note (but not the
+        // destructive-flow "unpushed work" warnings).
+        let mut a = app(&[("main", true)]);
+        a.worktrees[0].merge_state = Some(MergeState::Merged {
+            into: Some("main".into()),
+        });
+        a.mark_loaded(a.worktrees[0].path.clone());
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("merged into main"));
+    }
+
+    #[test]
+    fn detail_pane_omits_no_upstream_warning() {
+        // The passive detail pane stays calm: the no-upstream-local warning is
+        // confined to the destructive confirm flow.
+        let mut a = app(&[("main", true)]);
+        a.worktrees[0].merge_state = Some(MergeState::NoUpstreamLocal);
+        a.mark_loaded(a.worktrees[0].path.clone());
+        let text = render_to_text(&a, 100, 30);
+        assert!(!text.contains("local-only"));
     }
 
     #[test]

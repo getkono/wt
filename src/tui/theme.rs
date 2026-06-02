@@ -260,6 +260,11 @@ impl Theme {
     pub fn warning(&self) -> Style {
         self.fg(YELLOW)
     }
+
+    /// Style for a reassuring/positive note (e.g. "merged — safe to delete").
+    pub fn success(&self) -> Style {
+        self.fg(GREEN)
+    }
 }
 
 #[cfg(test)]
