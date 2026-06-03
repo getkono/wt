@@ -153,6 +153,9 @@ pub struct App {
     pub status_kind: StatusKind,
     /// Set when the terminal became too small to continue (spec §10).
     pub too_small: bool,
+    /// Local branch names used to tab-complete the create-prompt base ref
+    /// (best-effort; empty when enumeration fails).
+    pub branches: Vec<String>,
 }
 
 /// Display/config inputs for the TUI (the parts of [`crate::config::Config`]
@@ -189,6 +192,7 @@ impl App {
             status_message: None,
             status_kind: StatusKind::Info,
             too_small: false,
+            branches: Vec::new(),
             worktrees,
             visible,
             selected,
