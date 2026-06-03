@@ -72,24 +72,65 @@ pub enum Resolution {
     NotFound,
 }
 
-/// Resolves a query, reporting ambiguity (candidate list) to stderr. The picker
-/// fallback for an interactive TTY is wired once the TUI exists (spec §7).
+/// Resolves a query. On ambiguity at an interactive terminal (stderr is a TTY)
+/// the TUI picker opens, pre-filtered to the query, and the chosen worktree is
+/// returned; otherwise the candidate list is printed to stderr (exit code `3`).
+/// Spec §7.
 pub fn resolve_query(cx: &mut Cx, worktrees: &[Worktree], query: &str) -> Resolution {
+    resolve_query_with(cx, worktrees, query, |cx, q| {
+        crate::tui::run_tui(cx, Some(q))
+    })
+}
+
+/// [`resolve_query`] with an injectable picker, so the TTY fallback is testable
+/// without a real terminal. `picker` returns the chosen worktree path, `None`
+/// on cancel, or an error.
+fn resolve_query_with(
+    cx: &mut Cx,
+    worktrees: &[Worktree],
+    query: &str,
+    picker: impl FnOnce(&mut Cx, &str) -> Result<Option<PathBuf>>,
+) -> Resolution {
     match query::resolve(worktrees, query) {
         Resolved::One(index) => Resolution::Found(index),
         Resolved::Ambiguous(indices) => {
-            let _ = cx
-                .err
-                .line(&format!("query {query:?} is ambiguous; candidates:"));
-            for index in indices {
-                let _ = cx
-                    .err
-                    .line(&format!("  {}", candidate_label(&worktrees[index])));
+            if cx.err.is_tty() {
+                match picker(cx, query) {
+                    // Map the chosen path back to an index in the caller's slice.
+                    // A miss (path not in this set) or a cancel emits nothing and
+                    // falls through to `Ambiguous` (exit 3, no `cd`).
+                    Ok(Some(path)) => worktrees
+                        .iter()
+                        .position(|w| same_path(&w.path, &path))
+                        .map_or(Resolution::Ambiguous, Resolution::Found),
+                    Ok(None) => Resolution::Ambiguous,
+                    Err(_) => list_candidates(cx, worktrees, query, &indices),
+                }
+            } else {
+                list_candidates(cx, worktrees, query, &indices)
             }
-            Resolution::Ambiguous
         }
         Resolved::NotFound => Resolution::NotFound,
     }
+}
+
+/// Prints the ambiguous-query candidate list to stderr and returns
+/// [`Resolution::Ambiguous`].
+fn list_candidates(
+    cx: &mut Cx,
+    worktrees: &[Worktree],
+    query: &str,
+    indices: &[usize],
+) -> Resolution {
+    let _ = cx
+        .err
+        .line(&format!("query {query:?} is ambiguous; candidates:"));
+    for &index in indices {
+        let _ = cx
+            .err
+            .line(&format!("  {}", candidate_label(&worktrees[index])));
+    }
+    Resolution::Ambiguous
 }
 
 /// A human label for a worktree in candidate/diagnostic lists.
@@ -253,4 +294,109 @@ pub fn emit_worktree(
         cx.out.line(&target.to_string_lossy())?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Resolution, resolve_query_with};
+    use crate::cx::Stream;
+    use crate::model::Worktree;
+    use crate::testutil::{SharedBuf, test_cx};
+    use std::path::PathBuf;
+
+    /// A worktree row carrying a branch (and its slug), as the resolver matches on.
+    fn wt(branch: &str) -> Worktree {
+        let slug = branch.replace('/', "-");
+        let mut w = Worktree::new(PathBuf::from(format!("/r/{slug}")));
+        w.branch = Some(branch.to_string());
+        w.slug = Some(slug);
+        w
+    }
+
+    fn worktrees() -> Vec<Worktree> {
+        vec![wt("main"), wt("feature/login"), wt("feature/logout")]
+    }
+
+    /// Wires a [`crate::testutil::TestCx`] whose stderr reports the given TTY
+    /// status, returning the cx and a handle to read what was written to stderr.
+    fn cx_with_err_tty(is_tty: bool) -> (crate::testutil::TestCx, SharedBuf) {
+        let mut t = test_cx(&[], "/work");
+        let err = SharedBuf::new();
+        t.cx.err = Stream::new(Box::new(err.clone()), is_tty);
+        (t, err)
+    }
+
+    #[test]
+    fn unique_match_is_found() {
+        let (mut t, _err) = cx_with_err_tty(false);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "main", |_, _| {
+            panic!("picker must not run for a unique match")
+        });
+        assert!(matches!(r, Resolution::Found(0)));
+    }
+
+    #[test]
+    fn no_match_is_not_found() {
+        let (mut t, _err) = cx_with_err_tty(true);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "zzz", |_, _| {
+            panic!("picker must not run when nothing matches")
+        });
+        assert!(matches!(r, Resolution::NotFound));
+    }
+
+    #[test]
+    fn non_tty_ambiguous_lists_candidates() {
+        let (mut t, err) = cx_with_err_tty(false);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "feature/log", |_, _| {
+            panic!("picker must not run when stderr is not a TTY")
+        });
+        assert!(matches!(r, Resolution::Ambiguous));
+        let out = err.contents();
+        assert!(out.contains("ambiguous"));
+        assert!(out.contains("feature/login"));
+        assert!(out.contains("feature/logout"));
+    }
+
+    #[test]
+    fn tty_picker_selection_maps_to_index() {
+        let (mut t, err) = cx_with_err_tty(true);
+        let wts = worktrees();
+        let chosen = wts[2].path.clone();
+        let r = resolve_query_with(&mut t.cx, &wts, "feature/log", move |_, q| {
+            assert_eq!(q, "feature/log");
+            Ok(Some(chosen))
+        });
+        assert!(matches!(r, Resolution::Found(2)));
+        // The picker showed the choices; no candidate list is printed.
+        assert!(err.contents().is_empty());
+    }
+
+    #[test]
+    fn tty_picker_cancel_is_ambiguous_without_output() {
+        let (mut t, err) = cx_with_err_tty(true);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "feature/log", |_, _| Ok(None));
+        assert!(matches!(r, Resolution::Ambiguous));
+        assert!(err.contents().is_empty());
+    }
+
+    #[test]
+    fn tty_picker_error_falls_back_to_listing() {
+        let (mut t, err) = cx_with_err_tty(true);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "feature/log", |_, _| {
+            Err(crate::error::Error::operation("boom"))
+        });
+        assert!(matches!(r, Resolution::Ambiguous));
+        assert!(err.contents().contains("ambiguous"));
+        assert!(err.contents().contains("feature/login"));
+    }
+
+    #[test]
+    fn tty_picker_unknown_path_is_ambiguous() {
+        let (mut t, err) = cx_with_err_tty(true);
+        let r = resolve_query_with(&mut t.cx, &worktrees(), "feature/log", |_, _| {
+            Ok(Some(PathBuf::from("/somewhere/else")))
+        });
+        assert!(matches!(r, Resolution::Ambiguous));
+        assert!(err.contents().is_empty());
+    }
 }

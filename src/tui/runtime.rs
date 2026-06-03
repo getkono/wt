@@ -41,7 +41,9 @@ pub(crate) fn app_config(config: &Config, color: bool) -> AppConfig {
 }
 
 /// Runs the TUI, returning the chosen worktree path (if the user switched).
-pub fn run_tui(cx: &mut Cx) -> Result<Option<PathBuf>> {
+/// When `initial_filter` is set, the picker opens pre-filtered to that query
+/// (the ambiguous-query fallback uses this to surface the candidates).
+pub fn run_tui(cx: &mut Cx, initial_filter: Option<&str>) -> Result<Option<PathBuf>> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     let sync_worktrees = enumerate_worktrees(&session.repo, git.as_ref())?;
@@ -51,6 +53,9 @@ pub fn run_tui(cx: &mut Cx) -> Result<Option<PathBuf>> {
     let color = cx.color_enabled_err(session.config.ui_color);
     let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
     app.branches = crate::git::local_branches(session.repo.gix()).unwrap_or_default();
+    if let Some(filter) = initial_filter.filter(|f| !f.is_empty()) {
+        app.apply_filter(filter.to_string());
+    }
     app.mark_loading();
 
     let runtime = tokio::runtime::Runtime::new()?;
