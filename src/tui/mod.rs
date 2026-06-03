@@ -14,4 +14,4 @@ pub mod view;
 
 pub use app::{App, Mode, Pane};
 pub use event::Effect;
-pub use runtime::run_tui;
+pub use runtime::{run_pr_picker, run_tui};

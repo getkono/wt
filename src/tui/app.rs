@@ -144,6 +144,10 @@ pub struct App {
     pub quit: bool,
     /// Set to the chosen path when the user switches (Enter).
     pub chosen: Option<PathBuf>,
+    /// When set, checking out a PR sets `chosen` and exits the loop (switching
+    /// into the new worktree) instead of returning to the list. Used by the
+    /// `wt pr` no-argument picker entry; the `p`-key picker leaves it `false`.
+    pub exit_on_pr_checkout: bool,
     /// Worktree paths whose async fields have loaded; rows not in this set show
     /// the per-row spinner (spec §10). Keyed by path so it survives re-sorting.
     loaded_paths: std::collections::HashSet<PathBuf>,
@@ -213,6 +217,7 @@ impl App {
             color: config.color,
             quit: false,
             chosen: None,
+            exit_on_pr_checkout: false,
         }
     }
 
