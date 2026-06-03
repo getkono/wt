@@ -340,6 +340,15 @@ impl App {
         self.recompute_visible();
     }
 
+    /// Replaces the filter wholesale and recomputes the visible set, resetting
+    /// the selection to the first match. Used to seed the picker with a query
+    /// (e.g. the ambiguous-query fallback opens pre-filtered to that query).
+    pub(crate) fn apply_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.selected = 0;
+        self.recompute_visible();
+    }
+
     /// Re-sorts worktrees and rebuilds the visible set, keeping the selection.
     fn resort_preserving_selection(&mut self) {
         let selected_path = self.selected_worktree().map(|w| w.path.clone());
@@ -470,6 +479,17 @@ mod tests {
         assert!(a.selected < a.visible.len());
         a.clear_filter();
         assert_eq!(a.visible.len(), 3);
+    }
+
+    #[test]
+    fn apply_filter_seeds_filter_and_resets_selection() {
+        let mut a = app(&[("alpha", true), ("beta", false), ("alphabet", false)]);
+        a.selected = 2;
+        a.apply_filter("alph".to_string());
+        assert_eq!(a.filter, "alph");
+        // Only alpha + alphabet match; selection resets to the first match.
+        assert_eq!(a.visible.len(), 2);
+        assert_eq!(a.selected, 0);
     }
 
     #[test]

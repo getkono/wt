@@ -31,7 +31,7 @@ pub fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {
 /// Launches the TUI picker; on a switch, prints the chosen path (so the wrapper
 /// `cd`s). A cancelled picker prints nothing and exits `0` (no `cd`).
 pub fn launch_picker(cx: &mut Cx) -> Result<u8> {
-    match crate::tui::run_tui(cx)? {
+    match crate::tui::run_tui(cx, None)? {
         Some(path) => {
             cx.out.line(&path.to_string_lossy())?;
             Ok(0)
