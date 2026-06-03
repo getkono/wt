@@ -50,6 +50,7 @@ pub fn run_tui(cx: &mut Cx) -> Result<Option<PathBuf>> {
     // stderr (stdout is reserved for the chosen path and is usually piped).
     let color = cx.color_enabled_err(session.config.ui_color);
     let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
+    app.branches = crate::git::local_branches(session.repo.gix()).unwrap_or_default();
     app.mark_loading();
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -178,10 +179,15 @@ fn mark_all_loaded(app: &mut App, worktrees: Vec<Worktree>) {
 /// Rebuilds the worktree list (after a mutation), preserving selection.
 pub(crate) fn do_refresh(cx: &Cx, app: &mut App, root: &Path) {
     let git = cx.git.clone();
-    if let Ok(repo) = Repo::discover(root)
-        && let Ok(worktrees) = build_worktrees(&repo, git.as_ref())
-    {
-        mark_all_loaded(app, worktrees);
+    if let Ok(repo) = Repo::discover(root) {
+        // Refresh the base-ref completion candidates so a just-created branch
+        // becomes completable (best-effort; keep the old list on failure).
+        if let Ok(branches) = crate::git::local_branches(repo.gix()) {
+            app.branches = branches;
+        }
+        if let Ok(worktrees) = build_worktrees(&repo, git.as_ref()) {
+            mark_all_loaded(app, worktrees);
+        }
     }
 }
 

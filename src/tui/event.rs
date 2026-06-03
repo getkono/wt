@@ -58,6 +58,46 @@ impl CreateState {
     }
 }
 
+/// Extends the create-prompt base ref to the longest common prefix of the local
+/// branches that start with it (a no-op when nothing matches or there is no
+/// progress to make). Best-effort completion: an empty candidate list — e.g.
+/// when branch enumeration failed — simply does nothing.
+fn complete_base_ref(state: &mut CreateState, branches: &[String]) {
+    let matches: Vec<&str> = branches
+        .iter()
+        .map(String::as_str)
+        .filter(|b| b.starts_with(&state.base))
+        .collect();
+    if let Some(common) = longest_common_prefix(&matches)
+        && common.len() > state.base.len()
+    {
+        state.base = common;
+    }
+}
+
+/// The longest common prefix shared by all `items`, or `None` when `items` is
+/// empty. A single item yields the whole item.
+fn longest_common_prefix(items: &[&str]) -> Option<String> {
+    let (first, rest) = items.split_first()?;
+    let mut prefix: &str = first;
+    for item in rest {
+        // Trim `prefix` to the shared leading chars with `item`, ending on a
+        // `prefix` char boundary so the slice is always valid UTF-8.
+        let shared = prefix
+            .char_indices()
+            .zip(item.chars())
+            .take_while(|&((_, a), b)| a == b)
+            .map(|((i, a), _)| i + a.len_utf8())
+            .last()
+            .unwrap_or(0);
+        prefix = &prefix[..shared];
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    Some(prefix.to_string())
+}
+
 impl App {
     /// Handles a terminal event, returning the [`Effect`] to perform.
     pub fn handle_event(&mut self, event: Event) -> Effect {
@@ -184,11 +224,19 @@ impl App {
             KeyCode::Backspace => {
                 state.field_mut().pop();
             }
+            KeyCode::Tab => {
+                if state.step == CreateStep::Base {
+                    complete_base_ref(state, &self.branches);
+                }
+            }
             KeyCode::Esc => self.mode = Mode::List,
             KeyCode::Enter => match state.step {
                 CreateStep::Branch => {
-                    if state.branch.trim().is_empty() {
+                    let branch = state.branch.trim();
+                    if branch.is_empty() {
                         state.error = Some("branch name is required".into());
+                    } else if let Err(msg) = crate::git::validate_branch_name(branch) {
+                        state.error = Some(msg);
                     } else {
                         state.step = CreateStep::Base;
                     }
@@ -379,6 +427,101 @@ mod tests {
                 base: None
             }
         );
+    }
+
+    #[test]
+    fn create_mode_rejects_invalid_branch_name() {
+        let mut a = app(&[("a", true)]);
+        a.handle_event(press(KeyCode::Char('n')));
+        for c in "feat..x".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        // Invalid ref name -> inline error, stays on the branch step.
+        a.handle_event(press(KeyCode::Enter));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.step, CreateStep::Branch);
+            assert!(s.error.as_deref().unwrap().contains("invalid branch name"));
+        } else {
+            panic!("expected create mode");
+        }
+        // Typing clears the error (existing char arm).
+        a.handle_event(press(KeyCode::Char('y')));
+        if let Mode::Create(s) = &a.mode {
+            assert!(s.error.is_none());
+        }
+        // A legal name then advances to the base step.
+        if let Mode::Create(s) = &mut a.mode {
+            s.branch = "feature/x".into();
+        }
+        a.handle_event(press(KeyCode::Enter));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.step, CreateStep::Base);
+        } else {
+            panic!("expected create mode");
+        }
+    }
+
+    #[test]
+    fn create_mode_tab_completes_base_ref() {
+        let mut a = app(&[("a", true)]);
+        a.branches = vec!["feature/alpha".into(), "feature/beta".into(), "main".into()];
+        a.handle_event(press(KeyCode::Char('n')));
+        for c in "topic".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Enter)); // advance to base step
+        // Ambiguous prefix extends to the longest common prefix.
+        for c in "feat".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Tab));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "feature/");
+        } else {
+            panic!("expected create mode");
+        }
+        // Disambiguate, then Tab completes the unique branch fully.
+        a.handle_event(press(KeyCode::Char('a')));
+        a.handle_event(press(KeyCode::Tab));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "feature/alpha");
+        }
+    }
+
+    #[test]
+    fn create_mode_tab_noop_without_candidates() {
+        let mut a = app(&[("a", true)]);
+        a.handle_event(press(KeyCode::Char('n')));
+        for c in "feature/x".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Enter)); // base step
+        for c in "xyz".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Tab)); // no branches -> no change
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "xyz");
+        }
+        // Tab on the branch step is a no-op (completion is base-only).
+        let mut b = app(&[("a", true)]);
+        b.branches = vec!["main".into()];
+        b.handle_event(press(KeyCode::Char('n')));
+        b.handle_event(press(KeyCode::Tab));
+        if let Mode::Create(s) = &b.mode {
+            assert!(s.branch.is_empty());
+        }
+    }
+
+    #[test]
+    fn longest_common_prefix_cases() {
+        assert_eq!(longest_common_prefix(&[]), None);
+        assert_eq!(longest_common_prefix(&["solo"]).as_deref(), Some("solo"));
+        assert_eq!(
+            longest_common_prefix(&["feature/a", "feature/b"]).as_deref(),
+            Some("feature/")
+        );
+        assert_eq!(longest_common_prefix(&["abc", "xyz"]).as_deref(), Some(""));
     }
 
     #[test]

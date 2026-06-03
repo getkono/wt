@@ -35,6 +35,20 @@ pub fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Validates a user-entered branch name as a legal git branch ref
+/// (`git check-ref-format --branch` semantics), returning a human-readable
+/// reason on failure. The name is validated as the full ref `refs/heads/<name>`,
+/// so single-component lowercase names like `feature` are accepted while
+/// illegal forms (`feat..x`, `a b`, `*x`, `.hidden`, `x.lock`, `HEAD`, …) are
+/// rejected.
+pub fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
+    use gix::bstr::ByteSlice;
+    let full = format!("refs/heads/{name}");
+    gix::validate::reference::branch_name(full.as_bytes().as_bstr())
+        .map(|_| ())
+        .map_err(|e| format!("invalid branch name: {e}"))
+}
+
 /// Resolves a revspec to an object id (hex), or `None` if it does not resolve.
 pub fn resolve_hex(repo: &gix::Repository, spec: &str) -> Option<String> {
     repo.rev_parse_single(spec)
@@ -110,6 +124,27 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let branches = local_branches(r.gix()).unwrap();
         assert_eq!(branches, vec!["alpha", "main", "zeta"]);
+    }
+
+    #[test]
+    fn validates_branch_names() {
+        // Legal branch names, including slashes, dashes, underscores, digits.
+        for ok in ["feature", "feature/x", "fix-bug_123", "release/v1.2"] {
+            assert!(
+                validate_branch_name(ok).is_ok(),
+                "expected {ok:?} to be valid"
+            );
+        }
+        // Illegal forms are rejected with a reason.
+        for bad in [
+            "feat..x", "a b", "*x", ".hidden", "feature/", "x.lock", "HEAD", "",
+        ] {
+            let err = validate_branch_name(bad).unwrap_err();
+            assert!(
+                err.starts_with("invalid branch name:"),
+                "expected {bad:?} to be rejected, got {err:?}"
+            );
+        }
     }
 
     #[test]
