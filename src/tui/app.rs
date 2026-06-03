@@ -86,6 +86,8 @@ pub struct PrItem {
     pub author: String,
     /// PR state label.
     pub state: String,
+    /// ISO-8601 creation time, used to render a relative age.
+    pub created_at: String,
 }
 
 /// The PR-picker state.

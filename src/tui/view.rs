@@ -618,12 +618,16 @@ fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: R
         );
         return;
     }
+    let now = now_unix();
     let items: Vec<ListItem> = state
         .prs
         .iter()
         .map(|pr| {
             let state_style = PrState::parse(&pr.state)
                 .map(|s| theme.pr_state(s))
+                .unwrap_or_default();
+            let age = parse_iso8601(&pr.created_at)
+                .map(|u| relative(now, u))
                 .unwrap_or_default();
             ListItem::new(Line::from(vec![
                 Span::styled(format!("#{}", pr.number), theme.commit_hash()),
@@ -633,6 +637,8 @@ fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: R
                 Span::styled(format!("({})", pr.author), theme.hint_label()),
                 Span::raw("  "),
                 Span::styled(pr.state.clone(), state_style),
+                Span::raw("  "),
+                Span::styled(age, theme.time()),
             ]))
         })
         .collect();
@@ -902,17 +908,31 @@ mod tests {
 
         a.mode = Mode::PrPicker(PrPickerState {
             loading: false,
-            prs: vec![PrItem {
-                number: 42,
-                title: "Add login".into(),
-                author: "alice".into(),
-                state: "open".into(),
-            }],
+            prs: vec![
+                PrItem {
+                    number: 42,
+                    title: "Add login".into(),
+                    author: "alice".into(),
+                    state: "open".into(),
+                    created_at: "2020-01-01T00:00:00Z".into(),
+                },
+                // An unparseable timestamp renders an empty age without panicking.
+                PrItem {
+                    number: 7,
+                    title: "No date".into(),
+                    author: "bob".into(),
+                    state: "open".into(),
+                    created_at: String::new(),
+                },
+            ],
             ..Default::default()
         });
         let text = render_to_text(&a, 100, 30);
         assert!(text.contains("#42"));
         assert!(text.contains("Add login"));
+        // The age column renders a relative time; the fixed far-past date is
+        // always years before "now", so the unit is deterministically years.
+        assert!(text.contains("ago"));
 
         a.mode = Mode::PrPicker(PrPickerState {
             error: Some("gh unavailable".into()),
