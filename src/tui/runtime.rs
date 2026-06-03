@@ -10,7 +10,7 @@ use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::cli::{NewArgs, PrArgs};
+use crate::cli::NewArgs;
 use crate::commands::{self, Session, open_session};
 use crate::config::Config;
 use crate::cx::Cx;
@@ -46,20 +46,52 @@ pub(crate) fn app_config(config: &Config, color: bool) -> AppConfig {
 pub fn run_tui(cx: &mut Cx, initial_filter: Option<&str>) -> Result<Option<PathBuf>> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
-    let sync_worktrees = enumerate_worktrees(&session.repo, git.as_ref())?;
+    let mut app = build_app(cx, &session, git.as_ref())?;
+    if let Some(filter) = initial_filter.filter(|f| !f.is_empty()) {
+        app.apply_filter(filter.to_string());
+    }
+    drive_tui(cx, &session, app, Effect::None)
+}
+
+/// Runs the TUI directly in PR-picker mode (the `wt pr` no-argument entry).
+/// Returns the chosen worktree path once a PR is checked out, or `None` if the
+/// user cancels. The picker loads its PRs on open (via an initial `FetchPrs`),
+/// and selecting a PR switches into the new worktree (spec §7).
+pub fn run_pr_picker(cx: &mut Cx) -> Result<Option<PathBuf>> {
+    let git = cx.git.clone();
+    let session = open_session(cx, git.as_ref())?;
+    let mut app = build_app(cx, &session, git.as_ref())?;
+    app.exit_on_pr_checkout = true;
+    app.mode = Mode::PrPicker(crate::tui::app::PrPickerState {
+        loading: true,
+        ..Default::default()
+    });
+    drive_tui(cx, &session, app, Effect::FetchPrs)
+}
+
+/// Builds the [`App`] over the session's worktrees, seeding the branch list.
+fn build_app(cx: &Cx, session: &Session, git: &dyn GitCli) -> Result<App> {
+    let sync_worktrees = enumerate_worktrees(&session.repo, git)?;
     let size = crossterm::terminal::size().unwrap_or((100, 30));
     // The TUI draws to the alternate screen on stderr, so resolve color against
     // stderr (stdout is reserved for the chosen path and is usually piped).
     let color = cx.color_enabled_err(session.config.ui_color);
     let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
     app.branches = crate::git::local_branches(session.repo.gix()).unwrap_or_default();
-    if let Some(filter) = initial_filter.filter(|f| !f.is_empty()) {
-        app.apply_filter(filter.to_string());
-    }
     app.mark_loading();
+    Ok(app)
+}
 
+/// Drives the prepared app through the event loop and returns the chosen path
+/// (terminal shell; not unit-tested).
+fn drive_tui(
+    cx: &mut Cx,
+    session: &Session,
+    mut app: App,
+    initial: Effect,
+) -> Result<Option<PathBuf>> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run_loop(cx, &session, &mut app))?;
+    runtime.block_on(run_loop(cx, session, &mut app, initial))?;
 
     if app.too_small {
         cx.err.line("terminal too small (need ≥5 rows)")?;
@@ -68,8 +100,10 @@ pub fn run_tui(cx: &mut Cx, initial_filter: Option<&str>) -> Result<Option<PathB
     Ok(app.chosen.clone())
 }
 
-/// The async event loop (terminal shell; not unit-tested).
-async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App) -> Result<()> {
+/// The async event loop (terminal shell; not unit-tested). `initial` is an
+/// effect dispatched once after the first paint (e.g. `FetchPrs` to populate the
+/// PR picker on open); pass `Effect::None` for no initial action.
+async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect) -> Result<()> {
     install_panic_hook();
     let mut tui = Tui::enter(app.mouse)?;
     app.size = tui.size();
@@ -80,6 +114,13 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App) -> Result<()> {
         return Ok(());
     }
     tui.draw(app)?;
+
+    if initial != Effect::None {
+        if dispatch_effect(cx, session, app, &mut tui, initial)? {
+            return Ok(());
+        }
+        tui.draw(app)?;
+    }
 
     // Load async data in the background and stream the result in.
     let (tx, mut rx) = mpsc::channel::<Vec<Worktree>>(1);
@@ -151,7 +192,9 @@ fn dispatch_effect(
             tui.suspend()?;
             do_checkout_pr(cx, session, app, number);
             tui.resume()?;
-            Ok(false)
+            // A switching checkout (the `wt pr` picker entry) sets `chosen`; exit
+            // the loop so the wrapper `cd`s into the new worktree.
+            Ok(app.chosen.is_some())
         }
     }
 }
@@ -282,19 +325,35 @@ pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: us
     do_refresh(cx, app, &session.primary_root);
 }
 
-/// Checks out a PR into a new worktree and refreshes.
+/// Checks out a PR into a worktree. When `app.exit_on_pr_checkout` is set (the
+/// `wt pr` picker entry), records the new worktree as `chosen` so the loop exits
+/// and the wrapper `cd`s into it; otherwise returns to the list and refreshes
+/// (the in-TUI `p`-key flow).
 pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, number: u64) {
-    let args = PrArgs {
-        target: Some(number.to_string()),
-        no_switch: true,
-        no_hooks: false,
-        sub: None,
-    };
-    match commands::pr::run(cx, &RealHookRunner, &args, false) {
-        Ok(_) => {
-            app.mode = Mode::List;
-            app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
-            do_refresh(cx, app, &session.primary_root);
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    match commands::pr::checkout_pr_worktree(
+        cx,
+        git.as_ref(),
+        gh.as_ref(),
+        &RealHookRunner,
+        session,
+        &dir,
+        &number.to_string(),
+        false,
+    ) {
+        Ok((path, _existed)) => {
+            if app.exit_on_pr_checkout {
+                app.chosen = Some(path);
+            } else {
+                app.mode = Mode::List;
+                app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
+                do_refresh(cx, app, &session.primary_root);
+            }
         }
         Err(e) => match &mut app.mode {
             Mode::PrPicker(state) => state.error = Some(e.to_string()),
@@ -453,5 +512,84 @@ mod tests {
                 .iter()
                 .any(|w| w.branch.as_deref() == Some("added"))
         );
+    }
+
+    /// Sets up a fetchable `pull/<n>/head` ref served by an `origin` remote
+    /// pointing at the repo itself, so `do_checkout_pr` can fetch a real head.
+    fn repo_with_pr(number: u64) -> TestRepo {
+        let repo = TestRepo::init();
+        repo.write("pr.txt", "from pr\n");
+        repo.commit_all("pr commit");
+        let pr_oid = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", &format!("refs/pull/{number}/head"), &pr_oid]);
+        repo.git(&["reset", "-q", "--hard", "HEAD~1"]);
+        repo.git(&["remote", "add", "origin", repo.root().to_str().unwrap()]);
+        repo
+    }
+
+    fn pr_view(number: u64, head: &str, base: &str) -> crate::gh::PrView {
+        crate::gh::PrView {
+            number,
+            title: "Add login".into(),
+            state: "OPEN".into(),
+            is_draft: false,
+            head_ref_name: head.into(),
+            base_ref_name: base.into(),
+            url: format!("https://github.com/o/r/pull/{number}"),
+        }
+    }
+
+    #[test]
+    fn do_checkout_pr_switches_when_exit_flag_set() {
+        // The `wt pr` picker entry: selecting a PR checks it out and exits the
+        // loop with the new worktree as `chosen` (honoring the nav contract).
+        let repo = repo_with_pr(123);
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.gh = StdArc::new(FakeGh::with_view(pr_view(123, "pr-feature", "main")));
+        app.exit_on_pr_checkout = true;
+        app.mode = Mode::PrPicker(Default::default());
+        do_checkout_pr(&mut t.cx, &session, &mut app, 123);
+        let path = app.chosen.clone().expect("chosen path set on checkout");
+        assert!(path.to_string_lossy().ends_with("pr-feature"));
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn do_checkout_pr_stays_in_list_without_exit_flag() {
+        // The in-TUI `p`-key flow: checkout returns to the list and refreshes,
+        // leaving `chosen` unset so the TUI keeps running.
+        let repo = repo_with_pr(55);
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.gh = StdArc::new(FakeGh::with_view(pr_view(55, "pr-feature", "main")));
+        app.mode = Mode::PrPicker(Default::default());
+        do_checkout_pr(&mut t.cx, &session, &mut app, 55);
+        assert!(app.chosen.is_none());
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("checked out")
+        );
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("pr-feature"))
+        );
+    }
+
+    #[test]
+    fn do_checkout_pr_surfaces_gh_error_in_picker() {
+        let repo = TestRepo::init();
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.gh = StdArc::new(FakeGh::unavailable());
+        app.mode = Mode::PrPicker(Default::default());
+        do_checkout_pr(&mut t.cx, &session, &mut app, 1);
+        if let Mode::PrPicker(state) = &app.mode {
+            assert!(state.error.is_some());
+        } else {
+            panic!("expected pr picker with error");
+        }
+        assert!(app.chosen.is_none());
     }
 }

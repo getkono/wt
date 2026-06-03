@@ -1,14 +1,14 @@
 //! `wt pr` — check out a GitHub PR into its own worktree, or list open PRs
 //! (spec §7). PR operations go through the `gh` boundary (§4).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::{PrArgs, PrSub};
 use crate::commands::{Session, emit_worktree, open_session, resolve_target, rollback_worktree};
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
 use crate::cx::Cx;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::gh::GhClient;
 use crate::git::cli::GitCli;
 use crate::git::resolve_hex;
@@ -19,6 +19,12 @@ use crate::worktree_service::enumerate_worktrees;
 
 /// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
 pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
+    // `wt pr` with no target and no sub: open the interactive PR picker (§7).
+    // The picker opens its own session, so return before opening one here.
+    if args.sub.is_none() && args.target.is_none() {
+        return launch_pr_picker(cx);
+    }
+
     let git = cx.git.clone();
     let gh = cx.gh.clone();
     let session = open_session(cx, git.as_ref())?;
@@ -30,22 +36,30 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Re
     if matches!(args.sub, Some(PrSub::List)) {
         return pr_list(cx, gh.as_ref(), &dir, json);
     }
-    if let Some(target) = args.target.clone() {
-        return pr_checkout(
-            cx,
-            git.as_ref(),
-            gh.as_ref(),
-            hooks,
-            &session,
-            &dir,
-            &target,
-            args,
-            json,
-        );
+    let target = args.target.clone().unwrap_or_default();
+    pr_checkout(
+        cx,
+        git.as_ref(),
+        gh.as_ref(),
+        hooks,
+        &session,
+        &dir,
+        &target,
+        args,
+        json,
+    )
+}
+
+/// Launches the TUI PR picker; on a checkout, prints the chosen worktree path
+/// (so the wrapper `cd`s). A cancelled picker prints nothing and exits `0`.
+fn launch_pr_picker(cx: &mut Cx) -> Result<u8> {
+    match crate::tui::run_pr_picker(cx)? {
+        Some(path) => {
+            cx.out.line(&path.to_string_lossy())?;
+            Ok(0)
+        }
+        None => Ok(0),
     }
-    Err(Error::operation(
-        "the interactive PR picker requires the TUI; pass a PR number, URL, or branch",
-    ))
 }
 
 /// `pr list` — print open PRs as a table or newline-delimited JSON.
@@ -83,7 +97,8 @@ fn pr_list(cx: &mut Cx, gh: &dyn GhClient, dir: &Path, json: bool) -> Result<u8>
     Ok(0)
 }
 
-/// `pr <target>` — fetch the PR head and create a worktree for it.
+/// `pr <target>` — fetch the PR head, create a worktree for it, then emit the
+/// navigation result (path/JSON/note).
 #[allow(clippy::too_many_arguments)]
 fn pr_checkout(
     cx: &mut Cx,
@@ -96,6 +111,32 @@ fn pr_checkout(
     args: &PrArgs,
     json: bool,
 ) -> Result<u8> {
+    let (path, existed) =
+        checkout_pr_worktree(cx, git, gh, hooks, session, dir, target, args.no_hooks)?;
+    let note = if existed {
+        "worktree already exists at"
+    } else {
+        "checked out PR worktree at"
+    };
+    emit_worktree(cx, &path, json, args.no_switch, note)
+}
+
+/// Checks out `target` (a PR number, URL, or head branch) into a worktree,
+/// recording its PR metadata (§7). Returns the worktree path and whether the
+/// worktree already existed (vs. was created here). Does not emit output — the
+/// caller decides how to surface the path (CLI navigation result, or TUI
+/// switch).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkout_pr_worktree(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    gh: &dyn GhClient,
+    hooks: &dyn HookRunner,
+    session: &Session,
+    dir: &Path,
+    target: &str,
+    no_hooks: bool,
+) -> Result<(PathBuf, bool)> {
     let view = gh.view_pr(dir, target)?;
     let root = session.primary_root.clone();
     let branch = view.head_ref_name.clone();
@@ -115,13 +156,7 @@ fn pr_checkout(
         wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
         wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
         wtconfig::write_base_ref(git, &root, &branch, &base)?;
-        return emit_worktree(
-            cx,
-            &path,
-            json,
-            args.no_switch,
-            "worktree already exists at",
-        );
+        return Ok((path, true));
     }
 
     // Fetch the PR head (works for fork PRs too via the pull/<n>/head ref).
@@ -204,16 +239,10 @@ fn pr_checkout(
         cx,
         session.config.hooks_post_create.as_deref(),
         &ctx,
-        args.no_hooks,
+        no_hooks,
     )?;
 
-    emit_worktree(
-        cx,
-        &worktree_path,
-        json,
-        args.no_switch,
-        "checked out PR worktree at",
-    )
+    Ok((worktree_path, false))
 }
 
 #[cfg(test)]
@@ -491,13 +520,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::GhUnavailable(_)));
-    }
-
-    #[test]
-    fn no_target_requires_tui() {
-        let repo = TestRepo::init();
-        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-        let err = super::run(&mut t.cx, &RealHookRunner, &pr_args(None, None), false).unwrap_err();
-        assert!(err.to_string().contains("TUI"));
     }
 }
