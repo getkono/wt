@@ -569,12 +569,14 @@ mod tests {
                     title: "x".into(),
                     author: "a".into(),
                     state: "open".into(),
+                    created_at: String::new(),
                 },
                 crate::tui::app::PrItem {
                     number: 9,
                     title: "y".into(),
                     author: "b".into(),
                     state: "open".into(),
+                    created_at: String::new(),
                 },
             ];
         }

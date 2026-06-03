@@ -259,6 +259,7 @@ pub(crate) fn do_fetch_prs(cx: &Cx, session: &Session, app: &mut App) {
                             title: p.title,
                             author: p.author.login,
                             state: pr_state,
+                            created_at: p.created_at,
                         }
                     })
                     .collect();
