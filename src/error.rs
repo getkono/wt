@@ -55,10 +55,11 @@ pub enum Error {
         reason: String,
     },
 
-    /// A `git` or `gh` subprocess failed; `stderr` is surfaced verbatim.
+    /// A subprocess (`git`, `gh`, or a code agent) failed; `stderr` is surfaced
+    /// verbatim.
     #[error("{program} failed: {stderr}")]
     Subprocess {
-        /// The program that failed (`git` or `gh`).
+        /// The program that failed (e.g. `git`, `gh`, `claude`).
         program: String,
         /// Captured standard error, verbatim.
         stderr: String,
@@ -67,6 +68,10 @@ pub enum Error {
     /// The `gh` CLI is missing or unauthenticated.
     #[error("{0}")]
     GhUnavailable(String),
+
+    /// No code-agent CLI is available (missing binary or failed to launch).
+    #[error("{0}")]
+    AgentUnavailable(String),
 
     /// An operation failed for the reason described by the message.
     #[error("{0}")]
@@ -140,6 +145,7 @@ mod tests {
             1
         );
         assert_eq!(Error::GhUnavailable("gh".into()).exit_code(), 1);
+        assert_eq!(Error::AgentUnavailable("a".into()).exit_code(), 1);
         assert_eq!(Error::operation("op").exit_code(), 1);
         assert_eq!(Error::from(std::io::Error::other("io")).exit_code(), 1);
         let json_err = serde_json::from_str::<i32>("nope").unwrap_err();
@@ -187,6 +193,7 @@ mod tests {
             "gh failed: no auth"
         );
         assert_eq!(Error::GhUnavailable("nope".into()).to_string(), "nope");
+        assert_eq!(Error::AgentUnavailable("nope".into()).to_string(), "nope");
         assert_eq!(Error::operation("op").to_string(), "op");
         assert_eq!(Error::from(std::io::Error::other("io")).to_string(), "io");
     }

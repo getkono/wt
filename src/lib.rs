@@ -9,6 +9,7 @@
 //! the process exit code. Keeping the side-effecting handles in `Cx` makes the
 //! whole dispatch path testable without touching the real terminal.
 
+pub mod agent;
 pub mod cli;
 pub mod commands;
 pub mod config;
