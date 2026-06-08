@@ -7,6 +7,7 @@
 //! Subprocess calls are synchronous (`std::process::Command`), matching the
 //! other CLI boundaries (`git`, `gh`, hooks).
 
+pub mod model;
 pub mod spec;
 pub mod types;
 
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::{Error, Result};
+pub use model::{AgentModel, AgentOptions, Effort};
 pub use spec::{AGENTS, AgentKind, AgentSpec, ResultFormat};
 pub use types::{AgentRun, AgentVersion, DetectedAgent};
 
@@ -24,8 +26,15 @@ pub trait AgentClient {
     fn detect(&self, kind: AgentKind) -> Result<Option<DetectedAgent>>;
 
     /// Runs `kind` non-interactively on `prompt` in `dir`, in the agent's JSON
-    /// output mode, and returns the normalized result.
-    fn run(&self, kind: AgentKind, prompt: &str, dir: &Path) -> Result<AgentRun>;
+    /// output mode, with the selected model and effort (`opts`), and returns the
+    /// normalized result.
+    fn run(
+        &self,
+        kind: AgentKind,
+        prompt: &str,
+        dir: &Path,
+        opts: &AgentOptions,
+    ) -> Result<AgentRun>;
 
     /// Probes every known agent on `PATH`, returning those found. Agents that
     /// are not installed are omitted (that is not an error).
@@ -46,8 +55,14 @@ impl AgentClient for RealAgent {
         detect_with(kind.spec().binary, kind, kind.spec())
     }
 
-    fn run(&self, kind: AgentKind, prompt: &str, dir: &Path) -> Result<AgentRun> {
-        run_with(kind.spec().binary, kind, kind.spec(), prompt, dir)
+    fn run(
+        &self,
+        kind: AgentKind,
+        prompt: &str,
+        dir: &Path,
+        opts: &AgentOptions,
+    ) -> Result<AgentRun> {
+        run_with(kind.spec().binary, kind, kind.spec(), prompt, dir, opts)
     }
 }
 
@@ -74,8 +89,10 @@ fn run_with(
     spec: &AgentSpec,
     prompt: &str,
     dir: &Path,
+    opts: &AgentOptions,
 ) -> Result<AgentRun> {
-    let argv = spec::prompt_argv(spec, prompt);
+    let prompt = spec::apply_effort(opts.effort, prompt);
+    let argv = spec::prompt_argv(spec, &prompt, opts.model);
     let stdout = run_agent(binary, Some(dir), &argv)?;
     spec::parse_result(kind, spec.result_format, &stdout)
 }
@@ -143,7 +160,13 @@ mod tests {
             }
         }
 
-        fn run(&self, kind: AgentKind, prompt: &str, _dir: &Path) -> Result<AgentRun> {
+        fn run(
+            &self,
+            kind: AgentKind,
+            prompt: &str,
+            _dir: &Path,
+            _opts: &AgentOptions,
+        ) -> Result<AgentRun> {
             Ok(AgentRun {
                 kind,
                 is_error: false,
@@ -169,7 +192,12 @@ mod tests {
     fn fake_run_returns_normalized_result() {
         let dir = tempfile::tempdir().unwrap();
         let run = Fake(Behavior::Found)
-            .run(AgentKind::Claude, "hi", dir.path())
+            .run(
+                AgentKind::Claude,
+                "hi",
+                dir.path(),
+                &AgentOptions::default(),
+            )
             .unwrap();
         assert_eq!(run.result, "hi");
         assert!(!run.is_error);
@@ -208,6 +236,7 @@ mod tests {
             run_args: &["-c", "printf '{\"is_error\":false,\"result\":\"ok\"}'"],
             prompt_positional: true,
             json_args: &[],
+            model_flag: "",
             result_format: ResultFormat::SingleObject,
         };
 
@@ -219,6 +248,7 @@ mod tests {
             run_args: &["-c", "true"],
             prompt_positional: true,
             json_args: &[],
+            model_flag: "",
             result_format: ResultFormat::SingleObject,
         };
 
@@ -262,6 +292,7 @@ mod tests {
                 &SH_VERSION,
                 "my prompt",
                 dir.path(),
+                &AgentOptions::default(),
             )
             .unwrap();
             assert!(!run.is_error);

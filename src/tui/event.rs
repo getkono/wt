@@ -287,7 +287,8 @@ impl App {
 
     /// PR-compose key handling. Fixed keys (overlay convention): typing edits
     /// the active field, Tab switches fields, Enter advances (title) or inserts a
-    /// newline (body), Ctrl-S submits, Ctrl-D toggles draft, Esc cancels.
+    /// newline (body), Ctrl-S submits, Ctrl-D toggles draft, Ctrl-A auto-fills
+    /// with the agent, Ctrl-M/Ctrl-E cycle the model/effort, Esc cancels.
     fn key_compose(&mut self, key: KeyEvent) -> Effect {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Mode::PrCompose(state) = &mut self.mode else {
@@ -310,6 +311,15 @@ impl App {
                     };
                 }
             }
+            // Ctrl-A: auto-fill title/body with the agent (current model/effort).
+            KeyCode::Char('a') if ctrl => {
+                state.submitting = true;
+                state.error = None;
+                return Effect::DraftPrAi;
+            }
+            // Ctrl-M / Ctrl-E: cycle the model / effort used for the next fill.
+            KeyCode::Char('m') if ctrl => state.model = state.model.next(),
+            KeyCode::Char('e') if ctrl => state.effort = state.effort.next(),
             KeyCode::Char('d') if ctrl => state.draft = !state.draft,
             // Plain character input (Ctrl chords are handled above / ignored).
             KeyCode::Char(c) if !ctrl => {
@@ -738,6 +748,40 @@ mod tests {
         }
         a.handle_event(press(KeyCode::Esc));
         assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn compose_ctrl_a_triggers_ai_fill() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        let effect = a.handle_event(ctrl('a'));
+        assert_eq!(effect, Effect::DraftPrAi);
+        if let Mode::PrCompose(s) = &a.mode {
+            // The form enters the "working" state; Ctrl-A is not typed as 'a'.
+            assert!(s.submitting);
+            assert_eq!(s.title, "");
+        } else {
+            panic!("expected compose mode");
+        }
+    }
+
+    #[test]
+    fn compose_ctrl_m_and_e_cycle_model_and_effort() {
+        use crate::agent::{AgentModel, Effort};
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        // Defaults are Sonnet / Medium; cycling advances and never types a char.
+        a.handle_event(ctrl('m'));
+        a.handle_event(ctrl('e'));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.model, AgentModel::Sonnet.next());
+            assert_eq!(s.effort, Effort::Medium.next());
+            assert_eq!(s.title, "");
+        } else {
+            panic!("expected compose mode");
+        }
     }
 
     #[test]

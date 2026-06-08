@@ -5,6 +5,7 @@
 
 use toml::Value;
 
+use crate::agent::{AgentModel, Effort};
 use crate::config::schema::ConfigLayer;
 use crate::error::{Error, Result};
 use crate::keys::{KeyAction, KeyChord};
@@ -68,6 +69,7 @@ pub fn parse_layer(text: &str, file: &str) -> Result<ConfigLayer> {
             "hooks" => parse_hooks(file, val, &mut layer)?,
             "remove" => parse_remove(file, val, &mut layer)?,
             "pr" => parse_pr(file, val, &mut layer)?,
+            "agent" => parse_agent(file, val, &mut layer)?,
             "list" => parse_list(file, val, &mut layer)?,
             "ui" => parse_ui(file, val, &mut layer)?,
             other => return Err(cfg_err(file, other, "unknown configuration key")),
@@ -112,6 +114,29 @@ fn parse_pr(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
         let key = format!("pr.{sub}");
         match sub.as_str() {
             "default_remote" => layer.pr_default_remote = Some(as_string(file, &key, val)?),
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `[agent]` table, validating the model and effort identifiers.
+fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "agent", value)? {
+        let key = format!("agent.{sub}");
+        match sub.as_str() {
+            "model" => {
+                let text = as_string(file, &key, val)?;
+                let model = AgentModel::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: opus, sonnet, haiku"))?;
+                layer.agent_model = Some(model);
+            }
+            "effort" => {
+                let text = as_string(file, &key, val)?;
+                let effort = Effort::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: low, medium, high"))?;
+                layer.agent_effort = Some(effort);
+            }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
@@ -210,6 +235,10 @@ mod tests {
             [pr]
             default_remote = "upstream"
 
+            [agent]
+            model = "opus"
+            effort = "high"
+
             [list]
             show_untracked = false
             columns = ["branch", "pr"]
@@ -236,6 +265,8 @@ mod tests {
         assert_eq!(layer.remove_delete_merged_branch, Some(false));
         assert_eq!(layer.remove_untracked_blocks, Some(true));
         assert_eq!(layer.pr_default_remote.as_deref(), Some("upstream"));
+        assert_eq!(layer.agent_model, Some(AgentModel::Opus));
+        assert_eq!(layer.agent_effort, Some(Effort::High));
         assert_eq!(layer.list_show_untracked, Some(false));
         assert_eq!(layer.list_columns, Some(vec![Column::Branch, Column::Pr]));
         assert_eq!(layer.ui_nerd_fonts, Some(true));
@@ -292,6 +323,18 @@ mod tests {
     fn invalid_color_rejected() {
         let (key, _) = config_reason(parse("[ui]\ncolor = \"rainbow\"").unwrap_err());
         assert_eq!(key, "ui.color");
+    }
+
+    #[test]
+    fn invalid_agent_model_and_effort_rejected() {
+        let (key, reason) = config_reason(parse("[agent]\nmodel = \"gpt\"").unwrap_err());
+        assert_eq!(key, "agent.model");
+        assert!(reason.contains("opus, sonnet, haiku"));
+        let (key, reason) = config_reason(parse("[agent]\neffort = \"max\"").unwrap_err());
+        assert_eq!(key, "agent.effort");
+        assert!(reason.contains("low, medium, high"));
+        let (key, _) = config_reason(parse("[agent]\nwiggle = true").unwrap_err());
+        assert_eq!(key, "agent.wiggle");
     }
 
     #[test]

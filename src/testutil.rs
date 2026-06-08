@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use std::collections::VecDeque;
 
-use crate::agent::{AgentClient, AgentKind, AgentRun, AgentVersion, DetectedAgent};
+use crate::agent::{AgentClient, AgentKind, AgentOptions, AgentRun, AgentVersion, DetectedAgent};
 use crate::cx::{Cx, Env, Input, Stream};
 use crate::error::Error;
 use crate::gh::{GhClient, OpenPr, PrSummary, PrView, RealGh};
@@ -161,30 +161,46 @@ pub(crate) enum AgentBehavior {
 }
 
 /// A fake [`AgentClient`] for tests: returns a canned draft, simulates an
-/// absent agent, or an erroring run.
-pub(crate) struct FakeAgent(AgentBehavior);
+/// absent agent, or an erroring run, and records the [`AgentOptions`] of the
+/// last `run` so tests can assert the selected model/effort were threaded.
+pub(crate) struct FakeAgent {
+    behavior: AgentBehavior,
+    last_opts: Mutex<Option<AgentOptions>>,
+}
 
 #[allow(dead_code)]
 impl FakeAgent {
+    fn new(behavior: AgentBehavior) -> Self {
+        FakeAgent {
+            behavior,
+            last_opts: Mutex::new(None),
+        }
+    }
+
     /// A present agent whose `run` returns `result` (a successful draft).
     pub(crate) fn drafting(result: &str) -> Self {
-        FakeAgent(AgentBehavior::Draft(result.to_string()))
+        FakeAgent::new(AgentBehavior::Draft(result.to_string()))
     }
 
     /// A present agent whose `run` returns an error-flagged result.
     pub(crate) fn erroring(result: &str) -> Self {
-        FakeAgent(AgentBehavior::Erroring(result.to_string()))
+        FakeAgent::new(AgentBehavior::Erroring(result.to_string()))
     }
 
     /// An absent agent (`detect` → `None`, `run` → `AgentUnavailable`).
     pub(crate) fn unavailable() -> Self {
-        FakeAgent(AgentBehavior::Unavailable)
+        FakeAgent::new(AgentBehavior::Unavailable)
+    }
+
+    /// The [`AgentOptions`] passed to the most recent `run`, if any.
+    pub(crate) fn last_opts(&self) -> Option<AgentOptions> {
+        *self.last_opts.lock().expect("lock")
     }
 }
 
 impl AgentClient for FakeAgent {
     fn detect(&self, kind: AgentKind) -> crate::error::Result<Option<DetectedAgent>> {
-        match self.0 {
+        match self.behavior {
             AgentBehavior::Unavailable => Ok(None),
             _ => Ok(Some(DetectedAgent {
                 kind,
@@ -197,8 +213,15 @@ impl AgentClient for FakeAgent {
         }
     }
 
-    fn run(&self, kind: AgentKind, _prompt: &str, _dir: &Path) -> crate::error::Result<AgentRun> {
-        match &self.0 {
+    fn run(
+        &self,
+        kind: AgentKind,
+        _prompt: &str,
+        _dir: &Path,
+        opts: &AgentOptions,
+    ) -> crate::error::Result<AgentRun> {
+        *self.last_opts.lock().expect("lock") = Some(*opts);
+        match &self.behavior {
             AgentBehavior::Draft(result) => Ok(AgentRun {
                 kind,
                 is_error: false,
