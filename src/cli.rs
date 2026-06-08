@@ -185,11 +185,46 @@ pub struct PrArgs {
     pub sub: Option<PrSub>,
 }
 
-/// The `pr list` sub-form.
+/// The `pr` sub-forms (`list`, `open`).
 #[derive(Debug, Subcommand)]
 pub enum PrSub {
     /// List open PRs without checking any out.
     List,
+    /// Compose and open (create or update) a PR for the current branch.
+    Open(PrOpenArgs),
+}
+
+/// Arguments for `wt pr open`.
+#[derive(Debug, Args)]
+pub struct PrOpenArgs {
+    /// PR title. On an interactive terminal it seeds the compose form;
+    /// non-interactively (or with `-y`) it is used directly.
+    #[arg(long)]
+    pub title: Option<String>,
+    /// PR body text.
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read the PR body from a file (use `-` for stdin).
+    #[arg(long = "body-file", conflicts_with = "body")]
+    pub body_file: Option<String>,
+    /// Open the PR as a draft (create only).
+    #[arg(long)]
+    pub draft: bool,
+    /// Draft the title/body with a code agent (Claude), then review before sending.
+    #[arg(long)]
+    pub ai: bool,
+    /// Skip the compose form and submit non-interactively.
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Override the base/trunk branch to target.
+    #[arg(long, value_name = "REF")]
+    pub base: Option<String>,
+    /// When a PR already exists for this branch, update it.
+    #[arg(long, conflicts_with = "new")]
+    pub update: bool,
+    /// When a PR already exists for this branch, create a new one anyway.
+    #[arg(long = "new", conflicts_with = "update")]
+    pub new: bool,
 }
 
 /// Arguments for `wt status`.
@@ -496,6 +531,24 @@ mod tests {
             }
             _ => panic!("expected pr"),
         }
+        // `pr open --title X --draft` -> the open sub-form with its flags.
+        let cli = parse(&["pr", "open", "--title", "X", "--draft", "--ai"]).unwrap();
+        match cli.command {
+            Some(Command::Pr(a)) => match a.sub {
+                Some(PrSub::Open(o)) => {
+                    assert_eq!(o.title.as_deref(), Some("X"));
+                    assert!(o.draft);
+                    assert!(o.ai);
+                    assert!(!o.update && !o.new);
+                }
+                _ => panic!("expected pr open"),
+            },
+            _ => panic!("expected pr"),
+        }
+        // `--update` and `--new` are mutually exclusive.
+        assert!(parse(&["pr", "open", "--update", "--new"]).is_err());
+        // `--body` and `--body-file` are mutually exclusive.
+        assert!(parse(&["pr", "open", "--body", "b", "--body-file", "f"]).is_err());
     }
 
     #[test]

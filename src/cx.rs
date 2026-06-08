@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::agent::AgentClient;
 use crate::error::Result;
 use crate::gh::GhClient;
 use crate::git::cli::GitCli;
@@ -118,6 +119,9 @@ pub struct Cx {
     pub git: Arc<dyn GitCli + Send + Sync>,
     /// The `gh` subprocess handle (real, or a fake in tests).
     pub gh: Arc<dyn GhClient + Send + Sync>,
+    /// The code-agent subprocess handle (real, or a fake in tests). Drives a
+    /// code agent (e.g. `claude`) to draft PR content; see [`AgentClient`].
+    pub agent: Arc<dyn AgentClient + Send + Sync>,
     /// Interactive input source for confirmation prompts.
     pub input: Box<dyn Input + Send>,
     /// The `--color` flag value, if given (set during dispatch).
@@ -131,8 +135,9 @@ pub struct Cx {
 
 impl Cx {
     /// Builds a context from injected streams, environment, working dir, the
-    /// `git`/`gh` handles, and the input source. The global flag fields
+    /// `git`/`gh`/`agent` handles, and the input source. The global flag fields
     /// (`color_flag`, `no_pager`) default off and are set during dispatch.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         out: Stream,
         err: Stream,
@@ -140,6 +145,7 @@ impl Cx {
         cwd: PathBuf,
         git: Arc<dyn GitCli + Send + Sync>,
         gh: Arc<dyn GhClient + Send + Sync>,
+        agent: Arc<dyn AgentClient + Send + Sync>,
         input: Box<dyn Input + Send>,
     ) -> Self {
         Self {
@@ -149,6 +155,7 @@ impl Cx {
             cwd,
             git,
             gh,
+            agent,
             input,
             color_flag: None,
             no_pager: false,

@@ -19,7 +19,7 @@ use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::hooks::RealHookRunner;
 use crate::model::{SortSpec, Worktree};
-use crate::tui::app::{App, AppConfig, Mode, PrItem, StatusKind};
+use crate::tui::app::{App, AppConfig, Mode, PrComposeState, PrItem, StatusKind};
 use crate::tui::event::Effect;
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
@@ -196,6 +196,9 @@ fn dispatch_effect(
             // the loop so the wrapper `cd`s into the new worktree.
             Ok(app.chosen.is_some())
         }
+        // Compose-only effects are driven by the dedicated compose loop
+        // ([`run_pr_compose`]) and never reach the main loop.
+        Effect::DraftPrAi | Effect::SubmitPr { .. } => Ok(false),
     }
 }
 
@@ -359,6 +362,226 @@ pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, numb
             Mode::PrPicker(state) => state.error = Some(e.to_string()),
             _ => app.set_status(e.to_string(), StatusKind::Error),
         },
+    }
+}
+
+/// The initial title/body/draft seed for the compose form (`wt pr open`).
+#[derive(Debug, Clone, Default)]
+pub struct ComposeSeed {
+    /// Seed title (empty when not provided).
+    pub title: String,
+    /// Seed body (empty when not provided).
+    pub body: String,
+    /// Whether the draft toggle starts on.
+    pub draft: bool,
+}
+
+/// Runs the TUI directly in PR-compose mode (`wt pr open`). Seeds the form from
+/// `seed`, optionally drafting the title/body with the code agent first
+/// (`draft_ai`), then lets the user edit and submit. Returns the submit outcome,
+/// or `None` if the user cancels (Esc/quit). The compose form uses its own event
+/// loop so it can carry the gathered `ctx`, the resolved `action`, and the
+/// resulting outcome.
+pub fn run_pr_compose(
+    cx: &mut Cx,
+    session: &Session,
+    ctx: sendit::PrContext,
+    action: sendit::PrAction,
+    seed: ComposeSeed,
+    draft_ai: bool,
+) -> Result<Option<(sendit::PrOutcome, sendit::PrSpec)>> {
+    let git = cx.git.clone();
+    let mut app = build_app(cx, session, git.as_ref())?;
+    let action_label = match action {
+        sendit::PrAction::Create => "create".to_string(),
+        sendit::PrAction::Update { number } => format!("update #{number}"),
+    };
+    app.mode = Mode::PrCompose(PrComposeState {
+        title: seed.title,
+        body: seed.body,
+        draft: seed.draft,
+        branch: ctx.branch.clone(),
+        trunk: ctx.trunk.clone(),
+        action_label,
+        ..Default::default()
+    });
+
+    let initial = if draft_ai {
+        Effect::DraftPrAi
+    } else {
+        Effect::None
+    };
+    let mut outcome: Option<(sendit::PrOutcome, sendit::PrSpec)> = None;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run_compose_loop(
+        cx,
+        session,
+        &mut app,
+        &ctx,
+        action,
+        initial,
+        &mut outcome,
+    ))?;
+
+    if app.too_small {
+        cx.err.line("terminal too small (need ≥5 rows)")?;
+        return Err(Error::operation("terminal too small"));
+    }
+    Ok(outcome)
+}
+
+/// The compose-mode event loop (terminal shell; not unit-tested). Mirrors
+/// [`run_loop`] but carries the PR `ctx`/`action`/`outcome` the compose effects
+/// need; the `do_*` helpers it delegates to are tested.
+async fn run_compose_loop(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    ctx: &sendit::PrContext,
+    action: sendit::PrAction,
+    initial: Effect,
+    outcome: &mut Option<(sendit::PrOutcome, sendit::PrSpec)>,
+) -> Result<()> {
+    install_panic_hook();
+    let mut tui = Tui::enter(app.mouse)?;
+    app.size = tui.size();
+    if app.size.1 < crate::tui::app::MIN_HEIGHT {
+        app.too_small = true;
+        return Ok(());
+    }
+    tui.draw(app)?;
+
+    if initial != Effect::None
+        && compose_dispatch(cx, session, app, &mut tui, ctx, action, initial, outcome)?
+    {
+        return Ok(());
+    }
+    tui.draw(app)?;
+
+    let mut events = EventStream::new();
+    while let Some(maybe) = events.next().await {
+        let Ok(event) = maybe else { continue };
+        let effect = app.handle_event(event);
+        if compose_dispatch(cx, session, app, &mut tui, ctx, action, effect, outcome)? {
+            break;
+        }
+        tui.draw(app)?;
+    }
+    Ok(())
+}
+
+/// Executes a compose-mode effect, returning `true` when the loop should exit
+/// (a successful submit, a quit, or a cancel — the user leaving compose mode via
+/// Esc). Terminal shell; the `do_*` helpers it calls are tested.
+#[allow(clippy::too_many_arguments)]
+fn compose_dispatch(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    tui: &mut Tui,
+    ctx: &sendit::PrContext,
+    action: sendit::PrAction,
+    effect: Effect,
+    outcome: &mut Option<(sendit::PrOutcome, sendit::PrSpec)>,
+) -> Result<bool> {
+    match effect {
+        Effect::Quit => Ok(true),
+        Effect::TooSmall => {
+            app.too_small = true;
+            Ok(true)
+        }
+        Effect::DraftPrAi => {
+            tui.suspend()?;
+            do_draft_pr_ai(cx, session, app, ctx);
+            tui.resume()?;
+            Ok(false)
+        }
+        Effect::SubmitPr { title, body, draft } => {
+            tui.suspend()?;
+            let done = do_submit_pr(cx, session, app, ctx, action, title, body, draft, outcome);
+            tui.resume()?;
+            Ok(done)
+        }
+        // Any other effect (typically `None`): exit only if the user left compose
+        // mode (Esc sets the mode back to List), which we treat as a cancel.
+        _ => Ok(!matches!(app.mode, Mode::PrCompose(_))),
+    }
+}
+
+/// Drafts the PR title/body with the code agent and seeds the compose form.
+/// Errors (including a missing agent) show inline in the form, which stays open.
+pub(crate) fn do_draft_pr_ai(cx: &Cx, session: &Session, app: &mut App, ctx: &sendit::PrContext) {
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), ctx, &dir);
+    if let Mode::PrCompose(state) = &mut app.mode {
+        match result {
+            Ok((title, body)) => {
+                state.title = title;
+                state.body = body;
+                state.error = None;
+            }
+            Err(e) => state.error = Some(e.to_string()),
+        }
+        state.submitting = false;
+    }
+}
+
+/// Submits the composed PR (push + create/update + metadata). On success stores
+/// the outcome and returns `true` to exit the loop; on failure shows the error
+/// inline and stays so the user can edit and retry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn do_submit_pr(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    ctx: &sendit::PrContext,
+    action: sendit::PrAction,
+    title: String,
+    body: String,
+    draft: bool,
+    outcome: &mut Option<(sendit::PrOutcome, sendit::PrSpec)>,
+) -> bool {
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let spec = sendit::PrSpec { title, body, draft };
+    let result = crate::commands::pr_open::submit_pr(
+        git.as_ref(),
+        gh.as_ref(),
+        &session.primary_root,
+        &dir,
+        &session.config.pr_default_remote,
+        ctx,
+        &spec,
+        action,
+    );
+    match result {
+        Ok(out) => {
+            // Best-effort metadata so `wt list`/TUI show the new PR offline.
+            let _ = crate::commands::pr_open::record_pr_metadata(
+                git.as_ref(),
+                &session.primary_root,
+                &ctx.branch,
+                &ctx.trunk,
+                &out,
+                &spec.title,
+            );
+            *outcome = Some((out, spec));
+            true
+        }
+        Err(e) => {
+            if let Mode::PrCompose(state) = &mut app.mode {
+                state.error = Some(e.to_string());
+                state.submitting = false;
+            }
+            false
+        }
     }
 }
 
@@ -576,6 +799,134 @@ mod tests {
                 .iter()
                 .any(|w| w.branch.as_deref() == Some("pr-feature"))
         );
+    }
+
+    fn sendit_ctx(branch: &str, trunk: &str, has_upstream: bool) -> sendit::PrContext {
+        sendit::PrContext {
+            branch: branch.into(),
+            trunk: trunk.into(),
+            merge_base: "abc".into(),
+            has_upstream,
+            commits_ahead: 1,
+            commit_log: vec![],
+            diffstat: sendit::DiffStat {
+                files: 1,
+                insertions: 1,
+                deletions: 0,
+                raw: String::new(),
+            },
+            existing_pr: None,
+        }
+    }
+
+    /// A feature repo (`feat`, one commit ahead of `main`) with a bare `origin`.
+    fn feature_repo_with_remote() -> (TestRepo, TestRepo) {
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.write("f.txt", "x\n");
+        repo.commit_all("feat work");
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        (repo, bare)
+    }
+
+    #[test]
+    fn do_draft_pr_ai_seeds_form() {
+        let repo = TestRepo::init();
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.agent = StdArc::new(crate::testutil::FakeAgent::drafting(
+            "Add login\n\nBody here",
+        ));
+        app.mode = Mode::PrCompose(crate::tui::app::PrComposeState::default());
+        do_draft_pr_ai(
+            &t.cx,
+            &session,
+            &mut app,
+            &sendit_ctx("feat", "main", false),
+        );
+        if let Mode::PrCompose(s) = &app.mode {
+            assert_eq!(s.title, "Add login");
+            assert_eq!(s.body, "Body here");
+            assert!(s.error.is_none());
+        } else {
+            panic!("expected compose mode");
+        }
+    }
+
+    #[test]
+    fn do_draft_pr_ai_shows_error_when_unavailable() {
+        let repo = TestRepo::init();
+        // The default test agent is `FakeAgent::unavailable()`.
+        let (t, session, mut app) = setup(&repo);
+        app.mode = Mode::PrCompose(crate::tui::app::PrComposeState::default());
+        do_draft_pr_ai(
+            &t.cx,
+            &session,
+            &mut app,
+            &sendit_ctx("feat", "main", false),
+        );
+        if let Mode::PrCompose(s) = &app.mode {
+            assert!(s.error.is_some());
+        } else {
+            panic!("expected compose mode");
+        }
+    }
+
+    #[test]
+    fn do_submit_pr_creates_records_and_exits() {
+        let (repo, _bare) = feature_repo_with_remote();
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.gh = StdArc::new(FakeGh::sender("https://github.com/o/r/pull/77\n"));
+        app.mode = Mode::PrCompose(crate::tui::app::PrComposeState::default());
+        let mut outcome = None;
+        let done = do_submit_pr(
+            &mut t.cx,
+            &session,
+            &mut app,
+            &sendit_ctx("feat", "main", false),
+            sendit::PrAction::Create,
+            "T".into(),
+            "B".into(),
+            false,
+            &mut outcome,
+        );
+        assert!(done);
+        assert_eq!(outcome.expect("outcome").0.number, Some(77));
+        assert_eq!(
+            repo.git(&["config", "--get", "wt.feat.prNumber"]).trim(),
+            "77"
+        );
+    }
+
+    #[test]
+    fn do_submit_pr_error_stays_in_form() {
+        let (repo, _bare) = feature_repo_with_remote();
+        let (mut t, session, mut app) = setup(&repo);
+        t.cx.gh = StdArc::new(FakeGh::unavailable());
+        app.mode = Mode::PrCompose(crate::tui::app::PrComposeState {
+            submitting: true,
+            ..Default::default()
+        });
+        let mut outcome = None;
+        let done = do_submit_pr(
+            &mut t.cx,
+            &session,
+            &mut app,
+            &sendit_ctx("feat", "main", false),
+            sendit::PrAction::Create,
+            "T".into(),
+            "B".into(),
+            false,
+            &mut outcome,
+        );
+        assert!(!done);
+        assert!(outcome.is_none());
+        if let Mode::PrCompose(s) = &app.mode {
+            assert!(s.error.is_some());
+            assert!(!s.submitting);
+        } else {
+            panic!("expected compose mode");
+        }
     }
 
     #[test]

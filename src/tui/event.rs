@@ -6,11 +6,11 @@
 use std::path::PathBuf;
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
 use crate::keys::{KeyAction, KeyChord};
-use crate::tui::app::{App, CreateState, CreateStep, MIN_HEIGHT, Mode, Pane};
+use crate::tui::app::{App, ComposeField, CreateState, CreateStep, MIN_HEIGHT, Mode, Pane};
 
 /// The minimum/maximum list-pane width when resizing.
 const MIN_SIDEBAR: u16 = 10;
@@ -46,6 +46,17 @@ pub enum Effect {
     OpenEditor(PathBuf),
     /// Force a full async refresh.
     Refresh,
+    /// Draft the PR title/body with the code agent (seeds the compose form).
+    DraftPrAi,
+    /// Submit the composed PR (push + create/update).
+    SubmitPr {
+        /// The PR title.
+        title: String,
+        /// The PR body.
+        body: String,
+        /// Whether to open as a draft (create only).
+        draft: bool,
+    },
 }
 
 impl CreateState {
@@ -126,6 +137,7 @@ impl App {
             Mode::Filter => self.key_filter(key),
             Mode::Create(_) => self.key_create(key),
             Mode::PrPicker(_) => self.key_pr(key),
+            Mode::PrCompose(_) => self.key_compose(key),
             Mode::ConfirmRemove(_) => self.key_confirm(key),
             Mode::Help => {
                 self.mode = Mode::List;
@@ -267,6 +279,63 @@ impl App {
                     return Effect::CheckoutPr(pr.number);
                 }
             }
+            KeyCode::Esc => self.mode = Mode::List,
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// PR-compose key handling. Fixed keys (overlay convention): typing edits
+    /// the active field, Tab switches fields, Enter advances (title) or inserts a
+    /// newline (body), Ctrl-S submits, Ctrl-D toggles draft, Esc cancels.
+    fn key_compose(&mut self, key: KeyEvent) -> Effect {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Mode::PrCompose(state) = &mut self.mode else {
+            return Effect::None;
+        };
+        // Ignore input while a submit/draft is in flight.
+        if state.submitting {
+            return Effect::None;
+        }
+        match key.code {
+            KeyCode::Char('s') if ctrl => {
+                if state.title.trim().is_empty() {
+                    state.error = Some("a PR title is required".into());
+                } else {
+                    state.submitting = true;
+                    return Effect::SubmitPr {
+                        title: state.title.clone(),
+                        body: state.body.clone(),
+                        draft: state.draft,
+                    };
+                }
+            }
+            KeyCode::Char('d') if ctrl => state.draft = !state.draft,
+            // Plain character input (Ctrl chords are handled above / ignored).
+            KeyCode::Char(c) if !ctrl => {
+                match state.field {
+                    ComposeField::Title => state.title.push(c),
+                    ComposeField::Body => state.body.push(c),
+                }
+                state.error = None;
+            }
+            KeyCode::Backspace => {
+                match state.field {
+                    ComposeField::Title => state.title.pop(),
+                    ComposeField::Body => state.body.pop(),
+                };
+                state.error = None;
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                state.field = match state.field {
+                    ComposeField::Title => ComposeField::Body,
+                    ComposeField::Body => ComposeField::Title,
+                };
+            }
+            KeyCode::Enter => match state.field {
+                ComposeField::Title => state.field = ComposeField::Body,
+                ComposeField::Body => state.body.push('\n'),
+            },
             KeyCode::Esc => self.mode = Mode::List,
             _ => {}
         }
@@ -581,6 +650,92 @@ mod tests {
         a.handle_event(press(KeyCode::Down));
         let effect = a.handle_event(press(KeyCode::Enter));
         assert_eq!(effect, Effect::CheckoutPr(9));
+    }
+
+    #[test]
+    fn compose_typing_field_switch_and_newline() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        a.handle_event(press(KeyCode::Char('h')));
+        a.handle_event(press(KeyCode::Char('i')));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.title, "hi");
+            assert_eq!(s.field, ComposeField::Title);
+        } else {
+            panic!("expected compose mode");
+        }
+        // Enter in the title advances to the body.
+        a.handle_event(press(KeyCode::Enter));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.field, ComposeField::Body);
+        }
+        // Typing + Enter in the body inserts a newline.
+        a.handle_event(press(KeyCode::Char('x')));
+        a.handle_event(press(KeyCode::Enter));
+        a.handle_event(press(KeyCode::Char('y')));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.body, "x\ny");
+        }
+        // Tab switches back to the title; Backspace pops the active field.
+        a.handle_event(press(KeyCode::Tab));
+        a.handle_event(press(KeyCode::Backspace));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.field, ComposeField::Title);
+            assert_eq!(s.title, "h");
+        }
+    }
+
+    #[test]
+    fn compose_ctrl_s_requires_title_and_is_not_typed() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        let effect = a.handle_event(ctrl('s'));
+        assert_eq!(effect, Effect::None);
+        if let Mode::PrCompose(s) = &a.mode {
+            assert!(s.error.is_some());
+            // Ctrl-S must not be inserted as a literal 's'.
+            assert_eq!(s.title, "");
+        } else {
+            panic!("expected compose mode");
+        }
+    }
+
+    #[test]
+    fn compose_ctrl_s_submits_when_title_present() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            title: "T".into(),
+            body: "B".into(),
+            ..Default::default()
+        });
+        let effect = a.handle_event(ctrl('s'));
+        assert_eq!(
+            effect,
+            Effect::SubmitPr {
+                title: "T".into(),
+                body: "B".into(),
+                draft: false
+            }
+        );
+        if let Mode::PrCompose(s) = &a.mode {
+            assert!(s.submitting);
+        }
+    }
+
+    #[test]
+    fn compose_ctrl_d_toggles_draft_and_esc_cancels() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        a.handle_event(ctrl('d'));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert!(s.draft);
+        }
+        a.handle_event(press(KeyCode::Esc));
+        assert_eq!(a.mode, Mode::List);
     }
 
     #[test]

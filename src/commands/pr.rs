@@ -25,6 +25,12 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Re
         return launch_pr_picker(cx);
     }
 
+    // `wt pr open`: compose and open a PR for the current branch (issue #9). It
+    // opens its own session, so dispatch before setting one up here.
+    if let Some(PrSub::Open(open_args)) = &args.sub {
+        return crate::commands::pr_open::run(cx, open_args, json);
+    }
+
     let git = cx.git.clone();
     let gh = cx.gh.clone();
     let session = open_session(cx, git.as_ref())?;
