@@ -3,6 +3,7 @@
 //! `list.columns` identifiers, and bad `ui.keybindings` action names or key
 //! strings are rejected with a precise `{file, key, reason}` error.
 
+use ratatui::style::Color;
 use toml::Value;
 
 use crate::agent::{AgentModel, Effort};
@@ -11,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::keys::{KeyAction, KeyChord};
 use crate::model::Column;
 use crate::output::color::ColorChoice;
+use crate::tui::theme::ThemePreset;
 
 /// Builds a configuration error with file/key/reason context.
 fn cfg_err(file: &str, key: &str, reason: impl Into<String>) -> Error {
@@ -179,11 +181,57 @@ fn parse_ui(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
                     .ok_or_else(|| cfg_err(file, &key, "expected one of: auto, always, never"))?;
                 layer.ui_color = Some(choice);
             }
+            "theme" => parse_theme(file, val, layer)?,
             "keybindings" => parse_keybindings(file, val, layer)?,
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
     Ok(())
+}
+
+/// Parses `ui.theme`: either a string shorthand selecting a preset
+/// (`theme = "solarized"`) or a `[ui.theme]` table with a `preset` key and
+/// per-color overrides.
+fn parse_theme(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    // String shorthand selects the base preset.
+    if let Some(name) = value.as_str() {
+        let preset = ThemePreset::parse(name)
+            .ok_or_else(|| cfg_err(file, "ui.theme", "expected one of: one-dark, solarized"))?;
+        layer.ui_theme = Some(preset);
+        return Ok(());
+    }
+    let o = &mut layer.theme_overrides;
+    for (sub, val) in as_table(file, "ui.theme", value)? {
+        let key = format!("ui.theme.{sub}");
+        match sub.as_str() {
+            "preset" => {
+                let text = as_string(file, &key, val)?;
+                let preset = ThemePreset::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: one-dark, solarized"))?;
+                layer.ui_theme = Some(preset);
+            }
+            "accent" => o.accent = Some(parse_color(file, &key, val)?),
+            "green" => o.green = Some(parse_color(file, &key, val)?),
+            "red" => o.red = Some(parse_color(file, &key, val)?),
+            "yellow" => o.yellow = Some(parse_color(file, &key, val)?),
+            "orange" => o.orange = Some(parse_color(file, &key, val)?),
+            "cyan" => o.cyan = Some(parse_color(file, &key, val)?),
+            "magenta" => o.magenta = Some(parse_color(file, &key, val)?),
+            "gray" => o.gray = Some(parse_color(file, &key, val)?),
+            "selection_bg" => o.selection_bg = Some(parse_color(file, &key, val)?),
+            "chip_fg" => o.chip_fg = Some(parse_color(file, &key, val)?),
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+/// Parses a color string: `#rrggbb` hex, a named color (e.g. `cyan`,
+/// `light-blue`), or a 0–255 ANSI index, via ratatui's [`Color`] parser.
+fn parse_color(file: &str, key: &str, value: &Value) -> Result<Color> {
+    let text = as_string(file, key, value)?;
+    text.parse::<Color>()
+        .map_err(|_| cfg_err(file, key, format!("invalid color: {text:?}")))
 }
 
 /// Parses the `[ui.keybindings]` table (action name → key string).
@@ -352,5 +400,50 @@ mod tests {
     fn malformed_toml_is_config_error() {
         let (_, reason) = config_reason(parse("this is not = = toml").unwrap_err());
         assert!(reason.contains("invalid TOML"));
+    }
+
+    #[test]
+    fn parses_theme_table_with_preset_and_overrides() {
+        let layer =
+            parse("[ui.theme]\npreset = \"solarized\"\naccent = \"#ff8800\"\nred = \"red\"")
+                .unwrap();
+        assert_eq!(layer.ui_theme, Some(ThemePreset::Solarized));
+        assert_eq!(
+            layer.theme_overrides.accent,
+            Some(Color::Rgb(0xff, 0x88, 0x00))
+        );
+        assert_eq!(layer.theme_overrides.red, Some(Color::Red));
+        // Untouched slots stay None.
+        assert_eq!(layer.theme_overrides.green, None);
+    }
+
+    #[test]
+    fn parses_theme_string_shorthand() {
+        let layer = parse("[ui]\ntheme = \"solarized\"").unwrap();
+        assert_eq!(layer.ui_theme, Some(ThemePreset::Solarized));
+        assert_eq!(layer.theme_overrides, Default::default());
+    }
+
+    #[test]
+    fn invalid_theme_preset_rejected() {
+        let (key, reason) = config_reason(parse("[ui.theme]\npreset = \"dracula\"").unwrap_err());
+        assert_eq!(key, "ui.theme.preset");
+        assert!(reason.contains("one-dark, solarized"));
+        // The string shorthand validates the preset too.
+        let (key, _) = config_reason(parse("[ui]\ntheme = \"dracula\"").unwrap_err());
+        assert_eq!(key, "ui.theme");
+    }
+
+    #[test]
+    fn invalid_theme_color_rejected() {
+        let (key, reason) = config_reason(parse("[ui.theme]\naccent = \"notacolor\"").unwrap_err());
+        assert_eq!(key, "ui.theme.accent");
+        assert!(reason.contains("invalid color"));
+    }
+
+    #[test]
+    fn unknown_theme_key_rejected() {
+        let (key, _) = config_reason(parse("[ui.theme]\nsparkle = \"#fff\"").unwrap_err());
+        assert_eq!(key, "ui.theme.sparkle");
     }
 }

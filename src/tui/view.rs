@@ -52,7 +52,7 @@ pub fn render(app: &App, frame: &mut Frame) {
 
 /// Renders the worktree list pane.
 fn render_list(app: &App, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let focused = app.focus == Pane::List;
     let block = Block::bordered()
         .title(list_title(app, &theme, focused))
@@ -253,7 +253,7 @@ fn pr_spans(
 
 /// Renders the detail pane for the selected worktree (spec §10).
 fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let focused = app.focus == Pane::Detail;
     let block = Block::bordered()
         .title(Span::styled("detail", theme.title(focused)))
@@ -435,7 +435,7 @@ fn merge_state_note(
 
 /// Renders the bottom status/help bar.
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let mut spans = vec![Span::styled(
         format!(" {} ", mode_label(&app.mode)),
         theme.mode_chip(&app.mode),
@@ -514,7 +514,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 
 /// Renders the help overlay (the full key-binding reference).
 fn render_help(app: &App, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let rect = centered(area, 56, 22);
     frame.render_widget(Clear, rect);
     let bindings = [
@@ -552,7 +552,7 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
 
 /// Renders the create-worktree prompt.
 fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let rect = centered(area, 60, 8);
     frame.render_widget(Clear, rect);
     let field = |active: bool, label: &'static str, value: &str| {
@@ -604,7 +604,7 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
 /// Renders the PR compose form (`wt pr open`): a title + multi-line body with a
 /// header showing branch → trunk, the create/update action, and the draft state.
 fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let rect = centered(area, 76, 20);
     frame.render_widget(Clear, rect);
 
@@ -695,7 +695,7 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
 
 /// Renders the PR picker overlay.
 fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let rect = centered(area, 70, 20);
     frame.render_widget(Clear, rect);
     let block = Block::bordered().title(Span::styled("open pull requests", theme.title(true)));
@@ -762,7 +762,7 @@ fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Frame, area: R
 /// this is already on the [`crate::model::Worktree`] row; nothing new is read
 /// from git. The dialog grows to fit its content.
 fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
-    let theme = Theme::new(app.color);
+    let theme = Theme::with_palette(app.color, app.palette);
     let Some(worktree) = app.worktrees.get(index) else {
         return;
     };
@@ -1467,6 +1467,16 @@ mod tests {
         assert_eq!(cell_fg(&mono, "*"), Color::Reset);
         assert_eq!(cell_fg(&mono, "M"), Color::Reset);
         assert_eq!(cell_fg(&mono, "↑"), Color::Reset);
+    }
+
+    #[test]
+    fn custom_palette_recolors_cells() {
+        let mut a = app(&[("main", true)]);
+        // Overriding the "current" (green) slot recolors the current marker,
+        // proving the resolved palette threads through rendering.
+        a.palette.green = Color::Rgb(1, 2, 3);
+        let buf = render_to_buffer(&a, 100, 20);
+        assert_eq!(cell_fg(&buf, "*"), Color::Rgb(1, 2, 3));
     }
 
     #[test]

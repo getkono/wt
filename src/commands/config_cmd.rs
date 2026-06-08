@@ -30,6 +30,17 @@ const KEYS: &[&str] = &[
     "ui.nerd_fonts",
     "ui.mouse",
     "ui.color",
+    "ui.theme.preset",
+    "ui.theme.accent",
+    "ui.theme.green",
+    "ui.theme.red",
+    "ui.theme.yellow",
+    "ui.theme.orange",
+    "ui.theme.cyan",
+    "ui.theme.magenta",
+    "ui.theme.gray",
+    "ui.theme.selection_bg",
+    "ui.theme.chip_fg",
 ];
 
 /// The value type of a settable key.
@@ -175,8 +186,26 @@ fn set_dotted(doc: &mut DocumentMut, key: &str, item: Item) -> Result<()> {
 /// The type of a settable key, or `None` if unknown/non-settable.
 fn key_type(key: &str) -> Option<KeyType> {
     Some(match key {
-        "path_template" | "default_base" | "editor" | "hooks.post_create" | "hooks.pre_remove"
-        | "pr.default_remote" | "agent.model" | "agent.effort" | "ui.color" => KeyType::Str,
+        "path_template"
+        | "default_base"
+        | "editor"
+        | "hooks.post_create"
+        | "hooks.pre_remove"
+        | "pr.default_remote"
+        | "agent.model"
+        | "agent.effort"
+        | "ui.color"
+        | "ui.theme.preset"
+        | "ui.theme.accent"
+        | "ui.theme.green"
+        | "ui.theme.red"
+        | "ui.theme.yellow"
+        | "ui.theme.orange"
+        | "ui.theme.cyan"
+        | "ui.theme.magenta"
+        | "ui.theme.gray"
+        | "ui.theme.selection_bg"
+        | "ui.theme.chip_fg" => KeyType::Str,
         "remove.delete_merged_branch"
         | "remove.untracked_blocks"
         | "list.show_untracked"
@@ -214,6 +243,19 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "ui.nerd_fonts" => Some(config.ui_nerd_fonts.to_string()),
         "ui.mouse" => Some(config.ui_mouse.to_string()),
         "ui.color" => Some(color_str(config.ui_color).to_string()),
+        // The preset always resolves (default one-dark); per-color overrides are
+        // raw — unset reads back empty (like `default_base`).
+        "ui.theme.preset" => Some(config.ui_theme.id().to_string()),
+        "ui.theme.accent" => config.theme_overrides.accent.map(|c| c.to_string()),
+        "ui.theme.green" => config.theme_overrides.green.map(|c| c.to_string()),
+        "ui.theme.red" => config.theme_overrides.red.map(|c| c.to_string()),
+        "ui.theme.yellow" => config.theme_overrides.yellow.map(|c| c.to_string()),
+        "ui.theme.orange" => config.theme_overrides.orange.map(|c| c.to_string()),
+        "ui.theme.cyan" => config.theme_overrides.cyan.map(|c| c.to_string()),
+        "ui.theme.magenta" => config.theme_overrides.magenta.map(|c| c.to_string()),
+        "ui.theme.gray" => config.theme_overrides.gray.map(|c| c.to_string()),
+        "ui.theme.selection_bg" => config.theme_overrides.selection_bg.map(|c| c.to_string()),
+        "ui.theme.chip_fg" => config.theme_overrides.chip_fg.map(|c| c.to_string()),
         _ => return Err(Error::usage(format!("unknown config key: {key}"))),
     })
 }
@@ -497,5 +539,110 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no editor"));
+    }
+
+    #[test]
+    fn theme_preset_roundtrip_and_default() {
+        let repo = TestRepo::init();
+        // The default preset is one-dark.
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "ui.theme.preset".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "one-dark");
+        run(
+            &repo,
+            &[],
+            ConfigAction::Set {
+                key: "ui.theme.preset".into(),
+                value: "solarized".into(),
+            },
+            false,
+            false,
+        );
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "ui.theme.preset".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "solarized");
+    }
+
+    #[test]
+    fn theme_color_override_roundtrip_and_unset_is_empty() {
+        let repo = TestRepo::init();
+        // An unset override reads back empty (raw-value semantics).
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "ui.theme.accent".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "");
+        // A hex color round-trips (canonicalized to uppercase by ratatui).
+        run(
+            &repo,
+            &[],
+            ConfigAction::Set {
+                key: "ui.theme.accent".into(),
+                value: "#ff8800".into(),
+            },
+            false,
+            false,
+        );
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "ui.theme.accent".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "#FF8800");
+        // The value is written under the nested [ui.theme] table.
+        let content = std::fs::read_to_string(repo.root().join(".wt.toml")).unwrap();
+        assert!(content.contains("accent = \"#ff8800\""));
+    }
+
+    #[test]
+    fn theme_set_rejects_invalid_color() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let err = super::run(
+            &mut t.cx,
+            &ConfigArgs {
+                action: ConfigAction::Set {
+                    key: "ui.theme.accent".into(),
+                    value: "notacolor".into(),
+                },
+                global: false,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config { .. }));
+        // Validation runs before the write, so nothing is created.
+        assert!(!repo.root().join(".wt.toml").exists());
+    }
+
+    #[test]
+    fn list_includes_theme_keys() {
+        let repo = TestRepo::init();
+        let (_, out, _) = run(&repo, &[], ConfigAction::List, false, false);
+        assert!(out.contains("ui.theme.preset = one-dark"));
+        assert!(out.contains("ui.theme.accent = "));
     }
 }
