@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::{Error, Result};
-pub use types::{Author, PrSummary, PrView, pr_state};
+pub use types::{Author, OpenPr, PrSummary, PrView, pr_state};
 
 /// Performs GitHub pull-request operations via `gh`.
 pub trait GhClient {
@@ -18,6 +18,23 @@ pub trait GhClient {
 
     /// Views the PR identified by `target` (a number, URL, or head branch).
     fn view_pr(&self, dir: &Path, target: &str) -> Result<PrView>;
+
+    /// The repository's default branch (`gh repo view --json defaultBranchRef`),
+    /// or `None` on any failure (kept non-fatal so trunk detection can fall back
+    /// to local git state offline).
+    fn default_branch(&self, dir: &Path) -> Result<Option<String>>;
+
+    /// The open PR whose head is `branch`, if any.
+    fn find_pr_for_branch(&self, dir: &Path, branch: &str) -> Result<Option<OpenPr>>;
+
+    /// Runs `gh pr create` with the prebuilt `args`, returning stdout (the URL
+    /// line is parsed by the caller). Args are typically built by
+    /// `sendit::build_create_args`.
+    fn create_pr(&self, dir: &Path, args: &[String]) -> Result<String>;
+
+    /// Runs `gh pr edit` with the prebuilt `args`, returning stdout. Args are
+    /// typically built by `sendit::build_edit_args`.
+    fn edit_pr(&self, dir: &Path, args: &[String]) -> Result<String>;
 
     /// Lists open PR numbers (for completion; best-effort).
     fn open_pr_numbers(&self, dir: &Path) -> Result<Vec<u64>> {
@@ -61,6 +78,43 @@ impl GhClient for RealGh {
             ],
         )?;
         serde_json::from_str(&output).map_err(Error::from)
+    }
+
+    fn default_branch(&self, dir: &Path) -> Result<Option<String>> {
+        // Non-fatal: any failure (no `gh`, no remote, offline) falls back to
+        // local trunk detection, so map errors to `None` rather than propagate.
+        match run_gh(dir, &["repo", "view", "--json", "defaultBranchRef"]) {
+            Ok(output) => Ok(types::parse_default_branch(&output)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    fn find_pr_for_branch(&self, dir: &Path, branch: &str) -> Result<Option<OpenPr>> {
+        let output = run_gh(
+            dir,
+            &[
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number,url,state,isDraft",
+            ],
+        )?;
+        let prs: Vec<OpenPr> = serde_json::from_str(&output).map_err(Error::from)?;
+        Ok(prs.into_iter().next())
+    }
+
+    fn create_pr(&self, dir: &Path, args: &[String]) -> Result<String> {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_gh(dir, &argv)
+    }
+
+    fn edit_pr(&self, dir: &Path, args: &[String]) -> Result<String> {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        run_gh(dir, &argv)
     }
 }
 

@@ -25,6 +25,8 @@ pub enum Mode {
     Create(CreateState),
     /// PR picker overlay.
     PrPicker(PrPickerState),
+    /// PR compose form (`wt pr open`): edit a title + body, then submit.
+    PrCompose(PrComposeState),
     /// Confirm-remove dialog (the worktree index).
     ConfirmRemove(usize),
     /// Help overlay.
@@ -88,6 +90,40 @@ pub struct PrItem {
     pub state: String,
     /// ISO-8601 creation time, used to render a relative age.
     pub created_at: String,
+}
+
+/// Which PR-compose field is active.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ComposeField {
+    /// Editing the single-line title.
+    #[default]
+    Title,
+    /// Editing the multi-line body.
+    Body,
+}
+
+/// The `wt pr open` compose-form state: a title and (multi-line) body the user
+/// edits before submitting, plus the precomputed header context.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrComposeState {
+    /// Which field is being edited.
+    pub field: ComposeField,
+    /// The PR title (single line).
+    pub title: String,
+    /// The PR body (may contain newlines).
+    pub body: String,
+    /// Whether to open the PR as a draft (create only).
+    pub draft: bool,
+    /// The current branch (for the header).
+    pub branch: String,
+    /// The base/trunk branch (for the header).
+    pub trunk: String,
+    /// Precomputed action label, e.g. `create` or `update #12`.
+    pub action_label: String,
+    /// Whether a submit/draft operation is in flight (shown as a hint).
+    pub submitting: bool,
+    /// An inline error from a failed draft or submission.
+    pub error: Option<String>,
 }
 
 /// The PR-picker state.

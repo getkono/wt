@@ -9,6 +9,7 @@ pub mod list;
 pub mod new;
 pub mod path;
 pub mod pr;
+pub mod pr_open;
 pub mod prune;
 pub mod remove;
 pub mod root;

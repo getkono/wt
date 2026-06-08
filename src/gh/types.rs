@@ -72,6 +72,42 @@ impl PrView {
     }
 }
 
+/// An open PR found for a branch, as returned by
+/// `gh pr list --head <branch> --json number,url,state,isDraft`.
+///
+/// This is `wt`'s local mirror of `sendit::ExistingPr`; it is converted to the
+/// `sendit` type when assembling a `PrContext` for the compose/submit flow.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OpenPr {
+    /// PR number.
+    pub number: u64,
+    /// PR web URL.
+    #[serde(default)]
+    pub url: String,
+    /// PR state (`OPEN`/`CLOSED`/`MERGED`).
+    pub state: String,
+    /// Whether the PR is a draft.
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+}
+
+/// Extract the default branch name from `gh repo view --json defaultBranchRef`
+/// output, or `None` if it is absent or unparseable (kept non-fatal so trunk
+/// detection can fall back to local git state).
+pub(crate) fn parse_default_branch(json: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Ref {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct View {
+        #[serde(rename = "defaultBranchRef")]
+        default_branch_ref: Option<Ref>,
+    }
+    let view: View = serde_json::from_str(json).ok()?;
+    view.default_branch_ref.map(|r| r.name)
+}
+
 /// Maps a `gh` state string + draft flag to a [`PrState`].
 pub fn pr_state(state: &str, is_draft: bool) -> PrState {
     if is_draft && state.eq_ignore_ascii_case("open") {
@@ -123,5 +159,27 @@ mod tests {
         assert_eq!(pr_state("CLOSED", false), PrState::Closed);
         assert_eq!(pr_state("MERGED", false), PrState::Merged);
         assert_eq!(pr_state("CLOSED", true), PrState::Closed); // draft only matters for open
+    }
+
+    #[test]
+    fn parses_open_pr_list() {
+        let json = r#"[{"number": 77, "url": "https://github.com/o/r/pull/77",
+            "state": "OPEN", "isDraft": true}]"#;
+        let prs: Vec<OpenPr> = serde_json::from_str(json).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].number, 77);
+        assert_eq!(prs[0].url, "https://github.com/o/r/pull/77");
+        assert!(prs[0].is_draft);
+    }
+
+    #[test]
+    fn parses_default_branch() {
+        assert_eq!(
+            parse_default_branch(r#"{"defaultBranchRef": {"name": "main"}}"#),
+            Some("main".to_string())
+        );
+        // Null ref (e.g. empty repo) and garbage both yield None.
+        assert_eq!(parse_default_branch(r#"{"defaultBranchRef": null}"#), None);
+        assert_eq!(parse_default_branch("not json"), None);
     }
 }

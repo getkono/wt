@@ -182,6 +182,7 @@ impl Theme {
             Mode::Filter => YELLOW,
             Mode::Create(_) => GREEN,
             Mode::PrPicker(_) => MAGENTA,
+            Mode::PrCompose(_) => GREEN,
             Mode::ConfirmRemove(_) => RED,
             Mode::Help => CYAN,
         };

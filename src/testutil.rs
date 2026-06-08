@@ -14,18 +14,25 @@ use tempfile::TempDir;
 
 use std::collections::VecDeque;
 
+use crate::agent::{AgentClient, AgentKind, AgentRun, AgentVersion, DetectedAgent};
 use crate::cx::{Cx, Env, Input, Stream};
 use crate::error::Error;
-use crate::gh::{GhClient, PrSummary, PrView, RealGh};
+use crate::gh::{GhClient, OpenPr, PrSummary, PrView, RealGh};
 use crate::git::cli::{GitCli, RealGit};
 
 /// A fake [`GhClient`] returning canned PR data or simulating an unavailable
-/// `gh`.
+/// `gh`. Records `create_pr`/`edit_pr` args so submit tests can assert them.
 #[derive(Default)]
 pub(crate) struct FakeGh {
     list: Vec<PrSummary>,
     view: Option<PrView>,
     available: bool,
+    default_branch: Option<String>,
+    existing_pr: Option<OpenPr>,
+    create_stdout: String,
+    edit_stdout: String,
+    create_args: Arc<Mutex<Vec<Vec<String>>>>,
+    edit_args: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 #[allow(dead_code)]
@@ -48,9 +55,41 @@ impl FakeGh {
         }
     }
 
+    /// A fake whose `create_pr`/`edit_pr` succeed and return `stdout`.
+    pub(crate) fn sender(stdout: &str) -> Self {
+        FakeGh {
+            available: true,
+            create_stdout: stdout.to_string(),
+            edit_stdout: stdout.to_string(),
+            ..Default::default()
+        }
+    }
+
     /// A fake simulating a missing/unauthenticated `gh`.
     pub(crate) fn unavailable() -> Self {
         FakeGh::default()
+    }
+
+    /// Sets the default branch returned by `default_branch`.
+    pub(crate) fn with_default_branch(mut self, name: &str) -> Self {
+        self.default_branch = Some(name.to_string());
+        self
+    }
+
+    /// Sets the existing open PR returned by `find_pr_for_branch`.
+    pub(crate) fn with_existing_pr(mut self, pr: OpenPr) -> Self {
+        self.existing_pr = Some(pr);
+        self
+    }
+
+    /// The recorded `create_pr` arg lists (one per call).
+    pub(crate) fn created_args(&self) -> Vec<Vec<String>> {
+        self.create_args.lock().expect("lock poisoned").clone()
+    }
+
+    /// The recorded `edit_pr` arg lists (one per call).
+    pub(crate) fn edited_args(&self) -> Vec<Vec<String>> {
+        self.edit_args.lock().expect("lock poisoned").clone()
     }
 }
 
@@ -70,6 +109,110 @@ impl GhClient for FakeGh {
         self.view
             .clone()
             .ok_or_else(|| Error::operation("no PR configured"))
+    }
+
+    fn default_branch(&self, _dir: &std::path::Path) -> crate::error::Result<Option<String>> {
+        // Mirror RealGh: non-fatal, so an unavailable `gh` yields None here.
+        Ok(self.default_branch.clone())
+    }
+
+    fn find_pr_for_branch(
+        &self,
+        _dir: &std::path::Path,
+        _branch: &str,
+    ) -> crate::error::Result<Option<OpenPr>> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        Ok(self.existing_pr.clone())
+    }
+
+    fn create_pr(&self, _dir: &std::path::Path, args: &[String]) -> crate::error::Result<String> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.create_args
+            .lock()
+            .expect("lock poisoned")
+            .push(args.to_vec());
+        Ok(self.create_stdout.clone())
+    }
+
+    fn edit_pr(&self, _dir: &std::path::Path, args: &[String]) -> crate::error::Result<String> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.edit_args
+            .lock()
+            .expect("lock poisoned")
+            .push(args.to_vec());
+        Ok(self.edit_stdout.clone())
+    }
+}
+
+/// What a [`FakeAgent`] does when driven.
+pub(crate) enum AgentBehavior {
+    /// Agent present; `run` returns a successful [`AgentRun`] with this result text.
+    Draft(String),
+    /// Agent present; `run` returns an [`AgentRun`] flagged `is_error` with this text.
+    Erroring(String),
+    /// Agent absent: `detect` returns `Ok(None)` and `run` returns `AgentUnavailable`.
+    Unavailable,
+}
+
+/// A fake [`AgentClient`] for tests: returns a canned draft, simulates an
+/// absent agent, or an erroring run.
+pub(crate) struct FakeAgent(AgentBehavior);
+
+#[allow(dead_code)]
+impl FakeAgent {
+    /// A present agent whose `run` returns `result` (a successful draft).
+    pub(crate) fn drafting(result: &str) -> Self {
+        FakeAgent(AgentBehavior::Draft(result.to_string()))
+    }
+
+    /// A present agent whose `run` returns an error-flagged result.
+    pub(crate) fn erroring(result: &str) -> Self {
+        FakeAgent(AgentBehavior::Erroring(result.to_string()))
+    }
+
+    /// An absent agent (`detect` → `None`, `run` → `AgentUnavailable`).
+    pub(crate) fn unavailable() -> Self {
+        FakeAgent(AgentBehavior::Unavailable)
+    }
+}
+
+impl AgentClient for FakeAgent {
+    fn detect(&self, kind: AgentKind) -> crate::error::Result<Option<DetectedAgent>> {
+        match self.0 {
+            AgentBehavior::Unavailable => Ok(None),
+            _ => Ok(Some(DetectedAgent {
+                kind,
+                binary: kind.as_str().to_string(),
+                version: AgentVersion {
+                    version: None,
+                    raw: String::new(),
+                },
+            })),
+        }
+    }
+
+    fn run(&self, kind: AgentKind, _prompt: &str, _dir: &Path) -> crate::error::Result<AgentRun> {
+        match &self.0 {
+            AgentBehavior::Draft(result) => Ok(AgentRun {
+                kind,
+                is_error: false,
+                result: result.clone(),
+                raw: serde_json::Value::Null,
+            }),
+            AgentBehavior::Erroring(result) => Ok(AgentRun {
+                kind,
+                is_error: true,
+                result: result.clone(),
+                raw: serde_json::Value::Null,
+            }),
+            AgentBehavior::Unavailable => Err(Error::AgentUnavailable("claude unavailable".into())),
+        }
     }
 }
 
@@ -162,6 +305,7 @@ pub(crate) fn test_cx_with_git(
         PathBuf::from(cwd),
         git,
         Arc::new(RealGh),
+        Arc::new(FakeAgent::unavailable()),
         Box::new(CannedInput::default()),
     );
     TestCx { cx, out, err }

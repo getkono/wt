@@ -16,7 +16,9 @@ use ratatui::widgets::{
 use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
-use crate::tui::app::{App, CreateState, CreateStep, Mode, Pane, PrPickerState};
+use crate::tui::app::{
+    App, ComposeField, CreateState, CreateStep, Mode, Pane, PrComposeState, PrPickerState,
+};
 use crate::tui::glyphs::Glyphs;
 use crate::tui::theme::Theme;
 
@@ -42,6 +44,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Help => render_help(app, frame, area),
         Mode::Create(state) => render_create(app, state, frame, area),
         Mode::PrPicker(state) => render_pr_picker(app, state, frame, area),
+        Mode::PrCompose(state) => render_pr_compose(app, state, frame, area),
         Mode::ConfirmRemove(index) => render_confirm(app, *index, frame, area),
         _ => {}
     }
@@ -464,6 +467,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::Filter => "FILTER",
         Mode::Create(_) => "CREATE",
         Mode::PrPicker(_) => "PR",
+        Mode::PrCompose(_) => "COMPOSE",
         Mode::ConfirmRemove(_) => "REMOVE",
         Mode::Help => "HELP",
     }
@@ -485,6 +489,12 @@ fn mode_hints(mode: &Mode) -> &'static [(&'static str, &'static str)] {
         Mode::Filter => &[("type", "to filter"), ("Enter", "apply"), ("Esc", "clear")],
         Mode::Create(_) => &[("Enter", "next/submit"), ("Esc", "cancel")],
         Mode::PrPicker(_) => &[("↑/↓", "select"), ("Enter", "checkout"), ("Esc", "close")],
+        Mode::PrCompose(_) => &[
+            ("Ctrl-S", "submit"),
+            ("Ctrl-D", "draft"),
+            ("Tab", "field"),
+            ("Esc", "cancel"),
+        ],
         Mode::ConfirmRemove(_) => &[("y", "remove"), ("any other key", "cancels")],
         Mode::Help => &[("any key", "closes help")],
     }
@@ -587,6 +597,83 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("new worktree", theme.title(true)))),
+        rect,
+    );
+}
+
+/// Renders the PR compose form (`wt pr open`): a title + multi-line body with a
+/// header showing branch → trunk, the create/update action, and the draft state.
+fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::new(app.color);
+    let rect = centered(area, 76, 20);
+    frame.render_widget(Clear, rect);
+
+    let title_active = state.field == ComposeField::Title;
+    let body_active = state.field == ComposeField::Body;
+    let draft_mark = if state.draft { "[x]" } else { "[ ]" };
+
+    let mut lines = vec![
+        // Header: branch → trunk   [action]   draft [x]/[ ]
+        Line::from(vec![
+            Span::styled(format!("{} ", state.branch), theme.accent()),
+            Span::raw("→ "),
+            Span::styled(state.trunk.clone(), theme.label()),
+            Span::raw("   "),
+            Span::styled(format!("[{}]", state.action_label), theme.label()),
+            Span::raw("   "),
+            Span::styled(format!("draft {draft_mark}"), theme.label()),
+        ]),
+        Line::raw(""),
+        // Title field.
+        Line::from(vec![
+            Span::styled(
+                if title_active {
+                    "> title: "
+                } else {
+                    "  title: "
+                },
+                if title_active {
+                    theme.accent()
+                } else {
+                    theme.label()
+                },
+            ),
+            Span::raw(state.title.clone()),
+        ]),
+        Line::raw(""),
+        // Body field label.
+        Line::from(Span::styled(
+            if body_active { "> body:" } else { "  body:" },
+            if body_active {
+                theme.accent()
+            } else {
+                theme.label()
+            },
+        )),
+    ];
+    // Body content (multi-line); show at least one (blank) line.
+    if state.body.is_empty() {
+        lines.push(Line::raw(""));
+    } else {
+        for line in state.body.split('\n') {
+            lines.push(Line::raw(format!("  {line}")));
+        }
+    }
+    if let Some(err) = &state.error {
+        lines.push(Line::from(Span::styled(format!("! {err}"), theme.error())));
+    }
+    lines.push(Line::raw(""));
+    let hint = if state.submitting {
+        "submitting…"
+    } else {
+        "Ctrl-S: submit   Ctrl-D: draft   Tab: field   Enter: newline (body)   Esc: cancel"
+    };
+    lines.push(Line::from(Span::styled(hint, theme.hint_label())));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("open pull request", theme.title(true))))
+            .wrap(Wrap { trim: false }),
         rect,
     );
 }
@@ -791,7 +878,9 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::testutil::{app, wt};
-    use crate::tui::app::{CreateState, PrItem, PrPickerState, StatusKind};
+    use crate::tui::app::{
+        ComposeField, CreateState, PrComposeState, PrItem, PrPickerState, StatusKind,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -895,6 +984,47 @@ mod tests {
         assert!(text.contains("new worktree"));
         assert!(text.contains("feat"));
         assert!(text.contains("required"));
+    }
+
+    #[test]
+    fn pr_compose_overlay_shows_header_fields_and_hints() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            field: ComposeField::Body,
+            title: "Add login".into(),
+            body: "Summary line".into(),
+            draft: true,
+            branch: "feat/login".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            error: Some("boom".into()),
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("open pull request"));
+        assert!(text.contains("feat/login"));
+        assert!(text.contains("Add login"));
+        assert!(text.contains("Summary line"));
+        assert!(text.contains("[create]"));
+        assert!(text.contains("draft [x]"));
+        assert!(text.contains("boom"));
+        assert!(text.contains("Ctrl-S"));
+    }
+
+    #[test]
+    fn pr_compose_submitting_shows_status() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            title: "T".into(),
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "update #5".into(),
+            submitting: true,
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("submitting"));
+        assert!(text.contains("[update #5]"));
     }
 
     #[test]
