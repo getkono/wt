@@ -381,8 +381,25 @@ impl TestRepo {
 
 /// Runs `git -C <dir> <args>` with isolated config and identity, asserting
 /// success, and returns stdout.
+///
+/// Inherited `GIT_*` location variables are scrubbed first. Git honours
+/// `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` over the `-C <dir>` argument, so if
+/// these are present in the environment — as they are when the suite runs from
+/// inside a git hook (e.g. the `pre-push` hook git invokes with `GIT_DIR` set) —
+/// every `TestRepo` mutation would operate on the developer's real repository
+/// instead of the throwaway temp repo, silently corrupting it. Removing them
+/// makes `-C <dir>` authoritative so the fixture stays sandboxed.
 fn run_git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_PREFIX")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .env("GIT_AUTHOR_NAME", "wt Test")
