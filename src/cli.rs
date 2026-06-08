@@ -20,7 +20,7 @@ use crate::output::color::ColorChoice;
 #[derive(Debug, Parser)]
 #[command(
     name = "wt",
-    version,
+    version = crate::version::long_version(),
     about = "Git worktree and GitHub PR manager",
     propagate_version = true,
     disable_help_subcommand = true
