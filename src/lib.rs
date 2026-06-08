@@ -28,6 +28,7 @@ pub mod template;
 pub mod time;
 pub mod tui;
 pub mod util;
+pub mod version;
 pub mod worktree_service;
 
 #[cfg(test)]
