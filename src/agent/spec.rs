@@ -6,6 +6,7 @@
 
 use serde::Serialize;
 
+use crate::agent::model::{AgentModel, Effort};
 use crate::agent::types::{AgentRun, AgentVersion, ClaudeResult};
 use crate::error::Result;
 
@@ -66,6 +67,9 @@ pub struct AgentSpec {
     pub prompt_positional: bool,
     /// Arguments that select JSON output (e.g. `["--output-format", "json"]`).
     pub json_args: &'static [&'static str],
+    /// The flag that selects a model (e.g. `"--model"`); empty if the agent has
+    /// no model selector, in which case the model is not passed.
+    pub model_flag: &'static str,
     /// How to parse stdout in JSON mode.
     pub result_format: ResultFormat,
 }
@@ -78,6 +82,7 @@ pub static AGENTS: &[AgentSpec] = &[AgentSpec {
     run_args: &["-p"],
     prompt_positional: true,
     json_args: &["--output-format", "json"],
+    model_flag: "--model",
     result_format: ResultFormat::SingleObject,
 }];
 
@@ -86,17 +91,33 @@ pub fn version_argv(spec: &AgentSpec) -> Vec<String> {
     spec.version_args.iter().map(|s| s.to_string()).collect()
 }
 
-/// Builds the full non-interactive, JSON-mode argv for `spec` and `prompt`:
-/// `run_args`, then the prompt (when positional), then `json_args`. The prompt
-/// is a single argv element — never shell-interpolated — so it needs no
-/// quoting and cannot inject extra arguments.
-pub fn prompt_argv(spec: &AgentSpec, prompt: &str) -> Vec<String> {
+/// Builds the full non-interactive, JSON-mode argv for `spec`, `prompt`, and
+/// `model`: `run_args`, then the prompt (when positional), then `json_args`,
+/// then the model selector (`model_flag` + the model id) when the agent has
+/// one. The prompt is a single argv element — never shell-interpolated — so it
+/// needs no quoting and cannot inject extra arguments.
+pub fn prompt_argv(spec: &AgentSpec, prompt: &str, model: AgentModel) -> Vec<String> {
     let mut argv: Vec<String> = spec.run_args.iter().map(|s| s.to_string()).collect();
     if spec.prompt_positional {
         argv.push(prompt.to_string());
     }
     argv.extend(spec.json_args.iter().map(|s| s.to_string()));
+    if !spec.model_flag.is_empty() {
+        argv.push(spec.model_flag.to_string());
+        argv.push(model.id().to_string());
+    }
     argv
+}
+
+/// Applies an [`Effort`] level to a prompt by prepending its directive (a
+/// blank line separates it from the body); the baseline (medium) returns the
+/// prompt unchanged. This is how `wt` conveys effort to agents without a native
+/// effort flag — it never fails and is a no-op for unsupported levels.
+pub fn apply_effort(effort: Effort, prompt: &str) -> String {
+    match effort.directive() {
+        Some(directive) => format!("{directive}\n\n{prompt}"),
+        None => prompt.to_string(),
+    }
 }
 
 /// Extracts a best-effort version from `--version` output: the first
@@ -185,8 +206,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_argv_orders_run_then_prompt_then_json() {
-        let argv = prompt_argv(AgentKind::Claude.spec(), "do a thing");
+    fn prompt_argv_orders_run_then_prompt_then_json_then_model() {
+        let argv = prompt_argv(AgentKind::Claude.spec(), "do a thing", AgentModel::Sonnet);
         assert_eq!(
             argv,
             vec![
@@ -194,11 +215,32 @@ mod tests {
                 "do a thing".to_string(),
                 "--output-format".to_string(),
                 "json".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
             ]
         );
         // A prompt with spaces and quotes stays a single argv element.
-        let tricky = prompt_argv(AgentKind::Claude.spec(), "a \"quoted\" $arg; rm -rf");
+        let tricky = prompt_argv(
+            AgentKind::Claude.spec(),
+            "a \"quoted\" $arg; rm -rf",
+            AgentModel::Opus,
+        );
         assert_eq!(tricky[1], "a \"quoted\" $arg; rm -rf");
+        // The selected model is passed verbatim via `--model`.
+        assert_eq!(tricky[tricky.len() - 2], "--model");
+        assert_eq!(tricky[tricky.len() - 1], "opus");
+    }
+
+    #[test]
+    fn apply_effort_prefixes_directive_except_baseline() {
+        // Medium is the baseline: prompt unchanged.
+        assert_eq!(apply_effort(Effort::Medium, "draft this"), "draft this");
+        // Low/High prepend their directive plus a blank line.
+        let high = apply_effort(Effort::High, "draft this");
+        assert!(high.ends_with("\n\ndraft this"));
+        assert!(high.starts_with(Effort::High.directive().unwrap()));
+        let low = apply_effort(Effort::Low, "draft this");
+        assert!(low.starts_with(Effort::Low.directive().unwrap()));
     }
 
     #[test]

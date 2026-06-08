@@ -23,6 +23,8 @@ const KEYS: &[&str] = &[
     "remove.delete_merged_branch",
     "remove.untracked_blocks",
     "pr.default_remote",
+    "agent.model",
+    "agent.effort",
     "list.show_untracked",
     "list.columns",
     "ui.nerd_fonts",
@@ -174,7 +176,7 @@ fn set_dotted(doc: &mut DocumentMut, key: &str, item: Item) -> Result<()> {
 fn key_type(key: &str) -> Option<KeyType> {
     Some(match key {
         "path_template" | "default_base" | "editor" | "hooks.post_create" | "hooks.pre_remove"
-        | "pr.default_remote" | "ui.color" => KeyType::Str,
+        | "pr.default_remote" | "agent.model" | "agent.effort" | "ui.color" => KeyType::Str,
         "remove.delete_merged_branch"
         | "remove.untracked_blocks"
         | "list.show_untracked"
@@ -198,6 +200,8 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "remove.delete_merged_branch" => Some(config.remove_delete_merged_branch.to_string()),
         "remove.untracked_blocks" => Some(config.remove_untracked_blocks.to_string()),
         "pr.default_remote" => Some(config.pr_default_remote.clone()),
+        "agent.model" => Some(config.agent_model.id().to_string()),
+        "agent.effort" => Some(config.agent_effort.id().to_string()),
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),
         "list.columns" => Some(
             config
@@ -325,6 +329,58 @@ mod tests {
         // The file is valid TOML with the nested table.
         let content = std::fs::read_to_string(repo.root().join(".wt.toml")).unwrap();
         assert!(content.contains("default_remote = \"upstream\""));
+    }
+
+    #[test]
+    fn agent_model_and_effort_roundtrip_and_validate() {
+        let repo = TestRepo::init();
+        // Default value is the resolved Sonnet/medium.
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "agent.model".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "sonnet");
+        // Set + get a valid model.
+        run(
+            &repo,
+            &[],
+            ConfigAction::Set {
+                key: "agent.model".into(),
+                value: "opus".into(),
+            },
+            false,
+            false,
+        );
+        let (_, out, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "agent.model".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(out.trim(), "opus");
+        // An invalid value is rejected at write time (validation re-parses).
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let err = super::run(
+            &mut t.cx,
+            &ConfigArgs {
+                action: ConfigAction::Set {
+                    key: "agent.effort".into(),
+                    value: "max".into(),
+                },
+                global: false,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Config { .. }));
     }
 
     #[test]

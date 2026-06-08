@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use crate::agent::{AgentModel, Effort};
 use crate::keys::Keymap;
 use crate::model::{Column, SortKey, SortSpec, Worktree};
 use crate::util::fuzzy;
@@ -120,6 +121,10 @@ pub struct PrComposeState {
     pub trunk: String,
     /// Precomputed action label, e.g. `create` or `update #12`.
     pub action_label: String,
+    /// The model used for AI auto-fill (`Ctrl-A`), cycled with `Ctrl-M`.
+    pub model: AgentModel,
+    /// The effort used for AI auto-fill, cycled with `Ctrl-E`.
+    pub effort: Effort,
     /// Whether a submit/draft operation is in flight (shown as a hint).
     pub submitting: bool,
     /// An inline error from a failed draft or submission.

@@ -1,6 +1,7 @@
 //! The resolved [`Config`] and the per-layer [`ConfigLayer`], plus the merge
 //! semantics (spec §11).
 
+use crate::agent::{AgentModel, Effort};
 use crate::cx::Env;
 use crate::keys::{KeyAction, KeyChord, Keymap};
 use crate::model::Column;
@@ -29,6 +30,12 @@ pub struct Config {
     pub remove_untracked_blocks: bool,
     /// Remote used for PR fetches.
     pub pr_default_remote: String,
+    /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
+    /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
+    pub agent_model: AgentModel,
+    /// Default effort for the AI PR auto-fill; overridable by `--effort` or the
+    /// TUI's `Ctrl-E` key.
+    pub agent_effort: Effort,
     /// Show `?` in the dirty column for untracked files.
     pub list_show_untracked: bool,
     /// Ordered list of columns to display in `wt list`.
@@ -55,6 +62,8 @@ impl Default for Config {
             remove_delete_merged_branch: true,
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
+            agent_model: AgentModel::default(),
+            agent_effort: Effort::default(),
             list_show_untracked: true,
             list_columns: Column::ALL.to_vec(),
             ui_nerd_fonts: false,
@@ -97,6 +106,12 @@ impl Config {
         }
         if let Some(v) = layer.pr_default_remote {
             self.pr_default_remote = v;
+        }
+        if let Some(v) = layer.agent_model {
+            self.agent_model = v;
+        }
+        if let Some(v) = layer.agent_effort {
+            self.agent_effort = v;
         }
         if let Some(v) = layer.list_show_untracked {
             self.list_show_untracked = v;
@@ -160,6 +175,10 @@ pub struct ConfigLayer {
     pub remove_untracked_blocks: Option<bool>,
     /// `pr.default_remote`.
     pub pr_default_remote: Option<String>,
+    /// `agent.model`.
+    pub agent_model: Option<AgentModel>,
+    /// `agent.effort`.
+    pub agent_effort: Option<Effort>,
     /// `list.show_untracked`.
     pub list_show_untracked: Option<bool>,
     /// `list.columns`.
@@ -188,6 +207,8 @@ mod tests {
         assert!(c.remove_delete_merged_branch);
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
+        assert_eq!(c.agent_model, AgentModel::Sonnet);
+        assert_eq!(c.agent_effort, Effort::Medium);
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());
         assert!(!c.ui_nerd_fonts);
@@ -238,6 +259,8 @@ mod tests {
             hooks_pre_remove: Some("teardown".into()),
             remove_delete_merged_branch: Some(false),
             remove_untracked_blocks: Some(true),
+            agent_model: Some(AgentModel::Haiku),
+            agent_effort: Some(Effort::Low),
             list_show_untracked: Some(false),
             ui_nerd_fonts: Some(true),
             ui_color: Some(ColorChoice::Never),
@@ -250,6 +273,8 @@ mod tests {
         assert_eq!(c.hooks_pre_remove.as_deref(), Some("teardown"));
         assert!(!c.remove_delete_merged_branch);
         assert!(c.remove_untracked_blocks);
+        assert_eq!(c.agent_model, AgentModel::Haiku);
+        assert_eq!(c.agent_effort, Effort::Low);
         assert!(!c.list_show_untracked);
         assert!(c.ui_nerd_fonts);
         assert_eq!(c.ui_color, ColorChoice::Never);

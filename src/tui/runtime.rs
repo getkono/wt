@@ -375,6 +375,10 @@ pub struct ComposeSeed {
     pub body: String,
     /// Whether the draft toggle starts on.
     pub draft: bool,
+    /// The model used for AI auto-fill (resolved from `--model`/config).
+    pub model: crate::agent::AgentModel,
+    /// The effort used for AI auto-fill (resolved from `--effort`/config).
+    pub effort: crate::agent::Effort,
 }
 
 /// Runs the TUI directly in PR-compose mode (`wt pr open`). Seeds the form from
@@ -404,6 +408,8 @@ pub fn run_pr_compose(
         branch: ctx.branch.clone(),
         trunk: ctx.trunk.clone(),
         action_label,
+        model: seed.model,
+        effort: seed.effort,
         ..Default::default()
     });
 
@@ -509,14 +515,35 @@ fn compose_dispatch(
     }
 }
 
-/// Drafts the PR title/body with the code agent and seeds the compose form.
+/// Drafts the PR title/body with the code agent and seeds the compose form,
+/// using the model/effort currently selected in the form (`Ctrl-M`/`Ctrl-E`).
 /// Errors (including a missing agent) show inline in the form, which stays open.
-pub(crate) fn do_draft_pr_ai(cx: &Cx, session: &Session, app: &mut App, ctx: &sendit::PrContext) {
+pub(crate) fn do_draft_pr_ai(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    ctx: &sendit::PrContext,
+) {
     let dir = session
         .repo
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
-    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), ctx, &dir);
+    // Read the live model/effort from the form before borrowing it mutably.
+    let opts = match &app.mode {
+        Mode::PrCompose(state) => crate::agent::AgentOptions {
+            model: state.model,
+            effort: state.effort,
+        },
+        _ => crate::agent::AgentOptions::default(),
+    };
+    // The TUI is suspended during the (blocking) agent call, so a progress line
+    // on stderr is visible while the user waits.
+    let _ = cx.err.line(&format!(
+        "Drafting PR with {} (effort {})…",
+        opts.model.label(),
+        opts.effort.id()
+    ));
+    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), ctx, &dir, &opts);
     if let Mode::PrCompose(state) = &mut app.mode {
         match result {
             Ok((title, body)) => {
@@ -840,7 +867,7 @@ mod tests {
         ));
         app.mode = Mode::PrCompose(crate::tui::app::PrComposeState::default());
         do_draft_pr_ai(
-            &t.cx,
+            &mut t.cx,
             &session,
             &mut app,
             &sendit_ctx("feat", "main", false),
@@ -858,10 +885,10 @@ mod tests {
     fn do_draft_pr_ai_shows_error_when_unavailable() {
         let repo = TestRepo::init();
         // The default test agent is `FakeAgent::unavailable()`.
-        let (t, session, mut app) = setup(&repo);
+        let (mut t, session, mut app) = setup(&repo);
         app.mode = Mode::PrCompose(crate::tui::app::PrComposeState::default());
         do_draft_pr_ai(
-            &t.cx,
+            &mut t.cx,
             &session,
             &mut app,
             &sendit_ctx("feat", "main", false),
@@ -871,6 +898,33 @@ mod tests {
         } else {
             panic!("expected compose mode");
         }
+    }
+
+    #[test]
+    fn do_draft_pr_ai_uses_form_model_and_effort() {
+        let repo = TestRepo::init();
+        let (mut t, session, mut app) = setup(&repo);
+        let agent = StdArc::new(crate::testutil::FakeAgent::drafting("T\n\nB"));
+        t.cx.agent = agent.clone();
+        app.mode = Mode::PrCompose(crate::tui::app::PrComposeState {
+            model: crate::agent::AgentModel::Opus,
+            effort: crate::agent::Effort::High,
+            ..Default::default()
+        });
+        do_draft_pr_ai(
+            &mut t.cx,
+            &session,
+            &mut app,
+            &sendit_ctx("feat", "main", false),
+        );
+        // The model/effort selected in the form were passed to the agent.
+        assert_eq!(
+            agent.last_opts(),
+            Some(crate::agent::AgentOptions {
+                model: crate::agent::AgentModel::Opus,
+                effort: crate::agent::Effort::High,
+            })
+        );
     }
 
     #[test]

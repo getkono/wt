@@ -213,6 +213,14 @@ pub struct PrOpenArgs {
     /// Draft the title/body with a code agent (Claude), then review before sending.
     #[arg(long)]
     pub ai: bool,
+    /// Model for `--ai` drafting: `opus`, `sonnet`, or `haiku` (overrides
+    /// `agent.model`; default `sonnet`).
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+    /// Effort for `--ai` drafting: `low`, `medium`, or `high` (overrides
+    /// `agent.effort`; default `medium`).
+    #[arg(long, value_name = "LEVEL")]
+    pub effort: Option<String>,
     /// Skip the compose form and submit non-interactively.
     #[arg(short = 'y', long)]
     pub yes: bool,
@@ -531,14 +539,20 @@ mod tests {
             }
             _ => panic!("expected pr"),
         }
-        // `pr open --title X --draft` -> the open sub-form with its flags.
-        let cli = parse(&["pr", "open", "--title", "X", "--draft", "--ai"]).unwrap();
+        // `pr open --title X --draft --ai --model opus --effort high` -> the open
+        // sub-form with its flags, including the model/effort overrides.
+        let cli = parse(&[
+            "pr", "open", "--title", "X", "--draft", "--ai", "--model", "opus", "--effort", "high",
+        ])
+        .unwrap();
         match cli.command {
             Some(Command::Pr(a)) => match a.sub {
                 Some(PrSub::Open(o)) => {
                     assert_eq!(o.title.as_deref(), Some("X"));
                     assert!(o.draft);
                     assert!(o.ai);
+                    assert_eq!(o.model.as_deref(), Some("opus"));
+                    assert_eq!(o.effort.as_deref(), Some("high"));
                     assert!(!o.update && !o.new);
                 }
                 _ => panic!("expected pr open"),

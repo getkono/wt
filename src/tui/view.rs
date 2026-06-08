@@ -623,6 +623,14 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
             Span::raw("   "),
             Span::styled(format!("draft {draft_mark}"), theme.label()),
         ]),
+        // Agent settings used for `Ctrl-A` auto-fill (model + effort).
+        Line::from(vec![
+            Span::styled("model: ", theme.label()),
+            Span::styled(state.model.label().to_string(), theme.accent()),
+            Span::raw("   "),
+            Span::styled("effort: ", theme.label()),
+            Span::styled(state.effort.label().to_string(), theme.accent()),
+        ]),
         Line::raw(""),
         // Title field.
         Line::from(vec![
@@ -663,12 +671,19 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
         lines.push(Line::from(Span::styled(format!("! {err}"), theme.error())));
     }
     lines.push(Line::raw(""));
-    let hint = if state.submitting {
-        "submitting…"
+    if state.submitting {
+        lines.push(Line::from(Span::styled("working…", theme.hint_label())));
     } else {
-        "Ctrl-S: submit   Ctrl-D: draft   Tab: field   Enter: newline (body)   Esc: cancel"
-    };
-    lines.push(Line::from(Span::styled(hint, theme.hint_label())));
+        // Two hint rows: AI auto-fill controls, then the edit/submit controls.
+        lines.push(Line::from(Span::styled(
+            "Ctrl-A: AI fill   Ctrl-M: model   Ctrl-E: effort",
+            theme.hint_label(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "Ctrl-S: submit   Ctrl-D: draft   Tab: field   Enter: newline   Esc: cancel",
+            theme.hint_label(),
+        )));
+    }
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -1009,6 +1024,28 @@ mod tests {
         assert!(text.contains("draft [x]"));
         assert!(text.contains("boom"));
         assert!(text.contains("Ctrl-S"));
+        // The AI-fill controls and the selected model/effort are shown.
+        assert!(text.contains("Ctrl-A"));
+        assert!(text.contains("model:"));
+        assert!(text.contains("Sonnet 4.6")); // the default model label
+        assert!(text.contains("effort:"));
+    }
+
+    #[test]
+    fn pr_compose_shows_selected_model_and_effort() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            title: "T".into(),
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            model: crate::agent::AgentModel::Opus,
+            effort: crate::agent::Effort::High,
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("Opus 4.8"));
+        assert!(text.contains("high"));
     }
 
     #[test]
@@ -1023,7 +1060,7 @@ mod tests {
             ..Default::default()
         });
         let text = render_to_text(&a, 100, 30);
-        assert!(text.contains("submitting"));
+        assert!(text.contains("working"));
         assert!(text.contains("[update #5]"));
     }
 

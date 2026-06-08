@@ -13,9 +13,10 @@ use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::Path;
 
-use crate::agent::{AgentClient, AgentKind};
+use crate::agent::{AgentClient, AgentKind, AgentModel, AgentOptions, Effort};
 use crate::cli::PrOpenArgs;
 use crate::commands::open_session;
+use crate::config::Config;
 use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
@@ -48,6 +49,10 @@ pub fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
         args.base.as_deref(),
     )?;
     let flag_body = read_flag_body(args)?;
+    // The model/effort for AI fill: CLI flags override the config defaults. The
+    // compose form always carries these (Ctrl-A can draft at any time), so they
+    // are resolved even when `--ai` was not passed.
+    let opts = resolve_agent_options(args, &session.config)?;
 
     // Gate on the stderr TTY (where the TUI draws), matching the rest of `wt`.
     let interactive = cx.err.is_tty() && !args.yes;
@@ -56,6 +61,8 @@ pub fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
             title: args.title.clone().unwrap_or_default(),
             body: flag_body.unwrap_or_default(),
             draft: args.draft,
+            model: opts.model,
+            effort: opts.effort,
         };
         let action = action_for_form(ctx.existing_pr.as_ref(), args);
         match crate::tui::run_pr_compose(cx, &session, ctx.clone(), action, seed, args.ai)? {
@@ -65,7 +72,7 @@ pub fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
         }
     } else {
         let (title, body) = if args.ai {
-            draft_with_ai(cx.agent.as_ref(), &ctx, &dir)?
+            draft_with_ai(cx.agent.as_ref(), &ctx, &dir, &opts)?
         } else {
             (
                 args.title.clone().unwrap_or_default(),
@@ -315,16 +322,40 @@ pub(crate) fn build_ai_prompt(ctx: &sendit::PrContext) -> String {
     s
 }
 
-/// Runs the code agent (`claude`) to draft a PR `(title, body)` from `ctx`,
-/// parsing its output with [`sendit::parse_editor_output`]. Surfaces an
-/// erroring or empty draft as a typed error; a missing agent propagates
-/// [`Error::AgentUnavailable`].
+/// Resolves the agent model + effort for an AI draft: an explicit `--model` /
+/// `--effort` flag overrides the resolved config default. Unknown flag values
+/// are a usage error (exit 2).
+pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Result<AgentOptions> {
+    let model = match &args.model {
+        Some(m) => AgentModel::parse(m).ok_or_else(|| {
+            Error::usage(format!(
+                "unknown --model {m:?}; expected one of: opus, sonnet, haiku"
+            ))
+        })?,
+        None => config.agent_model,
+    };
+    let effort = match &args.effort {
+        Some(e) => Effort::parse(e).ok_or_else(|| {
+            Error::usage(format!(
+                "unknown --effort {e:?}; expected one of: low, medium, high"
+            ))
+        })?,
+        None => config.agent_effort,
+    };
+    Ok(AgentOptions { model, effort })
+}
+
+/// Runs the code agent (`claude`) to draft a PR `(title, body)` from `ctx` with
+/// the selected model and effort (`opts`), parsing its output with
+/// [`sendit::parse_editor_output`]. Surfaces an erroring or empty draft as a
+/// typed error; a missing agent propagates [`Error::AgentUnavailable`].
 pub(crate) fn draft_with_ai(
     agent: &dyn AgentClient,
     ctx: &sendit::PrContext,
     dir: &Path,
+    opts: &AgentOptions,
 ) -> Result<(String, String)> {
-    let run = agent.run(AgentKind::Claude, &build_ai_prompt(ctx), dir)?;
+    let run = agent.run(AgentKind::Claude, &build_ai_prompt(ctx), dir, opts)?;
     if run.is_error {
         return Err(Error::operation(format!(
             "code agent reported an error: {}",
@@ -676,17 +707,40 @@ mod tests {
     fn draft_with_ai_parses_title_and_body() {
         let agent = FakeAgent::drafting("Add login\n\n## Summary\n- did it\n");
         let dir = tempfile::tempdir().unwrap();
-        let (title, body) =
-            draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path()).unwrap();
+        let (title, body) = draft_with_ai(
+            &agent,
+            &ctx_for("feat", "main", false),
+            dir.path(),
+            &AgentOptions::default(),
+        )
+        .unwrap();
         assert_eq!(title, "Add login");
         assert_eq!(body, "## Summary\n- did it");
+    }
+
+    #[test]
+    fn draft_with_ai_threads_model_and_effort() {
+        let agent = FakeAgent::drafting("T\n\nB");
+        let dir = tempfile::tempdir().unwrap();
+        let opts = AgentOptions {
+            model: AgentModel::Opus,
+            effort: Effort::High,
+        };
+        draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path(), &opts).unwrap();
+        assert_eq!(agent.last_opts(), Some(opts));
     }
 
     #[test]
     fn draft_with_ai_maps_error_result() {
         let agent = FakeAgent::erroring("rate limited");
         let dir = tempfile::tempdir().unwrap();
-        let err = draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path()).unwrap_err();
+        let err = draft_with_ai(
+            &agent,
+            &ctx_for("feat", "main", false),
+            dir.path(),
+            &AgentOptions::default(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("code agent reported an error"));
     }
 
@@ -694,8 +748,50 @@ mod tests {
     fn draft_with_ai_unavailable_propagates() {
         let agent = FakeAgent::unavailable();
         let dir = tempfile::tempdir().unwrap();
-        let err = draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path()).unwrap_err();
+        let err = draft_with_ai(
+            &agent,
+            &ctx_for("feat", "main", false),
+            dir.path(),
+            &AgentOptions::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::AgentUnavailable(_)));
+    }
+
+    #[test]
+    fn resolve_agent_options_flags_override_config() {
+        let config = Config {
+            agent_model: AgentModel::Haiku,
+            agent_effort: Effort::Low,
+            ..Config::default()
+        };
+        // No flags: config defaults win.
+        let opts = resolve_agent_options(&open_args(None), &config).unwrap();
+        assert_eq!(opts.model, AgentModel::Haiku);
+        assert_eq!(opts.effort, Effort::Low);
+        // Flags override.
+        let mut args = open_args(None);
+        args.model = Some("opus".into());
+        args.effort = Some("high".into());
+        let opts = resolve_agent_options(&args, &config).unwrap();
+        assert_eq!(opts.model, AgentModel::Opus);
+        assert_eq!(opts.effort, Effort::High);
+    }
+
+    #[test]
+    fn resolve_agent_options_rejects_unknown_values() {
+        let mut args = open_args(None);
+        args.model = Some("gpt".into());
+        assert!(matches!(
+            resolve_agent_options(&args, &Config::default()),
+            Err(Error::Usage(_))
+        ));
+        let mut args = open_args(None);
+        args.effort = Some("max".into());
+        assert!(matches!(
+            resolve_agent_options(&args, &Config::default()),
+            Err(Error::Usage(_))
+        ));
     }
 
     fn open_args(title: Option<&str>) -> PrOpenArgs {
@@ -705,6 +801,8 @@ mod tests {
             body_file: None,
             draft: false,
             ai: false,
+            model: None,
+            effort: None,
             yes: false,
             base: None,
             update: false,
