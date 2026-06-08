@@ -2,7 +2,10 @@
 //!
 //! The snippet defines a `wt` shell function that intercepts the navigation
 //! subcommands (`switch`/`sw`, `new`, `pr`, `ui`/`tui`, and no subcommand),
-//! captures their path-only stdout, and `cd`s into it on success. It also wires
+//! captures their path-only stdout, and `cd`s into it on success. Invocations
+//! that print to stdout but should not be `cd`'d into — `--json`,
+//! `--print-path`, and the clap help/version flags (`-h`/`--help`/`-V`/
+//! `--version`) — bypass the capture and run straight through. It also wires
 //! up completion, including the dynamic `wt __complete` helper.
 
 use clap_complete::Shell;
@@ -32,7 +35,9 @@ wt() {
     switch|sw|new|pr|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
-        if [ "$__wt_arg" = "--json" ] || [ "$__wt_arg" = "--print-path" ]; then command wt "$@"; return $?; fi
+        case "$__wt_arg" in
+          --json|--print-path|-h|--help|-V|--version) command wt "$@"; return $? ;;
+        esac
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
@@ -79,7 +84,9 @@ wt() {
     switch|sw|new|pr|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
-        if [[ "$__wt_arg" == "--json" || "$__wt_arg" == "--print-path" ]]; then command wt "$@"; return $?; fi
+        case "$__wt_arg" in
+          --json|--print-path|-h|--help|-V|--version) command wt "$@"; return $? ;;
+        esac
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
@@ -113,7 +120,7 @@ const FISH: &str = r#"# wt shell integration (fish) — source this from your co
 function wt
     set -l cmd $argv[1]
     if test (count $argv) -eq 0; or contains -- "$cmd" switch sw new pr ui tui
-        if contains -- --json $argv; or contains -- --print-path $argv
+        if contains -- --json $argv; or contains -- --print-path $argv; or contains -- -h $argv; or contains -- --help $argv; or contains -- -V $argv; or contains -- --version $argv
             command wt $argv
             return $status
         end
@@ -146,7 +153,7 @@ function wt {
     $nav = @('switch','sw','new','pr','ui','tui')
     $exe = (Get-Command wt -CommandType Application | Select-Object -First 1).Source
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
-        if ($args -contains '--json' -or $args -contains '--print-path') { & $exe @args; return }
+        if ($args -contains '--json' -or $args -contains '--print-path' -or $args -contains '-h' -or $args -contains '--help' -or $args -contains '-V' -or $args -contains '--version') { & $exe @args; return }
         $out = & $exe @args
         if ($LASTEXITCODE -eq 0 -and $out) { Set-Location -- $out }
         elseif ($out) { Write-Output $out }
@@ -173,7 +180,7 @@ const ELVISH: &str = r#"# wt shell integration (elvish) — source this from you
 fn wt {|@a|
     var nav = [switch sw new pr ui tui]
     if (or (== (count $a) 0) (and (> (count $a) 0) (has-value $nav $a[0]))) {
-        if (or (has-value $a --json) (has-value $a --print-path)) {
+        if (or (has-value $a --json) (has-value $a --print-path) (has-value $a -h) (has-value $a --help) (has-value $a -V) (has-value $a --version)) {
             (external wt) $@a
             return
         }
@@ -246,6 +253,30 @@ mod tests {
             assert!(
                 snippet(shell).contains("--print-path"),
                 "{shell:?} wrapper ignores --print-path"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wrapper_passes_through_help_and_version() {
+        // Regression for #21: `wt pr -h` prints help to stdout and exits 0, so
+        // without a guard the wrapper would `cd` into the help text. Each
+        // wrapper must force a passthrough on the help/version flags.
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let s = snippet(shell);
+            assert!(
+                s.contains("--help"),
+                "{shell:?} wrapper does not guard --help"
+            );
+            assert!(
+                s.contains("--version"),
+                "{shell:?} wrapper does not guard --version"
             );
         }
     }
