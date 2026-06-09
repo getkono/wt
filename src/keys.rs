@@ -127,6 +127,40 @@ impl KeyAction {
     pub fn parse(name: &str) -> Option<KeyAction> {
         KeyAction::ALL.into_iter().find(|a| a.name() == name)
     }
+
+    /// A short human label for the status bar and help overlay (e.g. `switch`,
+    /// `new`, `checkout`). The match is exhaustive, so a new [`KeyAction`]
+    /// variant cannot be added without giving it a label — this is what keeps
+    /// the on-screen hints and help from drifting away from the key bindings
+    /// (issue #39).
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyAction::NavigateUp => "navigate up",
+            KeyAction::NavigateDown => "navigate down",
+            KeyAction::PageUp => "page up",
+            KeyAction::PageDown => "page down",
+            KeyAction::GoToTop => "go to top",
+            KeyAction::GoToBottom => "go to bottom",
+            KeyAction::FocusNextPane => "next pane",
+            KeyAction::FocusPrevPane => "prev pane",
+            KeyAction::Switch => "switch",
+            KeyAction::Filter => "filter",
+            KeyAction::ClearFilter => "clear / back",
+            KeyAction::New => "new",
+            KeyAction::Remove => "remove",
+            KeyAction::PrCheckout => "pr picker",
+            KeyAction::Checkout => "checkout",
+            KeyAction::OpenEditor => "open in editor",
+            KeyAction::Refresh => "refresh",
+            KeyAction::SortCycle => "sort cycle",
+            KeyAction::SortReverse => "sort reverse",
+            KeyAction::Help => "help",
+            KeyAction::Quit => "quit",
+            KeyAction::ToggleSidebar => "toggle sidebar",
+            KeyAction::ResizeSidebarGrow => "grow sidebar",
+            KeyAction::ResizeSidebarShrink => "shrink sidebar",
+        }
+    }
 }
 
 /// A normalized key + modifier combination.
@@ -220,6 +254,30 @@ impl KeyChord {
         s.push_str(&keycode_name(self.code));
         s
     }
+
+    /// Renders this chord for on-screen hints and the help overlay:
+    /// terminal-pretty (`↑`, `Enter`, `Shift+Tab`, `Ctrl-S`, plain letters).
+    /// Distinct from [`KeyChord::render`], which produces the lowercase
+    /// `ctrl+u` *config* format that round-trips through [`KeyChord::parse`].
+    pub fn display(&self) -> String {
+        let ctrl = self.mods.contains(KeyModifiers::CONTROL);
+        let mut s = String::new();
+        if ctrl {
+            s.push_str("Ctrl-");
+        }
+        if self.mods.contains(KeyModifiers::ALT) {
+            s.push_str("Alt-");
+        }
+        if self.mods.contains(KeyModifiers::SHIFT) {
+            s.push_str("Shift+");
+        }
+        // Control chords read better uppercased (`Ctrl-U`), matching convention.
+        match self.code {
+            KeyCode::Char(c) if ctrl => s.push(c.to_ascii_uppercase()),
+            code => s.push_str(&keycode_display(code)),
+        }
+        s
+    }
 }
 
 /// Parses a modifier token (case-insensitive).
@@ -290,6 +348,32 @@ fn keycode_name(code: KeyCode) -> String {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::F(n) => format!("f{n}"),
         other => format!("{other:?}").to_ascii_lowercase(),
+    }
+}
+
+/// Renders a key code for on-screen display (pretty glyphs/short names), the
+/// counterpart to [`keycode_name`]'s config tokens (see [`KeyChord::display`]).
+fn keycode_display(code: KeyCode) -> String {
+    match code {
+        KeyCode::Up => "↑".into(),
+        KeyCode::Down => "↓".into(),
+        KeyCode::Left => "←".into(),
+        KeyCode::Right => "→".into(),
+        KeyCode::Home => "Home".into(),
+        KeyCode::End => "End".into(),
+        KeyCode::PageUp => "PgUp".into(),
+        KeyCode::PageDown => "PgDn".into(),
+        KeyCode::Enter => "Enter".into(),
+        KeyCode::Esc => "Esc".into(),
+        KeyCode::Tab => "Tab".into(),
+        KeyCode::BackTab => "Shift+Tab".into(),
+        KeyCode::Backspace => "Backspace".into(),
+        KeyCode::Delete => "Del".into(),
+        KeyCode::Insert => "Ins".into(),
+        KeyCode::Char(' ') => "Space".into(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::F(n) => format!("F{n}"),
+        other => format!("{other:?}"),
     }
 }
 
@@ -371,6 +455,34 @@ impl Keymap {
             .map(|(c, _)| *c)
             .collect()
     }
+
+    /// A stable, human-readable display of every chord bound to `action`, joined
+    /// with `/` (e.g. `↑/k`), or `None` if the action is currently unbound. The
+    /// chords are sorted because [`Keymap::chords_for`] draws from a `HashMap`
+    /// whose iteration order is unspecified; without this the displayed hint
+    /// would flicker between runs.
+    pub fn display_for(&self, action: KeyAction) -> Option<String> {
+        let mut chords = self.chords_for(action);
+        if chords.is_empty() {
+            return None;
+        }
+        chords.sort_by_key(chord_sort_key);
+        Some(
+            chords
+                .iter()
+                .map(KeyChord::display)
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    }
+}
+
+/// A stable ordering key for displaying an action's chords: named/special keys
+/// (arrows, `Enter`, …) sort before character keys, with the config `render()`
+/// string as a deterministic tiebreaker.
+fn chord_sort_key(chord: &KeyChord) -> (u8, String) {
+    let bucket = u8::from(matches!(chord.code, KeyCode::Char(_)));
+    (bucket, chord.render())
 }
 
 #[cfg(test)]
@@ -549,6 +661,53 @@ mod tests {
             Some(KeyAction::Checkout)
         );
         assert_eq!(m.action_for(KeyChord::key(KeyCode::Char('z'))), None);
+    }
+
+    #[test]
+    fn every_action_has_a_label() {
+        for action in KeyAction::ALL {
+            assert!(!action.label().is_empty(), "missing label for {action:?}");
+        }
+    }
+
+    #[test]
+    fn chord_display_is_terminal_pretty() {
+        assert_eq!(KeyChord::key(KeyCode::Up).display(), "↑");
+        assert_eq!(KeyChord::key(KeyCode::Down).display(), "↓");
+        assert_eq!(KeyChord::key(KeyCode::Enter).display(), "Enter");
+        assert_eq!(KeyChord::key(KeyCode::Esc).display(), "Esc");
+        assert_eq!(KeyChord::key(KeyCode::Char('k')).display(), "k");
+        assert_eq!(KeyChord::key(KeyCode::Char('?')).display(), "?");
+        assert_eq!(KeyChord::ctrl('s').display(), "Ctrl-S");
+        assert_eq!(
+            KeyChord::normalized(KeyCode::Tab, KeyModifiers::SHIFT).display(),
+            "Shift+Tab"
+        );
+    }
+
+    #[test]
+    fn display_for_is_sorted_and_deterministic() {
+        let m = Keymap::defaults();
+        // Multi-chord action: named key (↑) sorts before the char key (k).
+        assert_eq!(m.display_for(KeyAction::NavigateUp).as_deref(), Some("↑/k"));
+        assert_eq!(m.display_for(KeyAction::Switch).as_deref(), Some("Enter"));
+        assert_eq!(m.display_for(KeyAction::SortCycle).as_deref(), Some("s"));
+        assert_eq!(m.display_for(KeyAction::Checkout).as_deref(), Some("c"));
+        // Stable across repeated calls despite the HashMap backing.
+        assert_eq!(
+            m.display_for(KeyAction::NavigateUp),
+            m.display_for(KeyAction::NavigateUp)
+        );
+    }
+
+    #[test]
+    fn display_for_follows_rebind_and_is_none_when_unbound() {
+        let mut m = Keymap::defaults();
+        m.rebind(KeyAction::Checkout, KeyChord::key(KeyCode::Char('x')));
+        assert_eq!(m.display_for(KeyAction::Checkout).as_deref(), Some("x"));
+        // Rebind another action onto Checkout's last chord, leaving it unbound.
+        m.rebind(KeyAction::Quit, KeyChord::key(KeyCode::Char('x')));
+        assert_eq!(m.display_for(KeyAction::Checkout), None);
     }
 
     #[test]
