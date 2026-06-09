@@ -78,7 +78,7 @@ fn build_app(cx: &Cx, session: &Session, git: &dyn GitCli) -> Result<App> {
     // stderr (stdout is reserved for the chosen path and is usually piped).
     let color = cx.color_enabled_err(session.config.ui_color);
     let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
-    app.branches = crate::git::local_branches(session.repo.gix()).unwrap_or_default();
+    app.branches = crate::git::all_branches(session.repo.gix()).unwrap_or_default();
     app.mark_loading();
     Ok(app)
 }
@@ -232,9 +232,9 @@ fn mark_all_loaded(app: &mut App, worktrees: Vec<Worktree>) {
 pub(crate) fn do_refresh(cx: &Cx, app: &mut App, root: &Path) {
     let git = cx.git.clone();
     if let Ok(repo) = Repo::discover(root) {
-        // Refresh the base-ref completion candidates so a just-created branch
-        // becomes completable (best-effort; keep the old list on failure).
-        if let Ok(branches) = crate::git::local_branches(repo.gix()) {
+        // Refresh the branch options/completion candidates so a just-created
+        // branch becomes selectable (best-effort; keep the old list on failure).
+        if let Ok(branches) = crate::git::all_branches(repo.gix()) {
             app.branches = branches;
         }
         if let Ok(worktrees) = build_worktrees(&repo, git.as_ref()) {

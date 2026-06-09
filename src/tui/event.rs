@@ -67,6 +67,21 @@ impl CreateState {
             CreateStep::Base => &mut self.base,
         }
     }
+
+    /// The text of the field currently being edited.
+    fn field_value(&self) -> &str {
+        match self.step {
+            CreateStep::Branch => &self.branch,
+            CreateStep::Base => &self.base,
+        }
+    }
+
+    /// Re-filters the options dropdown against the active field and shows it.
+    fn refresh_options(&mut self) {
+        let query = self.field_value().to_owned();
+        self.options.refilter(&query);
+        self.options.open();
+    }
 }
 
 /// Extends the create-prompt base ref to the longest common prefix of the local
@@ -107,6 +122,27 @@ fn longest_common_prefix(items: &[&str]) -> Option<String> {
         }
     }
     Some(prefix.to_string())
+}
+
+/// The next PR-compose field in Tab order (title → body → model → effort → wrap).
+fn compose_next_field(field: ComposeField) -> ComposeField {
+    match field {
+        ComposeField::Title => ComposeField::Body,
+        ComposeField::Body => ComposeField::Model,
+        ComposeField::Model => ComposeField::Effort,
+        ComposeField::Effort => ComposeField::Title,
+    }
+}
+
+/// The previous PR-compose field in Tab order (the inverse of
+/// [`compose_next_field`], for Shift-Tab).
+fn compose_prev_field(field: ComposeField) -> ComposeField {
+    match field {
+        ComposeField::Title => ComposeField::Effort,
+        ComposeField::Effort => ComposeField::Model,
+        ComposeField::Model => ComposeField::Body,
+        ComposeField::Body => ComposeField::Title,
+    }
 }
 
 impl App {
@@ -169,7 +205,15 @@ impl App {
             }
             KeyAction::Filter => self.mode = Mode::Filter,
             KeyAction::ClearFilter => self.clear_filter(),
-            KeyAction::New => self.mode = Mode::Create(CreateState::default()),
+            KeyAction::New => {
+                // Seed the branch-options dropdown with existing local + remote
+                // branches; it opens once the user types or reaches the base field.
+                let options = crate::tui::OptionList::new(self.branches.clone());
+                self.mode = Mode::Create(CreateState {
+                    options,
+                    ..Default::default()
+                });
+            }
             KeyAction::Remove => {
                 if let Some(&index) = self.visible.get(self.selected) {
                     self.mode = Mode::ConfirmRemove(index);
@@ -223,7 +267,10 @@ impl App {
         Effect::None
     }
 
-    /// Create-mode key handling.
+    /// Create-mode key handling. The active field offers an inline dropdown of
+    /// existing branches (issue #25): typing filters it, `↑/↓` move into it, and
+    /// `Enter` accepts the highlight when engaged — otherwise `Enter` advances /
+    /// submits the typed text. `Esc` closes an open dropdown before the modal.
     fn key_create(&mut self, key: KeyEvent) -> Effect {
         let Mode::Create(state) = &mut self.mode else {
             return Effect::None;
@@ -232,33 +279,55 @@ impl App {
             KeyCode::Char(c) => {
                 state.field_mut().push(c);
                 state.error = None;
+                state.refresh_options();
             }
             KeyCode::Backspace => {
                 state.field_mut().pop();
+                state.refresh_options();
             }
+            KeyCode::Up => state.options.up(),
+            KeyCode::Down => state.options.down(),
             KeyCode::Tab => {
                 if state.step == CreateStep::Base {
                     complete_base_ref(state, &self.branches);
+                    state.refresh_options();
                 }
             }
-            KeyCode::Esc => self.mode = Mode::List,
-            KeyCode::Enter => match state.step {
-                CreateStep::Branch => {
-                    let branch = state.branch.trim();
-                    if branch.is_empty() {
-                        state.error = Some("branch name is required".into());
-                    } else if let Err(msg) = crate::git::validate_branch_name(branch) {
-                        state.error = Some(msg);
-                    } else {
-                        state.step = CreateStep::Base;
+            KeyCode::Esc => {
+                if state.options.is_open() {
+                    state.options.close();
+                } else {
+                    self.mode = Mode::List;
+                }
+            }
+            KeyCode::Enter => {
+                // Accept the highlighted suggestion only once the user has moved
+                // into the list; otherwise fall through to advance/submit.
+                if let Some(selected) = state.options.selected().map(str::to_owned) {
+                    *state.field_mut() = selected;
+                    state.options.close();
+                } else {
+                    match state.step {
+                        CreateStep::Branch => {
+                            let branch = state.branch.trim();
+                            if branch.is_empty() {
+                                state.error = Some("branch name is required".into());
+                            } else if let Err(msg) = crate::git::validate_branch_name(branch) {
+                                state.error = Some(msg);
+                            } else {
+                                state.step = CreateStep::Base;
+                                // Reveal fork candidates as soon as the base field opens.
+                                state.refresh_options();
+                            }
+                        }
+                        CreateStep::Base => {
+                            let branch = state.branch.clone();
+                            let base = (!state.base.trim().is_empty()).then(|| state.base.clone());
+                            return Effect::Create { branch, base };
+                        }
                     }
                 }
-                CreateStep::Base => {
-                    let branch = state.branch.clone();
-                    let base = (!state.base.trim().is_empty()).then(|| state.base.clone());
-                    return Effect::Create { branch, base };
-                }
-            },
+            }
             _ => {}
         }
         Effect::None
@@ -285,10 +354,12 @@ impl App {
         Effect::None
     }
 
-    /// PR-compose key handling. Fixed keys (overlay convention): typing edits
-    /// the active field, Tab switches fields, Enter advances (title) or inserts a
-    /// newline (body), Ctrl-S submits, Ctrl-D toggles draft, Ctrl-A auto-fills
-    /// with the agent, Ctrl-M/Ctrl-E cycle the model/effort, Esc cancels.
+    /// PR-compose key handling. Fixed keys (overlay convention): typing edits the
+    /// active text field, Tab cycles the fields (title → body → model → effort),
+    /// `↑/↓` pick from the model/effort options dropdown (issue #25), Enter
+    /// advances (or inserts a newline in the body), Ctrl-S submits, Ctrl-D toggles
+    /// draft, Ctrl-A auto-fills with the agent, Ctrl-M/Ctrl-E quick-cycle the
+    /// model/effort, Esc cancels.
     fn key_compose(&mut self, key: KeyEvent) -> Effect {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Mode::PrCompose(state) = &mut self.mode else {
@@ -317,15 +388,16 @@ impl App {
                 state.error = None;
                 return Effect::DraftPrAi;
             }
-            // Ctrl-M / Ctrl-E: cycle the model / effort used for the next fill.
+            // Ctrl-M / Ctrl-E: quick-cycle the model / effort used for the next fill.
             KeyCode::Char('m') if ctrl => state.model = state.model.next(),
             KeyCode::Char('e') if ctrl => state.effort = state.effort.next(),
             KeyCode::Char('d') if ctrl => state.draft = !state.draft,
-            // Plain character input (Ctrl chords are handled above / ignored).
+            // Plain character input edits the text fields; option fields ignore it.
             KeyCode::Char(c) if !ctrl => {
                 match state.field {
                     ComposeField::Title => state.title.push(c),
                     ComposeField::Body => state.body.push(c),
+                    ComposeField::Model | ComposeField::Effort => {}
                 }
                 state.error = None;
             }
@@ -333,18 +405,29 @@ impl App {
                 match state.field {
                     ComposeField::Title => state.title.pop(),
                     ComposeField::Body => state.body.pop(),
+                    ComposeField::Model | ComposeField::Effort => None,
                 };
                 state.error = None;
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                state.field = match state.field {
-                    ComposeField::Title => ComposeField::Body,
-                    ComposeField::Body => ComposeField::Title,
-                };
-            }
+            // On an option field the arrows move the selection like the picker.
+            KeyCode::Up => match state.field {
+                ComposeField::Model => state.model = state.model.prev(),
+                ComposeField::Effort => state.effort = state.effort.prev(),
+                _ => {}
+            },
+            KeyCode::Down => match state.field {
+                ComposeField::Model => state.model = state.model.next(),
+                ComposeField::Effort => state.effort = state.effort.next(),
+                _ => {}
+            },
+            KeyCode::Tab => state.field = compose_next_field(state.field),
+            KeyCode::BackTab => state.field = compose_prev_field(state.field),
             KeyCode::Enter => match state.field {
                 ComposeField::Title => state.field = ComposeField::Body,
                 ComposeField::Body => state.body.push('\n'),
+                // On the option fields, Enter confirms and moves on.
+                ComposeField::Model => state.field = ComposeField::Effort,
+                ComposeField::Effort => state.field = ComposeField::Title,
             },
             KeyCode::Esc => self.mode = Mode::List,
             _ => {}
@@ -612,6 +695,66 @@ mod tests {
     }
 
     #[test]
+    fn create_mode_dropdown_filters_navigates_and_accepts() {
+        let mut a = app(&[("a", true)]);
+        a.branches = vec!["main".into(), "origin/main".into(), "origin/dev".into()];
+        a.handle_event(press(KeyCode::Char('n')));
+        // Type a new branch name (no existing branch contains "feature/login"),
+        // so the dropdown has no matches and Enter advances to the base field.
+        for c in "feature/login".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Enter));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.step, CreateStep::Base);
+            // The base field opens its dropdown to all fork candidates.
+            assert!(s.options.is_open());
+        } else {
+            panic!("expected create mode");
+        }
+        // Filter the base candidates to the two "origin/" branches.
+        for c in "origin".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        // Engage the list and accept the highlighted suggestion. Matches follow
+        // the seeded order [origin/main, origin/dev], so one Down lands on dev.
+        a.handle_event(press(KeyCode::Down));
+        a.handle_event(press(KeyCode::Enter));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "origin/dev");
+            assert!(!s.options.is_open()); // closed after accepting
+        }
+        // A final Enter (dropdown closed) submits the create.
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::Create {
+                branch: "feature/login".into(),
+                base: Some("origin/dev".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn create_mode_escape_closes_dropdown_before_modal() {
+        let mut a = app(&[("a", true)]);
+        a.branches = vec!["main".into()];
+        a.handle_event(press(KeyCode::Char('n')));
+        a.handle_event(press(KeyCode::Char('m'))); // opens the dropdown (matches "main")
+        if let Mode::Create(s) = &a.mode {
+            assert!(s.options.is_open());
+        }
+        a.handle_event(press(KeyCode::Esc)); // first Esc closes the dropdown
+        if let Mode::Create(s) = &a.mode {
+            assert!(!s.options.is_open());
+        } else {
+            panic!("expected create mode (still open)");
+        }
+        a.handle_event(press(KeyCode::Esc)); // second Esc cancels the modal
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
     fn confirm_remove_y_removes() {
         let mut a = app(&[("main", true), ("feat", false)]);
         a.selected = 1;
@@ -689,12 +832,65 @@ mod tests {
         if let Mode::PrCompose(s) = &a.mode {
             assert_eq!(s.body, "x\ny");
         }
-        // Tab switches back to the title; Backspace pops the active field.
-        a.handle_event(press(KeyCode::Tab));
+        // Shift-Tab steps back from the body to the title; Backspace pops it.
+        a.handle_event(press(KeyCode::BackTab));
         a.handle_event(press(KeyCode::Backspace));
         if let Mode::PrCompose(s) = &a.mode {
             assert_eq!(s.field, ComposeField::Title);
             assert_eq!(s.title, "h");
+        }
+    }
+
+    #[test]
+    fn compose_tab_cycles_all_four_fields() {
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        let field = |a: &App| {
+            if let Mode::PrCompose(s) = &a.mode {
+                s.field
+            } else {
+                panic!("expected compose mode")
+            }
+        };
+        assert_eq!(field(&a), ComposeField::Title);
+        a.handle_event(press(KeyCode::Tab));
+        assert_eq!(field(&a), ComposeField::Body);
+        a.handle_event(press(KeyCode::Tab));
+        assert_eq!(field(&a), ComposeField::Model);
+        a.handle_event(press(KeyCode::Tab));
+        assert_eq!(field(&a), ComposeField::Effort);
+        a.handle_event(press(KeyCode::Tab));
+        assert_eq!(field(&a), ComposeField::Title); // wraps
+    }
+
+    #[test]
+    fn compose_model_effort_fields_pick_with_arrows() {
+        use crate::agent::{AgentModel, Effort};
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState::default());
+        // Tab to the model field (title → body → model).
+        a.handle_event(press(KeyCode::Tab));
+        a.handle_event(press(KeyCode::Tab));
+        // Down advances like next(); Up reverses like prev() (defaults: Sonnet).
+        a.handle_event(press(KeyCode::Down));
+        a.handle_event(press(KeyCode::Up));
+        // Typing on an option field is ignored (no stray character lands).
+        a.handle_event(press(KeyCode::Char('z')));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.field, ComposeField::Model);
+            assert_eq!(s.model, AgentModel::Sonnet);
+            assert_eq!(s.title, "");
+        } else {
+            panic!("expected compose mode");
+        }
+        // Tab to effort; Down advances it like next() (default: Medium).
+        a.handle_event(press(KeyCode::Tab));
+        a.handle_event(press(KeyCode::Down));
+        if let Mode::PrCompose(s) = &a.mode {
+            assert_eq!(s.field, ComposeField::Effort);
+            assert_eq!(s.effort, Effort::Medium.next());
         }
     }
 
