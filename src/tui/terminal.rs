@@ -10,7 +10,7 @@ use std::io::{Stderr, stderr};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -54,11 +54,18 @@ impl Tui {
     /// Re-enters raw mode / alt screen after [`Tui::suspend`].
     pub fn resume(&mut self) -> Result<()> {
         enable_raw_mode()?;
-        execute!(stderr(), EnterAlternateScreen)?;
+        // Clear the alternate screen with a plain escape (no cursor read).
+        execute!(stderr(), EnterAlternateScreen, Clear(ClearType::All))?;
         if self.mouse {
             execute!(stderr(), EnableMouseCapture)?;
         }
-        self.terminal.clear()?;
+        // Recreate the terminal to force a full repaint on the next draw without
+        // a cursor-position query: ratatui ≥0.30.1's `Terminal::clear` reads the
+        // cursor (ESC[6n) on stdout, but `wt`'s stdout is captured by the shell
+        // wrapper, so the reply never arrives and crossterm times out (#36). A
+        // fresh fullscreen `Terminal` resets the diff buffers via `backend.size()`
+        // (ioctl) only — no cursor read.
+        self.terminal = Terminal::new(CrosstermBackend::new(stderr()))?;
         Ok(())
     }
 
