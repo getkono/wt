@@ -238,7 +238,11 @@ impl App {
                 // Seed a branch picker for the selected worktree (its index into
                 // `worktrees`, matching the `Remove` pattern).
                 if let Some(&index) = self.visible.get(self.selected) {
-                    let options = crate::tui::OptionList::new(self.branches.clone());
+                    // Open the dropdown immediately so the local + remote branch
+                    // list is browsable with ↑/↓ from the start — checkout is a
+                    // pick-an-existing-branch action, not free text entry (#32).
+                    let mut options = crate::tui::OptionList::new(self.branches.clone());
+                    options.open();
                     self.mode = Mode::Checkout(crate::tui::app::CheckoutState {
                         worktree_index: index,
                         options,
@@ -894,9 +898,29 @@ mod tests {
             // The target is the selected row's index into `worktrees`.
             assert_eq!(s.worktree_index, a.visible[1]);
             assert_eq!(s.options.match_count(), 2);
+            // The branch list is open immediately so ↑/↓ browse it without typing.
+            assert!(s.options.is_open());
         } else {
             panic!("expected checkout mode");
         }
+    }
+
+    #[test]
+    fn checkout_picker_arrows_select_a_branch_without_typing() {
+        // The dropdown opens on entry, so ↓ then Enter checks out the highlighted
+        // branch with no type-ahead — picking a local or remote branch directly.
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into(), "origin/feature/x".into()];
+        a.handle_event(press(KeyCode::Char('c')));
+        a.handle_event(press(KeyCode::Down)); // engage the list, move off `main`
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::CheckoutBranch {
+                worktree_index: 0,
+                branch: "origin/feature/x".into(),
+            }
+        );
     }
 
     #[test]
@@ -956,7 +980,7 @@ mod tests {
         let mut a = app(&[("main", true)]);
         a.branches = vec!["main".into()];
         a.handle_event(press(KeyCode::Char('c')));
-        a.handle_event(press(KeyCode::Char('m'))); // opens the dropdown (matches "main")
+        a.handle_event(press(KeyCode::Char('m'))); // dropdown open on entry; filters to "main"
         if let Mode::Checkout(s) = &a.mode {
             assert!(s.options.is_open());
         }
