@@ -89,9 +89,20 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
     // Create the worktree (git is atomic here).
     let target_str = target.to_string_lossy().into_owned();
     if let Some(base) = &base_ref {
+        // `--no-track` keeps the new branch from inheriting the base as its
+        // upstream (issue #43): git's `branch.autoSetupMerge` would otherwise make
+        // a remote-tracking base the upstream. `--track` opts into an explicit one.
         git.run(
             &root,
-            &["worktree", "add", "-b", &branch, &target_str, base],
+            &[
+                "worktree",
+                "add",
+                "--no-track",
+                "-b",
+                &branch,
+                &target_str,
+                base,
+            ],
         )?;
     } else {
         git.run(&root, &["worktree", "add", &target_str, &branch])?;
@@ -107,6 +118,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         &branch,
         &base_ref,
         &target,
+        args.track.as_deref(),
         args.copy_from.as_deref(),
     ) {
         Ok(outcome) => outcome,
@@ -151,12 +163,18 @@ fn post_create_steps(
     branch: &str,
     base_ref: &Option<String>,
     target: &Path,
+    track: Option<&str>,
     copy_from: Option<&str>,
 ) -> Result<crate::copy::CopyOutcome> {
     if let Some(base) = base_ref {
         // A wt-created branch records its base and "created by wt" (§3/§10).
         wtconfig::write_base_ref(git, root, branch, base)?;
         wtconfig::mark_created_by_wt(git, root, branch)?;
+    }
+    // `--track <REF>` sets an explicit upstream (issue #43); a bad ref fails here,
+    // inside the rolled-back region, so the half-created worktree is torn down.
+    if let Some(upstream) = track {
+        git.run(root, &["branch", "-u", upstream, branch])?;
     }
     let source = copy_source(repo, worktrees, copy_from, root)?;
     copy_ignored_files(git, &source, target, &config.copy)
@@ -218,6 +236,8 @@ mod tests {
         NewArgs {
             branch: branch.to_string(),
             from: None,
+            track: None,
+            no_track: false,
             no_switch: false,
             no_hooks: true,
             copy_from: None,
@@ -319,6 +339,52 @@ mod tests {
         assert_eq!(
             repo.git(&["config", "--get", "wt.derived.baseRef"]).trim(),
             "base-branch"
+        );
+    }
+
+    /// A repo with a real `origin` remote (itself) and a fetched
+    /// `refs/remotes/origin/main`, so `origin/main` is a genuine
+    /// remote-tracking branch for upstream/autoSetupMerge purposes.
+    fn repo_with_origin() -> TestRepo {
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", repo.root().to_str().unwrap()]);
+        repo.git(&["fetch", "-q", "origin"]);
+        repo
+    }
+
+    #[test]
+    fn new_branch_does_not_inherit_base_upstream() {
+        // Forking from a remote-tracking base must not make that base the new
+        // branch's upstream (issue #43); git's autoSetupMerge would otherwise.
+        let repo = repo_with_origin();
+        let mut a = args("feat");
+        a.from = Some("origin/main".to_string());
+        let (code, _, _) = run(&repo, &a, false);
+        assert_eq!(code, 0);
+        // No upstream is configured for the new branch (`--get` exits non-zero on
+        // a missing key, so check the full listing instead).
+        let all = repo.git(&["config", "--list"]);
+        assert!(
+            !all.contains("branch.feat.remote"),
+            "new branch should not track the base: {all}"
+        );
+    }
+
+    #[test]
+    fn track_sets_explicit_upstream() {
+        // `--track <REF>` records an explicit upstream for the new branch.
+        let repo = repo_with_origin();
+        let mut a = args("feat");
+        a.track = Some("origin/main".to_string());
+        let (code, _, _) = run(&repo, &a, false);
+        assert_eq!(code, 0);
+        assert_eq!(
+            repo.git(&["config", "--get", "branch.feat.remote"]).trim(),
+            "origin"
+        );
+        assert_eq!(
+            repo.git(&["config", "--get", "branch.feat.merge"]).trim(),
+            "refs/heads/main"
         );
     }
 

@@ -107,6 +107,12 @@ pub struct NewArgs {
     /// Base ref for a newly created branch (default: the repo's default branch).
     #[arg(long, value_name = "REF")]
     pub from: Option<String>,
+    /// Set the new branch's upstream tracking ref (default: none; never the base).
+    #[arg(long, value_name = "REF", conflicts_with = "no_track")]
+    pub track: Option<String>,
+    /// Do not set an upstream for the new branch (the default).
+    #[arg(long = "no-track")]
+    pub no_track: bool,
     /// Do not switch into the new worktree.
     #[arg(long = "no-switch")]
     pub no_switch: bool,
