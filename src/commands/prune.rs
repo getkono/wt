@@ -33,6 +33,11 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     // `--dry-run` (and the `--json` form) only report the candidate set.
     if args.dry_run || json {
+        // Report the empty case explicitly on stderr (stdout stays clean for
+        // `--json`) so a dry-run that finds nothing is never silently blank.
+        if candidates.is_empty() && !json {
+            cx.err.line("nothing to prune")?;
+        }
         for &index in &candidates {
             if json {
                 cx.out.line(&worktrees[index].to_json_line()?)?;
@@ -211,6 +216,16 @@ mod tests {
         assert!(t.out.contents().contains("would remove merged-wt"));
         // Still present (dry-run).
         assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
+    }
+
+    #[test]
+    fn dry_run_reports_nothing_when_no_candidates() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, true, false), false).unwrap();
+        // A dry-run that finds nothing says so on stderr; stdout stays empty.
+        assert!(t.err.contents().contains("nothing to prune"));
+        assert!(t.out.contents().is_empty());
     }
 
     #[test]
