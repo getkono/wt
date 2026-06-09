@@ -59,6 +59,9 @@ pub struct GlobalFlags {
 pub enum Command {
     /// Create a linked worktree from a branch or base ref.
     New(NewArgs),
+    /// Switch the branch checked out in the current worktree (syncs with origin).
+    #[command(visible_alias = "co")]
+    Checkout(CheckoutArgs),
     /// List worktrees.
     #[command(visible_alias = "ls")]
     List(ListArgs),
@@ -113,6 +116,19 @@ pub struct NewArgs {
     /// Override the source worktree for the copy step.
     #[arg(long = "copy-from", value_name = "QUERY")]
     pub copy_from: Option<String>,
+}
+
+/// Arguments for `wt checkout`.
+#[derive(Debug, Args)]
+pub struct CheckoutArgs {
+    /// Branch to check out in this worktree (local, or remote-only via DWIM).
+    pub branch: String,
+    /// Do not print the worktree path (no `cd`); print a note to stderr.
+    #[arg(long = "no-switch")]
+    pub no_switch: bool,
+    /// Discard uncommitted changes and switch anyway.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for `wt list`.
@@ -321,6 +337,7 @@ impl Cli {
         match &self.command {
             Some(
                 Command::New(_)
+                | Command::Checkout(_)
                 | Command::List(_)
                 | Command::Remove(_)
                 | Command::Prune(_)
@@ -336,6 +353,7 @@ impl Cli {
     fn command_label(&self) -> &'static str {
         match &self.command {
             Some(Command::New(_)) => "new",
+            Some(Command::Checkout(_)) => "checkout",
             Some(Command::List(_)) => "list",
             Some(Command::Switch(_)) => "switch",
             Some(Command::Remove(_)) => "remove",
@@ -420,6 +438,7 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::New(args)) => {
             crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
+        Some(Command::Checkout(args)) => crate::commands::checkout::run(cx, &args, json),
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),
         Some(Command::Remove(args)) => {
@@ -501,9 +520,29 @@ mod tests {
             Some(Command::Remove(_))
         ));
         assert!(matches!(
+            parse(&["co", "branch"]).unwrap().command,
+            Some(Command::Checkout(_))
+        ));
+        assert!(matches!(
             parse(&["tui"]).unwrap().command,
             Some(Command::Ui)
         ));
+    }
+
+    #[test]
+    fn checkout_parses_with_flags() {
+        let cli = parse(&["checkout", "feature/x", "--no-switch", "--force"]).unwrap();
+        match cli.command {
+            Some(Command::Checkout(a)) => {
+                assert_eq!(a.branch, "feature/x");
+                assert!(a.no_switch);
+                assert!(a.force);
+            }
+            _ => panic!("expected checkout"),
+        }
+        // `checkout` requires a branch.
+        let mut t = test_cx(&[], "/tmp");
+        assert_eq!(dispatch(argv(&["checkout"]), &mut t.cx).unwrap(), 2);
     }
 
     #[test]
@@ -609,6 +648,7 @@ mod tests {
             vec!["list"],
             vec!["status"],
             vec!["new", "b"],
+            vec!["checkout", "b"],
             vec!["remove", "q"],
             vec!["prune", "--merged"],
             vec!["pr", "list"],

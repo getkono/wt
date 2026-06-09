@@ -197,6 +197,17 @@ fn dispatch_effect(
             // the loop so the wrapper `cd`s into the new worktree.
             Ok(app.chosen.is_some())
         }
+        Effect::CheckoutBranch {
+            worktree_index,
+            branch,
+        } => {
+            tui.suspend()?;
+            do_checkout_branch(cx, session, app, worktree_index, branch);
+            tui.resume()?;
+            // The branch switches in place; stay in the list (refreshed) rather
+            // than `cd`-ing out.
+            Ok(false)
+        }
         // Compose-only effects are driven by the dedicated compose loop
         // ([`run_pr_compose`]) and never reach the main loop.
         Effect::DraftPrAi | Effect::SubmitPr { .. } => Ok(false),
@@ -362,6 +373,49 @@ pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, numb
         }
         Err(e) => match &mut app.mode {
             Mode::PrPicker(state) => state.error = Some(e.to_string()),
+            _ => app.set_status(e.to_string(), StatusKind::Error),
+        },
+    }
+}
+
+/// Checks out `branch` in the worktree at `index` in place, syncing with origin,
+/// then refreshes and stays in the list (the row updates in place). Errors show
+/// inline in the checkout picker; a successful sync's note is in the status bar.
+pub(crate) fn do_checkout_branch(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    index: usize,
+    branch: String,
+) {
+    let git = cx.git.clone();
+    let Some(worktree_dir) = app.worktrees.get(index).map(|w| w.path.clone()) else {
+        return;
+    };
+    match commands::checkout::checkout_branch_in_worktree(
+        cx,
+        git.as_ref(),
+        session,
+        &worktree_dir,
+        &branch,
+        false,
+    ) {
+        Ok(outcome) => {
+            app.mode = Mode::List;
+            app.set_status(
+                format!(
+                    "checked out {branch}{}",
+                    commands::checkout::sync_suffix(outcome)
+                ),
+                StatusKind::Success,
+            );
+            do_refresh(cx, app, &session.primary_root);
+        }
+        Err(e) => match &mut app.mode {
+            Mode::Checkout(state) => {
+                state.error = Some(e.to_string());
+                state.submitting = false;
+            }
             _ => app.set_status(e.to_string(), StatusKind::Error),
         },
     }
@@ -828,6 +882,52 @@ mod tests {
                 .iter()
                 .any(|w| w.branch.as_deref() == Some("pr-feature"))
         );
+    }
+
+    #[test]
+    fn do_checkout_branch_switches_and_stays_in_list() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]);
+        let (mut t, session, mut app) = setup(&repo);
+        app.mode = Mode::Checkout(crate::tui::app::CheckoutState {
+            worktree_index: 0,
+            ..Default::default()
+        });
+        do_checkout_branch(&mut t.cx, &session, &mut app, 0, "topic".into());
+        // Stays in the list (no `cd`), refreshed, with a success status.
+        assert_eq!(app.mode, Mode::List);
+        assert!(app.chosen.is_none());
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("checked out topic")
+        );
+        // The (primary) worktree now has `topic` checked out.
+        assert_eq!(
+            repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "topic"
+        );
+    }
+
+    #[test]
+    fn do_checkout_branch_dirty_shows_error_in_picker() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]);
+        repo.write("README.md", "dirty\n"); // a tracked modification
+        let (mut t, session, mut app) = setup(&repo);
+        app.mode = Mode::Checkout(crate::tui::app::CheckoutState {
+            worktree_index: 0,
+            submitting: true,
+            ..Default::default()
+        });
+        do_checkout_branch(&mut t.cx, &session, &mut app, 0, "topic".into());
+        if let Mode::Checkout(state) = &app.mode {
+            assert!(state.error.as_deref().unwrap().contains("uncommitted"));
+            assert!(!state.submitting);
+        } else {
+            panic!("expected checkout picker with error");
+        }
     }
 
     fn sendit_ctx(branch: &str, trunk: &str, has_upstream: bool) -> sendit::PrContext {
