@@ -117,6 +117,13 @@ These are the things worth knowing up front; the rest is discoverable from
   ```
 - **Removal protects your work.** `wt remove` and `wt prune` refuse to drop a
   worktree with uncommitted or unpushed changes unless you pass `--force`.
+- **Bulk-clean stale branches.** `wt prune --merged` removes worktrees whose branch
+  is merged into the default branch, and `wt prune --gone` removes worktrees whose
+  upstream was deleted (plus any missing worktrees). Both also delete matching
+  **local branches that no longer have a worktree** — so a repo left with a pile of
+  merged feature branches gets cleaned up too. Preview with `--dry-run`. A `--gone`
+  branch that isn't also merged may hold unmerged commits, so it is skipped unless
+  you pass `--force`. The current and default branches are never touched.
 
 ## Development
 

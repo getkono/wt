@@ -21,7 +21,8 @@ not be covered and will not count toward the 80% threshold.
   colorful backtraces; `color_eyre::install()` runs at startup in `main`.
 - **tracing + tracing-subscriber** — structured, async-aware diagnostics; the
   subscriber is configured in `main`. Use `tracing` macros (not `println!`) for
-  diagnostics in library code.
+  diagnostics in library code. Verbosity is controlled by `RUST_LOG` (default
+  `warn`); e.g. `RUST_LOG=wt=debug wt prune --merged --dry-run` traces selection.
 - **thiserror** — derive typed error enums for the library crate's public APIs.
 
 ## Quality
