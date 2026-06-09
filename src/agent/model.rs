@@ -69,6 +69,16 @@ impl AgentModel {
             AgentModel::Haiku => AgentModel::Opus,
         }
     }
+
+    /// The previous model in cycle order (wraps), for navigating the TUI's
+    /// model dropdown upward (`↑`).
+    pub fn prev(self) -> AgentModel {
+        match self {
+            AgentModel::Opus => AgentModel::Haiku,
+            AgentModel::Sonnet => AgentModel::Opus,
+            AgentModel::Haiku => AgentModel::Sonnet,
+        }
+    }
 }
 
 /// How much effort the agent should spend on a draft. Claude has no native
@@ -125,6 +135,16 @@ impl Effort {
             Effort::Low => Effort::Medium,
             Effort::Medium => Effort::High,
             Effort::High => Effort::Low,
+        }
+    }
+
+    /// The previous effort level in cycle order (wraps), for navigating the TUI's
+    /// effort dropdown upward (`↑`).
+    pub fn prev(self) -> Effort {
+        match self {
+            Effort::Low => Effort::High,
+            Effort::Medium => Effort::Low,
+            Effort::High => Effort::Medium,
         }
     }
 
@@ -203,6 +223,18 @@ mod tests {
         assert_eq!(Effort::Low.next(), Effort::Medium);
         assert_eq!(Effort::Medium.next(), Effort::High);
         assert_eq!(Effort::High.next(), Effort::Low);
+    }
+
+    #[test]
+    fn prev_is_the_inverse_of_next() {
+        for &m in AgentModel::all() {
+            assert_eq!(m.next().prev(), m);
+            assert_eq!(m.prev().next(), m);
+        }
+        for &e in Effort::all() {
+            assert_eq!(e.next().prev(), e);
+            assert_eq!(e.prev().next(), e);
+        }
     }
 
     #[test]

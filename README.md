@@ -78,6 +78,11 @@ Run `wt --help` (or `wt <command> --help`) for the complete command surface.
 These are the things worth knowing up front; the rest is discoverable from
 `--help` and the TUI.
 
+- **Pick options on pop-up fields.** TUI fields with known choices offer an
+  inline dropdown instead of blind typing. The new-worktree branch/base fields
+  suggest existing local **and** remote branches to fork from or check out — type
+  to filter, `↑/↓` to pick, `Enter` to accept, or just type a brand-new name. The
+  PR compose form's model and effort fields list their choices the same way.
 - **Where worktrees are created.** New worktrees follow a configurable path
   template. The default keeps them beside the repo, out of it, and prefixes each
   worktree directory with the repo name so it's obvious which repo you're in:

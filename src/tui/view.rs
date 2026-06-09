@@ -13,6 +13,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
+use crate::agent::{AgentModel, Effort};
 use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
@@ -20,6 +21,7 @@ use crate::tui::app::{
     App, ComposeField, CreateState, CreateStep, Mode, Pane, PrComposeState, PrPickerState,
 };
 use crate::tui::glyphs::Glyphs;
+use crate::tui::options::OptionList;
 use crate::tui::theme::Theme;
 
 /// Renders the whole TUI for the current state.
@@ -487,7 +489,11 @@ fn mode_hints(mode: &Mode) -> &'static [(&'static str, &'static str)] {
             ("q", "quit"),
         ],
         Mode::Filter => &[("type", "to filter"), ("Enter", "apply"), ("Esc", "clear")],
-        Mode::Create(_) => &[("Enter", "next/submit"), ("Esc", "cancel")],
+        Mode::Create(_) => &[
+            ("↑/↓", "options"),
+            ("Enter", "next/submit"),
+            ("Esc", "cancel"),
+        ],
         Mode::PrPicker(_) => &[("↑/↓", "select"), ("Enter", "checkout"), ("Esc", "close")],
         Mode::PrCompose(_) => &[
             ("Ctrl-S", "submit"),
@@ -550,11 +556,75 @@ fn render_help(app: &App, frame: &mut Frame, area: Rect) {
     );
 }
 
+/// The most option rows shown at once in an inline dropdown before it scrolls.
+const OPTION_ROWS: usize = 6;
+
+/// Builds the inline option-dropdown lines for an open [`OptionList`] (issue
+/// #25): each match on its own line with the cursor row highlighted, windowed to
+/// [`OPTION_ROWS`] and capped with a "N more" hint. Shared by the create and
+/// compose modals so every pop-up field selects options the same way.
+fn option_lines(theme: &Theme, options: &OptionList) -> Vec<Line<'static>> {
+    let total = options.match_count();
+    let cursor = options.cursor();
+    // Window of up to OPTION_ROWS rows that keeps the cursor visible.
+    let start = if cursor >= OPTION_ROWS {
+        cursor - (OPTION_ROWS - 1)
+    } else {
+        0
+    };
+    let end = (start + OPTION_ROWS).min(total);
+    let labels: Vec<&str> = options.match_labels().collect();
+    let mut lines: Vec<Line<'static>> = labels[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let highlighted = start + i == cursor;
+            let (symbol, style) = if highlighted {
+                (theme.selection_symbol(), theme.selection())
+            } else {
+                ("  ", theme.label())
+            };
+            Line::from(Span::styled(format!("{symbol}{label}"), style))
+        })
+        .collect();
+    if total > end {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more", total - end),
+            theme.hint_label(),
+        )));
+    }
+    lines
+}
+
+/// The model/effort options dropdown for the active PR-compose field, seeded to
+/// the current selection; `None` for the free-text title/body fields.
+fn compose_dropdown(state: &PrComposeState) -> Option<OptionList> {
+    let (labels, index) = match state.field {
+        ComposeField::Model => (
+            AgentModel::all()
+                .iter()
+                .map(|m| m.label().to_string())
+                .collect(),
+            AgentModel::all().iter().position(|m| *m == state.model)?,
+        ),
+        ComposeField::Effort => (
+            Effort::all()
+                .iter()
+                .map(|e| e.label().to_string())
+                .collect(),
+            Effort::all().iter().position(|e| *e == state.effort)?,
+        ),
+        ComposeField::Title | ComposeField::Body => return None,
+    };
+    let mut options = OptionList::new(labels);
+    options.open();
+    options.set_cursor(index);
+    Some(options)
+}
+
 /// Renders the create-worktree prompt.
 fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) {
     let theme = Theme::with_palette(app.color, app.palette);
-    let rect = centered(area, 60, 8);
-    frame.render_widget(Clear, rect);
     let field = |active: bool, label: &'static str, value: &str| {
         let (marker, style) = if active {
             (label, theme.accent())
@@ -590,10 +660,17 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
     if let Some(err) = &state.error {
         lines.push(Line::from(Span::styled(format!("! {err}"), theme.error())));
     }
+    // Inline options dropdown for the active field (existing branches).
+    if state.options.is_open() {
+        lines.extend(option_lines(&theme, &state.options));
+    }
     lines.push(Line::from(Span::styled(
-        "Enter: next/submit   Esc: cancel",
+        "↑/↓: options   Enter: next/submit   Esc: cancel",
         theme.hint_label(),
     )));
+    // Grow the modal to fit the fields, optional error, dropdown, and hint.
+    let rect = centered(area, 60, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("new worktree", theme.title(true)))),
@@ -605,12 +682,23 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
 /// header showing branch → trunk, the create/update action, and the draft state.
 fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area: Rect) {
     let theme = Theme::with_palette(app.color, app.palette);
-    let rect = centered(area, 76, 20);
-    frame.render_widget(Clear, rect);
 
     let title_active = state.field == ComposeField::Title;
     let body_active = state.field == ComposeField::Body;
+    let model_active = state.field == ComposeField::Model;
+    let effort_active = state.field == ComposeField::Effort;
     let draft_mark = if state.draft { "[x]" } else { "[ ]" };
+    // The active option field gets the `>` marker, mirroring the text fields.
+    let opt_label = |active: bool, label: &'static str| {
+        Span::styled(
+            label,
+            if active {
+                theme.accent()
+            } else {
+                theme.label()
+            },
+        )
+    };
 
     let mut lines = vec![
         // Header: branch → trunk   [action]   draft [x]/[ ]
@@ -625,10 +713,17 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
         ]),
         // Agent settings used for `Ctrl-A` auto-fill (model + effort).
         Line::from(vec![
-            Span::styled("model: ", theme.label()),
+            opt_label(
+                model_active,
+                if model_active {
+                    "> model: "
+                } else {
+                    "  model: "
+                },
+            ),
             Span::styled(state.model.label().to_string(), theme.accent()),
             Span::raw("   "),
-            Span::styled("effort: ", theme.label()),
+            opt_label(effort_active, "effort: "),
             Span::styled(state.effort.label().to_string(), theme.accent()),
         ]),
         Line::raw(""),
@@ -659,6 +754,14 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
             },
         )),
     ];
+    // When a model/effort field is active, show its options dropdown right under
+    // the agent-settings line; the modal grows to keep the rest from clipping.
+    let mut extra_rows = 0u16;
+    if let Some(options) = compose_dropdown(state) {
+        let dropdown = option_lines(&theme, &options);
+        extra_rows = dropdown.len() as u16;
+        lines.splice(2..2, dropdown);
+    }
     // Body content (multi-line); show at least one (blank) line.
     if state.body.is_empty() {
         lines.push(Line::raw(""));
@@ -676,7 +779,7 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
     } else {
         // Two hint rows: AI auto-fill controls, then the edit/submit controls.
         lines.push(Line::from(Span::styled(
-            "Ctrl-A: AI fill   Ctrl-M: model   Ctrl-E: effort",
+            "Ctrl-A: AI fill   Ctrl-M: model   Ctrl-E: effort   ↑/↓: pick",
             theme.hint_label(),
         )));
         lines.push(Line::from(Span::styled(
@@ -685,6 +788,9 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
         )));
     }
 
+    // Keep the established size, but grow for an open options dropdown.
+    let rect = centered(area, 76, 20 + extra_rows);
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("open pull request", theme.title(true))))
@@ -999,6 +1105,62 @@ mod tests {
         assert!(text.contains("new worktree"));
         assert!(text.contains("feat"));
         assert!(text.contains("required"));
+    }
+
+    #[test]
+    fn create_overlay_shows_open_branch_options() {
+        use crate::tui::options::OptionList;
+        let mut a = app(&[("main", true)]);
+        let mut options = OptionList::new(vec![
+            "main".into(),
+            "origin/main".into(),
+            "origin/dev".into(),
+        ]);
+        options.open();
+        a.mode = Mode::Create(CreateState {
+            options,
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        // The dropdown lists the existing branches and marks the cursor row.
+        assert!(text.contains("origin/main"));
+        assert!(text.contains("origin/dev"));
+        assert!(text.contains('▌')); // selection bar on the highlighted row
+        assert!(text.contains("options")); // status hint mentions ↑/↓ options
+    }
+
+    #[test]
+    fn pr_compose_model_field_shows_options_dropdown() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            field: ComposeField::Model,
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        // Every model option is listed, the active field marked with `>`.
+        assert!(text.contains("Opus 4.8"));
+        assert!(text.contains("Sonnet 4.6"));
+        assert!(text.contains("Haiku 4.5"));
+        assert!(text.contains("> model:"));
+    }
+
+    #[test]
+    fn pr_compose_effort_field_shows_options_dropdown() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            field: ComposeField::Effort,
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("low"));
+        assert!(text.contains("medium"));
+        assert!(text.contains("high"));
     }
 
     #[test]

@@ -35,6 +35,40 @@ pub fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// Lists remote-tracking branch names (e.g. `origin/main`), skipping the
+/// symbolic `<remote>/HEAD` pointers (which alias a real branch, not a fork
+/// candidate). Names keep their remote prefix so they read unambiguously.
+pub fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+    let platform = repo
+        .references()
+        .map_err(|e| Error::operation(format!("cannot read references: {e}")))?;
+    let iter = platform
+        .remote_branches()
+        .map_err(|e| Error::operation(format!("cannot list remote branches: {e}")))?;
+    let mut names = Vec::new();
+    for reference in iter {
+        let reference =
+            reference.map_err(|e| Error::operation(format!("cannot read remote branch: {e}")))?;
+        let name = reference.name().shorten().to_string();
+        // `origin/HEAD` is a symbolic alias for the default branch, not a branch.
+        if name.ends_with("/HEAD") {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// Lists every branch a new worktree can fork from or check out: local branches
+/// first (sorted), then remote-tracking branches (sorted). Best-effort — used to
+/// populate the TUI create-prompt options dropdown (issue #25).
+pub fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+    let mut names = local_branches(repo)?;
+    names.extend(remote_branches(repo)?);
+    Ok(names)
+}
+
 /// Validates a user-entered branch name as a legal git branch ref
 /// (`git check-ref-format --branch` semantics), returning a human-readable
 /// reason on failure. The name is validated as the full ref `refs/heads/<name>`,
@@ -124,6 +158,35 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let branches = local_branches(r.gix()).unwrap();
         assert_eq!(branches, vec!["alpha", "main", "zeta"]);
+    }
+
+    #[test]
+    fn lists_remote_branches_skipping_head() {
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.git(&["update-ref", "refs/remotes/origin/feature/x", &head]);
+        // The symbolic origin/HEAD alias must be excluded.
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let remotes = remote_branches(r.gix()).unwrap();
+        assert_eq!(remotes, vec!["origin/feature/x", "origin/main"]);
+    }
+
+    #[test]
+    fn all_branches_lists_locals_then_remotes() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "zeta"]);
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let all = all_branches(r.gix()).unwrap();
+        // Local branches (sorted) first, then remote-tracking branches (sorted).
+        assert_eq!(all, vec!["main", "zeta", "origin/main"]);
     }
 
     #[test]

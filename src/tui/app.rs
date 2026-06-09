@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::agent::{AgentModel, Effort};
 use crate::keys::Keymap;
 use crate::model::{Column, SortKey, SortSpec, Worktree};
+use crate::tui::options::OptionList;
 use crate::tui::theme::Palette;
 use crate::util::fuzzy;
 
@@ -67,6 +68,9 @@ pub struct CreateState {
     pub base: String,
     /// An inline error from a failed submission.
     pub error: Option<String>,
+    /// The inline branch-options dropdown for the active field (issue #25):
+    /// existing local + remote branches to fork from or check out.
+    pub options: OptionList,
 }
 
 /// Which create-prompt field is active.
@@ -102,6 +106,10 @@ pub enum ComposeField {
     Title,
     /// Editing the multi-line body.
     Body,
+    /// Selecting the AI auto-fill model from its options dropdown (issue #25).
+    Model,
+    /// Selecting the AI auto-fill effort from its options dropdown (issue #25).
+    Effort,
 }
 
 /// The `wt pr open` compose-form state: a title and (multi-line) body the user
@@ -203,8 +211,9 @@ pub struct App {
     pub status_kind: StatusKind,
     /// Set when the terminal became too small to continue (spec §10).
     pub too_small: bool,
-    /// Local branch names used to tab-complete the create-prompt base ref
-    /// (best-effort; empty when enumeration fails).
+    /// Local + remote-tracking branch names offered in the create-prompt
+    /// options dropdown and used to tab-complete the base ref (best-effort;
+    /// empty when enumeration fails).
     pub branches: Vec<String>,
 }
 
