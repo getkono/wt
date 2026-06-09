@@ -7,6 +7,7 @@
 pub mod app;
 pub mod event;
 pub mod glyphs;
+pub mod hints;
 pub mod options;
 pub mod runtime;
 pub mod terminal;

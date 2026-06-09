@@ -14,6 +14,7 @@ use ratatui::widgets::{
 };
 
 use crate::agent::{AgentModel, Effort};
+use crate::keys::KeyAction;
 use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
@@ -22,6 +23,7 @@ use crate::tui::app::{
     PrPickerState,
 };
 use crate::tui::glyphs::Glyphs;
+use crate::tui::hints::{self, Hint};
 use crate::tui::options::OptionList;
 use crate::tui::theme::Theme;
 
@@ -452,13 +454,13 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(message) = &app.status_message {
         spans.push(Span::styled(message.clone(), theme.status(app.status_kind)));
     } else {
-        for (i, (key, label)) in mode_hints(&app.mode).iter().enumerate() {
+        for (i, (key, label)) in mode_hints(app).into_iter().enumerate() {
             if i > 0 {
                 spans.push(Span::raw("  "));
             }
-            spans.push(Span::styled(*key, theme.hint_key()));
+            spans.push(Span::styled(key, theme.hint_key()));
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(*label, theme.hint_label()));
+            spans.push(Span::styled(label, theme.hint_label()));
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -478,40 +480,50 @@ fn mode_label(mode: &Mode) -> &'static str {
     }
 }
 
+/// The curated subset of rebindable actions shown in the List-mode status bar
+/// (the full reference lives in the help overlay). Their key text comes from the
+/// live [`Keymap`](crate::keys::Keymap) and their labels from
+/// [`KeyAction::label`], so the bar can never drift from the bindings (issue #39).
+const LIST_BAR: [KeyAction; 8] = [
+    KeyAction::Switch,
+    KeyAction::New,
+    KeyAction::Remove,
+    KeyAction::PrCheckout,
+    KeyAction::Checkout,
+    KeyAction::Filter,
+    KeyAction::Help,
+    KeyAction::Quit,
+];
+
 /// The right-side key hints for the current mode (spec §10 bottom bar), as
-/// `(key, description)` pairs so the keys can be colored.
-fn mode_hints(mode: &Mode) -> &'static [(&'static str, &'static str)] {
-    match mode {
-        Mode::List => &[
-            ("Enter", "switch"),
-            ("n", "new"),
-            ("d", "remove"),
-            ("p", "pr"),
-            ("/", "filter"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Mode::Filter => &[("type", "to filter"), ("Enter", "apply"), ("Esc", "clear")],
-        Mode::Create(_) => &[
-            ("↑/↓", "options"),
-            ("Enter", "next/submit"),
-            ("Esc", "cancel"),
-        ],
-        Mode::PrPicker(_) => &[("↑/↓", "select"), ("Enter", "checkout"), ("Esc", "close")],
-        Mode::PrCompose(_) => &[
-            ("Ctrl-S", "submit"),
-            ("Ctrl-D", "draft"),
-            ("Tab", "field"),
-            ("Esc", "cancel"),
-        ],
-        Mode::Checkout(_) => &[
-            ("↑/↓", "branches"),
-            ("Enter", "checkout"),
-            ("Esc", "cancel"),
-        ],
-        Mode::ConfirmRemove(_) => &[("y", "remove"), ("any other key", "cancels")],
-        Mode::Help => &[("any key", "closes help")],
+/// `(key, description)` pairs so the keys can be colored. List-mode hints derive
+/// from the keymap; modal hints come from the shared [`hints`] tables.
+fn mode_hints(app: &App) -> Vec<(String, String)> {
+    match &app.mode {
+        Mode::List => LIST_BAR
+            .iter()
+            .filter_map(|&action| {
+                app.keymap
+                    .display_for(action)
+                    .map(|keys| (keys, action.label().to_string()))
+            })
+            .collect(),
+        Mode::Filter => hint_pairs(hints::filter_hints()),
+        Mode::Create(_) => hint_pairs(hints::create_hints()),
+        Mode::PrPicker(_) => hint_pairs(hints::pr_picker_hints()),
+        Mode::PrCompose(_) => hint_pairs(hints::compose_edit_hints()),
+        Mode::Checkout(_) => hint_pairs(hints::checkout_hints()),
+        Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
+        Mode::Help => hint_pairs(hints::help_hints()),
     }
+}
+
+/// Converts a static hint table into owned `(key, label)` pairs for the bar.
+fn hint_pairs(table: &[Hint]) -> Vec<(String, String)> {
+    table
+        .iter()
+        .map(|h| (h.key.to_string(), h.label.to_string()))
+        .collect()
 }
 
 /// Centers a popup `width`×`height` within `area`.
@@ -526,37 +538,28 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Renders the help overlay (the full key-binding reference).
+/// Renders the help overlay: the full key-binding reference, generated from the
+/// live [`Keymap`](crate::keys::Keymap) so every action is documented and the
+/// list can never drift from the actual bindings (issue #39). One row per
+/// [`KeyAction`], skipping any action the user has unbound.
 fn render_help(app: &App, frame: &mut Frame, area: Rect) {
     let theme = Theme::with_palette(app.color, app.palette);
-    let rect = centered(area, 56, 22);
-    frame.render_widget(Clear, rect);
-    let bindings = [
-        ("↑/k  ↓/j", "navigate"),
-        ("g/G", "top / bottom"),
-        ("Enter", "switch (cd) and exit"),
-        ("/", "filter"),
-        ("Esc", "clear / back"),
-        ("n", "new worktree"),
-        ("d", "remove worktree"),
-        ("p", "PR picker"),
-        ("o", "open in editor"),
-        ("r", "refresh"),
-        ("s / S", "sort cycle / reverse"),
-        ("Tab", "switch pane"),
-        ("\\  + / -", "sidebar toggle / resize"),
-        ("?", "this help"),
-        ("q", "quit"),
-    ];
-    let lines: Vec<Line> = bindings
+    let lines: Vec<Line> = KeyAction::ALL
         .iter()
+        .filter_map(|&action| {
+            app.keymap
+                .display_for(action)
+                .map(|keys| (keys, action.label()))
+        })
         .map(|(keys, desc)| {
             Line::from(vec![
                 Span::styled(format!("{keys:<14}"), theme.hint_key()),
-                Span::styled((*desc).to_string(), theme.hint_label()),
+                Span::styled(desc.to_string(), theme.hint_label()),
             ])
         })
         .collect();
+    let rect = centered(area, 56, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("help", theme.title(true)))),
@@ -673,7 +676,7 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
         lines.extend(option_lines(&theme, &state.options));
     }
     lines.push(Line::from(Span::styled(
-        "↑/↓: options   Enter: next/submit   Esc: cancel",
+        hints::format_hint_row(hints::create_hints()),
         theme.hint_label(),
     )));
     // Grow the modal to fit the fields, optional error, dropdown, and hint.
@@ -712,7 +715,7 @@ fn render_checkout(app: &App, state: &CheckoutState, frame: &mut Frame, area: Re
         lines.extend(option_lines(&theme, &state.options));
     }
     lines.push(Line::from(Span::styled(
-        "↑/↓: branches   Enter: checkout   Esc: cancel",
+        hints::format_hint_row(hints::checkout_hints()),
         theme.hint_label(),
     )));
     let rect = centered(area, 60, lines.len() as u16 + 2);
@@ -825,11 +828,11 @@ fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut Frame, area:
     } else {
         // Two hint rows: AI auto-fill controls, then the edit/submit controls.
         lines.push(Line::from(Span::styled(
-            "Ctrl-A: AI fill   Ctrl-M: model   Ctrl-E: effort   ↑/↓: pick",
+            hints::format_hint_row(hints::compose_ai_hints()),
             theme.hint_label(),
         )));
         lines.push(Line::from(Span::styled(
-            "Ctrl-S: submit   Ctrl-D: draft   Tab: field   Enter: newline   Esc: cancel",
+            hints::format_hint_row(hints::compose_edit_hints()),
             theme.hint_label(),
         )));
     }
@@ -1044,10 +1047,12 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::KeyChord;
     use crate::tui::app::testutil::{app, wt};
     use crate::tui::app::{
         ComposeField, CreateState, PrComposeState, PrItem, PrPickerState, StatusKind,
     };
+    use crossterm::event::KeyCode;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1133,10 +1138,49 @@ mod tests {
     fn help_overlay_renders() {
         let mut a = app(&[("main", true)]);
         a.mode = Mode::Help;
-        let text = render_to_text(&a, 100, 30);
+        let text = render_to_text(&a, 100, 40);
         assert!(text.contains("help"));
         assert!(text.contains("navigate"));
         assert!(text.contains("quit"));
+        // Regression for #39: checkout (`c`) was bound but undocumented.
+        assert!(text.contains("checkout"));
+    }
+
+    #[test]
+    fn help_overlay_documents_every_action() {
+        // The help overlay is generated from the keymap, so every action must
+        // appear with its label — the structural guard against hint drift (#39).
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::Help;
+        let text = render_to_text(&a, 100, 40);
+        for action in KeyAction::ALL {
+            assert!(
+                text.contains(action.label()),
+                "help overlay missing label for {action:?}: {:?}",
+                action.label()
+            );
+        }
+    }
+
+    #[test]
+    fn list_bar_includes_checkout() {
+        // The List status bar derives from the keymap; checkout must show with
+        // its default `c` binding (the visible half of the #39 fix).
+        let a = app(&[("main", true)]);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("checkout"));
+        assert!(text.contains(" c "));
+    }
+
+    #[test]
+    fn list_bar_follows_rebind() {
+        // Rebinding an action flows through to the hint: the bar is sourced from
+        // the live keymap, not a hardcoded string.
+        let mut a = app(&[("main", true)]);
+        a.keymap
+            .rebind(KeyAction::Checkout, KeyChord::key(KeyCode::Char('x')));
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains(" x "));
     }
 
     #[test]
