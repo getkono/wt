@@ -14,7 +14,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     // Diagnostics go to stderr so stdout stays reserved for paths/JSON (§5).
+    // Verbosity is controlled by `RUST_LOG` (e.g. `RUST_LOG=wt=debug`); absent or
+    // unparseable, only warnings and errors are shown.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     tracing_subscriber::fmt()
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 

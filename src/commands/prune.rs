@@ -31,6 +31,16 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         .map(|(i, _)| i)
         .collect();
 
+    // `local_branches` exposes how many branches exist versus how many worktrees
+    // we actually inspect — the gap is the signal when a prune surprises someone.
+    tracing::debug!(
+        default = ?default,
+        worktrees = worktrees.len(),
+        candidates = candidates.len(),
+        local_branches = crate::git::local_branches(session.repo.gix()).map_or(0, |b| b.len()),
+        "prune: candidate selection",
+    );
+
     // `--dry-run` (and the `--json` form) only report the candidate set.
     if args.dry_run || json {
         // Report the empty case explicitly on stderr (stdout stays clean for
@@ -96,11 +106,13 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         if let Some(branch) = &worktree.branch {
             let _ = wtconfig::clear_meta(git, &root, branch);
         }
+        tracing::debug!(target_wt = %candidate_label(worktree), "prune: removed worktree");
         removed += 1;
     }
 
     // Reconcile Git's worktree admin metadata (equivalent to `git worktree prune`).
     git.run(&root, &["worktree", "prune"])?;
+    tracing::debug!(removed, "prune: done");
     cx.err.line(&format!("pruned {removed} worktree(s)"))?;
     Ok(0)
 }
