@@ -262,6 +262,8 @@ mod tests {
             &crate::cli::NewArgs {
                 branch: branch.to_string(),
                 from: None,
+                track: None,
+                no_track: false,
                 no_switch: true,
                 no_hooks: true,
                 copy_from: None,

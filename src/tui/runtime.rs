@@ -295,6 +295,8 @@ pub(crate) fn do_create(
     let args = NewArgs {
         branch: branch.clone(),
         from: base,
+        track: None,
+        no_track: false,
         no_switch: true,
         no_hooks: false,
         copy_from: None,
