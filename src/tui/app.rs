@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::agent::{AgentModel, Effort};
 use crate::keys::Keymap;
 use crate::model::{Column, SortKey, SortSpec, Worktree};
+use crate::tui::theme::Palette;
 use crate::util::fuzzy;
 
 /// The narrowest terminal width at which the detail pane is shown (spec §10).
@@ -183,6 +184,8 @@ pub struct App {
     pub mouse: bool,
     /// Whether color output is enabled (spec §11 precedence, resolved once).
     pub color: bool,
+    /// The resolved color palette (preset + `[ui.theme]` overrides).
+    pub palette: Palette,
     /// Set when the user quits without switching.
     pub quit: bool,
     /// Set to the chosen path when the user switches (Enter).
@@ -224,6 +227,8 @@ pub struct AppConfig {
     pub mouse: bool,
     /// Whether color output is enabled (spec §11 precedence, resolved once).
     pub color: bool,
+    /// The resolved color palette (preset + `[ui.theme]` overrides).
+    pub palette: Palette,
 }
 
 impl App {
@@ -258,6 +263,7 @@ impl App {
             nerd_fonts: config.nerd_fonts,
             mouse: config.mouse,
             color: config.color,
+            palette: config.palette,
             quit: false,
             chosen: None,
             exit_on_pr_checkout: false,
@@ -481,6 +487,7 @@ pub(crate) mod testutil {
                 nerd_fonts: false,
                 mouse: true,
                 color: true,
+                palette: Palette::one_dark(),
             },
             (100, 30),
         )

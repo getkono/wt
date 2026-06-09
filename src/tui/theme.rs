@@ -4,9 +4,11 @@
 //! All color is gated behind a single `enabled` flag — resolved once from the
 //! `--color` flag, `NO_COLOR`, and `ui.color` (spec §11 precedence) — so that
 //! disabling color collapses cleanly to the monochrome look (only the
-//! structural `DIM`/`BOLD`/`REVERSED` modifiers remain). The palette is fixed
-//! 24-bit RGB (One-Dark-style), so it renders consistently regardless of the
-//! terminal's theme.
+//! structural `DIM`/`BOLD`/`REVERSED` modifiers remain). The concrete colors
+//! come from a [`Palette`]: a built-in [`ThemePreset`] (One-Dark by default) with
+//! per-color overrides applied on top (`[ui.theme]`, spec §11). Each palette is
+//! fixed 24-bit RGB, so it renders consistently regardless of the terminal's own
+//! theme.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -34,17 +36,132 @@ const SELECTION_BG: Color = Color::Rgb(62, 68, 81);
 /// Foreground for text drawn on a colored chip (the mode label).
 const CHIP_FG: Color = Color::Rgb(30, 33, 39);
 
-/// A resolved theme. Construct with [`Theme::new`]; every accessor returns a
-/// ratatui [`Style`] that is plain ([`Style::default`]) when color is disabled.
+/// The set of semantic colors a [`Theme`] draws from. Every field is a concrete
+/// 24-bit (or named) [`Color`]; [`Theme`] decides where each is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    /// Accent (focus, links, selection bar).
+    pub accent: Color,
+    /// Good/current/ahead/open.
+    pub green: Color,
+    /// Bad/behind/missing/closed.
+    pub red: Color,
+    /// Dirty/detached/warning.
+    pub yellow: Color,
+    /// Commit hash.
+    pub orange: Color,
+    /// Untracked.
+    pub cyan: Color,
+    /// Merged PR.
+    pub magenta: Color,
+    /// Muted text (absent marker, spinner, relative time, labels).
+    pub gray: Color,
+    /// Selected-row background.
+    pub selection_bg: Color,
+    /// Foreground for text drawn on a colored chip (the mode label).
+    pub chip_fg: Color,
+}
+
+impl Palette {
+    /// The default One-Dark-style palette.
+    pub fn one_dark() -> Palette {
+        Palette {
+            accent: ACCENT,
+            green: GREEN,
+            red: RED,
+            yellow: YELLOW,
+            orange: ORANGE,
+            cyan: CYAN,
+            magenta: MAGENTA,
+            gray: GRAY,
+            selection_bg: SELECTION_BG,
+            chip_fg: CHIP_FG,
+        }
+    }
+
+    /// The Solarized-dark palette.
+    pub fn solarized() -> Palette {
+        Palette {
+            accent: Color::Rgb(38, 139, 210),    // blue
+            green: Color::Rgb(133, 153, 0),      // green
+            red: Color::Rgb(220, 50, 47),        // red
+            yellow: Color::Rgb(181, 137, 0),     // yellow
+            orange: Color::Rgb(203, 75, 22),     // orange
+            cyan: Color::Rgb(42, 161, 152),      // cyan
+            magenta: Color::Rgb(211, 54, 130),   // magenta
+            gray: Color::Rgb(88, 110, 117),      // base01
+            selection_bg: Color::Rgb(7, 54, 66), // base02
+            chip_fg: Color::Rgb(0, 43, 54),      // base03
+        }
+    }
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Palette::one_dark()
+    }
+}
+
+/// A built-in base palette, selected by `ui.theme.preset` (spec §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemePreset {
+    /// One-Dark-style (the default).
+    #[default]
+    OneDark,
+    /// Solarized-dark.
+    Solarized,
+}
+
+impl ThemePreset {
+    /// Parses a preset identifier (`one-dark`/`solarized`), or `None` if unknown.
+    pub fn parse(s: &str) -> Option<ThemePreset> {
+        match s {
+            "one-dark" => Some(ThemePreset::OneDark),
+            "solarized" => Some(ThemePreset::Solarized),
+            _ => None,
+        }
+    }
+
+    /// The stable identifier for this preset (the `config get` form).
+    pub fn id(self) -> &'static str {
+        match self {
+            ThemePreset::OneDark => "one-dark",
+            ThemePreset::Solarized => "solarized",
+        }
+    }
+
+    /// The base [`Palette`] for this preset.
+    pub fn palette(self) -> Palette {
+        match self {
+            ThemePreset::OneDark => Palette::one_dark(),
+            ThemePreset::Solarized => Palette::solarized(),
+        }
+    }
+}
+
+/// A resolved theme. Construct with [`Theme::new`] (One-Dark) or
+/// [`Theme::with_palette`]; every accessor returns a ratatui [`Style`] that is
+/// plain ([`Style::default`]) when color is disabled.
 pub struct Theme {
     enabled: bool,
+    palette: Palette,
 }
 
 impl Theme {
-    /// Builds a theme. When `enabled` is false every color accessor returns a
-    /// plain style, preserving the monochrome (`NO_COLOR`) appearance.
+    /// Builds a theme over the default (One-Dark) palette. When `enabled` is
+    /// false every color accessor returns a plain style, preserving the
+    /// monochrome (`NO_COLOR`) appearance.
     pub fn new(enabled: bool) -> Theme {
-        Theme { enabled }
+        Theme {
+            enabled,
+            palette: Palette::one_dark(),
+        }
+    }
+
+    /// Builds a theme over a specific [`Palette`] (the configured one). Color is
+    /// still gated by `enabled`.
+    pub fn with_palette(enabled: bool, palette: Palette) -> Theme {
+        Theme { enabled, palette }
     }
 
     /// Whether color is enabled (some widgets adjust their fallback styling).
@@ -72,73 +189,73 @@ impl Theme {
 
     /// Style for the current-worktree marker (`*`/▸).
     pub fn current(&self) -> Style {
-        self.styled(GREEN, Modifier::BOLD)
+        self.styled(self.palette.green, Modifier::BOLD)
     }
 
     /// Style for the missing-worktree marker (`!`/✘).
     pub fn missing(&self) -> Style {
-        self.fg(RED)
+        self.fg(self.palette.red)
     }
 
     /// Style for the detached-HEAD marker (`~`/⚓).
     pub fn detached(&self) -> Style {
-        self.fg(YELLOW)
+        self.fg(self.palette.yellow)
     }
 
     /// Style for the dirty marker (`M`/●).
     pub fn dirty(&self) -> Style {
-        self.fg(YELLOW)
+        self.fg(self.palette.yellow)
     }
 
     /// Style for the untracked marker (`?`).
     pub fn untracked(&self) -> Style {
-        self.fg(CYAN)
+        self.fg(self.palette.cyan)
     }
 
     /// Style for the "field unavailable" placeholder (`–`).
     pub fn absent(&self) -> Style {
-        self.fg(GRAY)
+        self.fg(self.palette.gray)
     }
 
     /// Style for the per-field loading spinner (`…`).
     pub fn spinner(&self) -> Style {
-        self.fg(GRAY)
+        self.fg(self.palette.gray)
     }
 
     /// Style for the ahead count (`↑N`): green when ahead, muted at zero.
     pub fn ahead(&self, count: u32) -> Style {
         if count > 0 {
-            self.fg(GREEN)
+            self.fg(self.palette.green)
         } else {
-            self.fg(GRAY)
+            self.fg(self.palette.gray)
         }
     }
 
     /// Style for the behind count (`↓N`): red when behind, muted at zero.
     pub fn behind(&self, count: u32) -> Style {
         if count > 0 {
-            self.fg(RED)
+            self.fg(self.palette.red)
         } else {
-            self.fg(GRAY)
+            self.fg(self.palette.gray)
         }
     }
 
     /// Style for a commit short hash.
     pub fn commit_hash(&self) -> Style {
-        self.fg(ORANGE)
+        self.fg(self.palette.orange)
     }
 
     /// Style for a relative timestamp.
     pub fn time(&self) -> Style {
-        self.fg(GRAY)
+        self.fg(self.palette.gray)
     }
 
     /// Style for a branch name, by role.
     pub fn branch(&self, is_current: bool, is_detached: bool) -> Style {
         if is_detached {
-            self.fg(YELLOW)
+            self.fg(self.palette.yellow)
         } else if is_current {
-            self.styled(ACCENT, Modifier::BOLD)
+            self.styled(self.palette.accent, Modifier::BOLD)
         } else {
             Style::default()
         }
@@ -147,10 +264,10 @@ impl Theme {
     /// Style for a PR's number/state cell, by PR state.
     pub fn pr_state(&self, state: PrState) -> Style {
         let color = match state {
-            PrState::Open => GREEN,
-            PrState::Draft => GRAY,
-            PrState::Merged => MAGENTA,
-            PrState::Closed => RED,
+            PrState::Open => self.palette.green,
+            PrState::Draft => self.palette.gray,
+            PrState::Merged => self.palette.magenta,
+            PrState::Closed => self.palette.red,
         };
         self.fg(color)
     }
@@ -160,7 +277,7 @@ impl Theme {
     pub fn selection(&self) -> Style {
         if self.enabled {
             Style::default()
-                .bg(SELECTION_BG)
+                .bg(self.palette.selection_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -178,25 +295,25 @@ impl Theme {
             return Style::default().add_modifier(Modifier::REVERSED);
         }
         let color = match mode {
-            Mode::List => ACCENT,
-            Mode::Filter => YELLOW,
-            Mode::Create(_) => GREEN,
-            Mode::PrPicker(_) => MAGENTA,
-            Mode::PrCompose(_) => GREEN,
-            Mode::ConfirmRemove(_) => RED,
-            Mode::Help => CYAN,
+            Mode::List => self.palette.accent,
+            Mode::Filter => self.palette.yellow,
+            Mode::Create(_) => self.palette.green,
+            Mode::PrPicker(_) => self.palette.magenta,
+            Mode::PrCompose(_) => self.palette.green,
+            Mode::ConfirmRemove(_) => self.palette.red,
+            Mode::Help => self.palette.cyan,
         };
         Style::default()
             .bg(color)
-            .fg(CHIP_FG)
+            .fg(self.palette.chip_fg)
             .add_modifier(Modifier::BOLD)
     }
 
     /// A pane border style; the focused pane is accented, others muted.
     pub fn border(&self, focused: bool) -> Style {
         match (self.enabled, focused) {
-            (true, true) => Style::default().fg(ACCENT),
-            (true, false) => Style::default().fg(GRAY),
+            (true, true) => Style::default().fg(self.palette.accent),
+            (true, false) => Style::default().fg(self.palette.gray),
             (false, true) => Style::default(),
             (false, false) => Style::default().add_modifier(Modifier::DIM),
         }
@@ -205,8 +322,10 @@ impl Theme {
     /// A pane title style; the focused pane is accented/bold, others muted.
     pub fn title(&self, focused: bool) -> Style {
         match (self.enabled, focused) {
-            (true, true) => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            (true, false) => Style::default().fg(GRAY),
+            (true, true) => Style::default()
+                .fg(self.palette.accent)
+                .add_modifier(Modifier::BOLD),
+            (true, false) => Style::default().fg(self.palette.gray),
             (false, true) => Style::default().add_modifier(Modifier::BOLD),
             (false, false) => Style::default().add_modifier(Modifier::DIM),
         }
@@ -214,29 +333,29 @@ impl Theme {
 
     /// Style for a key token in the status-bar / help key hints.
     pub fn hint_key(&self) -> Style {
-        self.styled(ACCENT, Modifier::BOLD)
+        self.styled(self.palette.accent, Modifier::BOLD)
     }
 
     /// Style for the description text next to a key hint.
     pub fn hint_label(&self) -> Style {
-        self.fg(GRAY)
+        self.fg(self.palette.gray)
     }
 
     /// Style for a detail-pane field label.
     pub fn label(&self) -> Style {
-        self.fg(GRAY)
+        self.fg(self.palette.gray)
     }
 
     /// The accent style (active fields, prompts).
     pub fn accent(&self) -> Style {
-        self.fg(ACCENT)
+        self.fg(self.palette.accent)
     }
 
     /// Style for a clickable/URL value.
     pub fn url(&self) -> Style {
         if self.enabled {
             Style::default()
-                .fg(ACCENT)
+                .fg(self.palette.accent)
                 .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default()
@@ -246,25 +365,25 @@ impl Theme {
     /// Style for a transient status message, by severity.
     pub fn status(&self, kind: StatusKind) -> Style {
         match kind {
-            StatusKind::Success => self.fg(GREEN),
-            StatusKind::Error => self.fg(RED),
+            StatusKind::Success => self.fg(self.palette.green),
+            StatusKind::Error => self.fg(self.palette.red),
             StatusKind::Info => Style::default(),
         }
     }
 
     /// Style for error text in modals.
     pub fn error(&self) -> Style {
-        self.fg(RED)
+        self.fg(self.palette.red)
     }
 
     /// Style for warning text in modals.
     pub fn warning(&self) -> Style {
-        self.fg(YELLOW)
+        self.fg(self.palette.yellow)
     }
 
     /// Style for a reassuring/positive note (e.g. "merged — safe to delete").
     pub fn success(&self) -> Style {
-        self.fg(GREEN)
+        self.fg(self.palette.green)
     }
 }
 
@@ -358,5 +477,54 @@ mod tests {
         assert_eq!(t.status(StatusKind::Success).fg, Some(GREEN));
         assert_eq!(t.status(StatusKind::Error).fg, Some(RED));
         assert_eq!(t.status(StatusKind::Info), Style::default());
+    }
+
+    #[test]
+    fn preset_parse_and_id_round_trip() {
+        assert_eq!(ThemePreset::parse("one-dark"), Some(ThemePreset::OneDark));
+        assert_eq!(
+            ThemePreset::parse("solarized"),
+            Some(ThemePreset::Solarized)
+        );
+        assert_eq!(ThemePreset::parse("nope"), None);
+        assert_eq!(ThemePreset::OneDark.id(), "one-dark");
+        assert_eq!(ThemePreset::Solarized.id(), "solarized");
+        // The default preset is One-Dark and matches the legacy constants.
+        assert_eq!(ThemePreset::default(), ThemePreset::OneDark);
+        assert_eq!(ThemePreset::OneDark.palette(), Palette::one_dark());
+    }
+
+    #[test]
+    fn one_dark_palette_matches_legacy_constants() {
+        let p = Palette::one_dark();
+        assert_eq!(p.accent, ACCENT);
+        assert_eq!(p.green, GREEN);
+        assert_eq!(p.red, RED);
+        assert_eq!(p.yellow, YELLOW);
+        assert_eq!(p.orange, ORANGE);
+        assert_eq!(p.cyan, CYAN);
+        assert_eq!(p.magenta, MAGENTA);
+        assert_eq!(p.gray, GRAY);
+        assert_eq!(p.selection_bg, SELECTION_BG);
+        assert_eq!(p.chip_fg, CHIP_FG);
+        // `Default` is One-Dark.
+        assert_eq!(Palette::default(), p);
+    }
+
+    #[test]
+    fn with_palette_applies_custom_colors() {
+        // A custom palette flows through the semantic accessors.
+        let mut p = Palette::one_dark();
+        p.green = Color::Rgb(1, 2, 3);
+        p.accent = Color::Rgb(4, 5, 6);
+        let t = Theme::with_palette(true, p);
+        assert_eq!(t.current().fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(t.border(true).fg, Some(Color::Rgb(4, 5, 6)));
+        // Solarized differs from One-Dark on every primary slot.
+        let sol = Palette::solarized();
+        assert_ne!(sol.accent, ACCENT);
+        assert_ne!(sol.green, GREEN);
+        // Color still gates: disabled is plain regardless of palette.
+        assert_eq!(Theme::with_palette(false, p).current(), Style::default());
     }
 }

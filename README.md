@@ -98,6 +98,18 @@ These are the things worth knowing up front; the rest is discoverable from
   the user config); precedence is flags > repo > global. `wt init` is an optional
   convenience that scaffolds a starter `.wt.toml` and, for a subdir store, offers
   to add it to `.gitignore`.
+- **Theme the TUI.** Pick a built-in palette and tweak individual colors under
+  `[ui.theme]`: `preset` selects the base (`one-dark` (default) or `solarized`),
+  and the named slots (`accent`, `green`, `red`, `yellow`, `orange`, `cyan`,
+  `magenta`, `gray`, `selection_bg`, `chip_fg`) override it. Colors are `#rrggbb`
+  hex, a named color (e.g. `cyan`, `light-blue`), or a 0–255 ANSI index. Like every
+  setting, themes merge across layers (a global base palette, per-repo accents), e.g.
+
+  ```toml
+  [ui.theme]
+  preset = "solarized"
+  accent = "#ff8800"
+  ```
 - **Removal protects your work.** `wt remove` and `wt prune` refuse to drop a
   worktree with uncommitted or unpushed changes unless you pass `--force`.
 

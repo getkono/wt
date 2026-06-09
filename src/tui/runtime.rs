@@ -37,6 +37,7 @@ pub(crate) fn app_config(config: &Config, color: bool) -> AppConfig {
         nerd_fonts: config.ui_nerd_fonts,
         mouse: config.ui_mouse,
         color,
+        palette: config.palette(),
     }
 }
 

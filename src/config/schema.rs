@@ -1,12 +1,15 @@
 //! The resolved [`Config`] and the per-layer [`ConfigLayer`], plus the merge
 //! semantics (spec §11).
 
+use ratatui::style::Color;
+
 use crate::agent::{AgentModel, Effort};
 use crate::cx::Env;
 use crate::keys::{KeyAction, KeyChord, Keymap};
 use crate::model::Column;
 use crate::output::color::{ColorChoice, resolve_color};
 use crate::template::DEFAULT_TEMPLATE;
+use crate::tui::theme::{Palette, ThemePreset};
 
 /// The fully-resolved configuration after merging all layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +49,10 @@ pub struct Config {
     pub ui_mouse: bool,
     /// Color output setting (reconciled with `--color`/`NO_COLOR`).
     pub ui_color: ColorChoice,
+    /// Built-in theme preset (the base TUI palette).
+    pub ui_theme: ThemePreset,
+    /// Per-color overrides layered on top of the preset (`[ui.theme]`).
+    pub theme_overrides: ThemeOverrides,
     /// Accumulated `ui.keybindings` overrides (applied over the defaults).
     pub keybinding_overrides: Vec<(KeyAction, KeyChord)>,
 }
@@ -69,6 +76,8 @@ impl Default for Config {
             ui_nerd_fonts: false,
             ui_mouse: true,
             ui_color: ColorChoice::Auto,
+            ui_theme: ThemePreset::default(),
+            theme_overrides: ThemeOverrides::default(),
             keybinding_overrides: Vec::new(),
         }
     }
@@ -76,9 +85,10 @@ impl Default for Config {
 
 impl Config {
     /// Applies a parsed layer on top of this config (spec §11 merge semantics):
-    /// scalars replace, arrays (`copy`, `list.columns`) replace wholesale, and
-    /// `ui.keybindings` deep-merges per action (overrides accumulate in apply
-    /// order, so a later layer wins).
+    /// scalars replace, arrays (`copy`, `list.columns`) replace wholesale,
+    /// `ui.keybindings` deep-merges per action, and the `[ui.theme]` colors
+    /// deep-merge per slot (the `preset` is a scalar). Overrides accumulate in
+    /// apply order, so a later layer wins.
     pub fn apply(&mut self, layer: ConfigLayer) {
         if let Some(v) = layer.path_template {
             self.path_template = v;
@@ -128,7 +138,19 @@ impl Config {
         if let Some(v) = layer.ui_color {
             self.ui_color = v;
         }
+        if let Some(v) = layer.ui_theme {
+            self.ui_theme = v;
+        }
+        self.theme_overrides.merge(layer.theme_overrides);
         self.keybinding_overrides.extend(layer.ui_keybindings);
+    }
+
+    /// Resolves the effective TUI [`Palette`]: the selected preset's base palette
+    /// with any `[ui.theme]` per-color overrides applied on top.
+    pub fn palette(&self) -> Palette {
+        let mut palette = self.ui_theme.palette();
+        self.theme_overrides.apply_to(&mut palette);
+        palette
     }
 
     /// Builds the effective TUI keymap: the defaults with the configured
@@ -189,8 +211,88 @@ pub struct ConfigLayer {
     pub ui_mouse: Option<bool>,
     /// `ui.color`.
     pub ui_color: Option<ColorChoice>,
+    /// `ui.theme.preset`.
+    pub ui_theme: Option<ThemePreset>,
+    /// `[ui.theme]` per-color overrides present in this layer.
+    pub theme_overrides: ThemeOverrides,
     /// `ui.keybindings` (action → chord) overrides.
     pub ui_keybindings: Vec<(KeyAction, KeyChord)>,
+}
+
+/// Per-color overrides for the TUI palette (`[ui.theme]`). Each field mirrors a
+/// [`Palette`] slot; `None` leaves the preset's color untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThemeOverrides {
+    /// `ui.theme.accent`.
+    pub accent: Option<Color>,
+    /// `ui.theme.green`.
+    pub green: Option<Color>,
+    /// `ui.theme.red`.
+    pub red: Option<Color>,
+    /// `ui.theme.yellow`.
+    pub yellow: Option<Color>,
+    /// `ui.theme.orange`.
+    pub orange: Option<Color>,
+    /// `ui.theme.cyan`.
+    pub cyan: Option<Color>,
+    /// `ui.theme.magenta`.
+    pub magenta: Option<Color>,
+    /// `ui.theme.gray`.
+    pub gray: Option<Color>,
+    /// `ui.theme.selection_bg`.
+    pub selection_bg: Option<Color>,
+    /// `ui.theme.chip_fg`.
+    pub chip_fg: Option<Color>,
+}
+
+impl ThemeOverrides {
+    /// Merges another layer's overrides on top of these (set slots win).
+    pub fn merge(&mut self, other: ThemeOverrides) {
+        self.accent = other.accent.or(self.accent);
+        self.green = other.green.or(self.green);
+        self.red = other.red.or(self.red);
+        self.yellow = other.yellow.or(self.yellow);
+        self.orange = other.orange.or(self.orange);
+        self.cyan = other.cyan.or(self.cyan);
+        self.magenta = other.magenta.or(self.magenta);
+        self.gray = other.gray.or(self.gray);
+        self.selection_bg = other.selection_bg.or(self.selection_bg);
+        self.chip_fg = other.chip_fg.or(self.chip_fg);
+    }
+
+    /// Applies the set overrides onto a base [`Palette`].
+    fn apply_to(&self, palette: &mut Palette) {
+        if let Some(c) = self.accent {
+            palette.accent = c;
+        }
+        if let Some(c) = self.green {
+            palette.green = c;
+        }
+        if let Some(c) = self.red {
+            palette.red = c;
+        }
+        if let Some(c) = self.yellow {
+            palette.yellow = c;
+        }
+        if let Some(c) = self.orange {
+            palette.orange = c;
+        }
+        if let Some(c) = self.cyan {
+            palette.cyan = c;
+        }
+        if let Some(c) = self.magenta {
+            palette.magenta = c;
+        }
+        if let Some(c) = self.gray {
+            palette.gray = c;
+        }
+        if let Some(c) = self.selection_bg {
+            palette.selection_bg = c;
+        }
+        if let Some(c) = self.chip_fg {
+            palette.chip_fg = c;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -335,5 +437,55 @@ mod tests {
             km.action_for(KeyChord::key(KeyCode::Char('n'))),
             Some(KeyAction::New)
         );
+    }
+
+    #[test]
+    fn theme_defaults_to_one_dark() {
+        let c = Config::default();
+        assert_eq!(c.ui_theme, ThemePreset::OneDark);
+        assert_eq!(c.theme_overrides, ThemeOverrides::default());
+        assert_eq!(c.palette(), Palette::one_dark());
+    }
+
+    #[test]
+    fn theme_preset_and_overrides_apply_and_merge() {
+        let mut c = Config::default();
+        // Global layer: solarized preset + an accent override.
+        c.apply(ConfigLayer {
+            ui_theme: Some(ThemePreset::Solarized),
+            theme_overrides: ThemeOverrides {
+                accent: Some(Color::Rgb(1, 1, 1)),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        // Per-repo layer: override red only; preset and accent untouched.
+        c.apply(ConfigLayer {
+            theme_overrides: ThemeOverrides {
+                red: Some(Color::Rgb(2, 2, 2)),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(c.ui_theme, ThemePreset::Solarized);
+        let p = c.palette();
+        // Both overrides survive (deep-merge per slot).
+        assert_eq!(p.accent, Color::Rgb(1, 1, 1));
+        assert_eq!(p.red, Color::Rgb(2, 2, 2));
+        // A non-overridden slot keeps the solarized base.
+        assert_eq!(p.green, Palette::solarized().green);
+    }
+
+    #[test]
+    fn later_theme_override_wins_for_same_slot() {
+        let mut o = ThemeOverrides {
+            accent: Some(Color::Rgb(1, 1, 1)),
+            ..Default::default()
+        };
+        o.merge(ThemeOverrides {
+            accent: Some(Color::Rgb(9, 9, 9)),
+            ..Default::default()
+        });
+        assert_eq!(o.accent, Some(Color::Rgb(9, 9, 9)));
     }
 }
