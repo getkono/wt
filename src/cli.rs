@@ -325,7 +325,8 @@ pub struct ShellInitArgs {
 /// Arguments for the hidden `wt __complete` helper.
 #[derive(Debug, Args)]
 pub struct CompleteArgs {
-    /// The kind of candidate to list (`worktrees`, `branches`, `pr-numbers`).
+    /// The kind of candidate to list (`worktrees`, `branches`, `all-branches`,
+    /// `pr-numbers`).
     pub kind: String,
     /// The partial token to complete.
     pub partial: Option<String>,

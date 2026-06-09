@@ -68,7 +68,7 @@ _wt_complete() {
       fi ;;
     checkout|co)
       if [ "$COMP_CWORD" -eq 2 ]; then
-        COMPREPLY=($(command wt __complete branches "$cur" 2>/dev/null)); return
+        COMPREPLY=($(command wt __complete all-branches "$cur" 2>/dev/null)); return
       fi ;;
     pr)
       if [ "$COMP_CWORD" -eq 2 ]; then
@@ -113,7 +113,7 @@ _wt() {
     new)
       compadd -- ${(f)"$(command wt __complete branches "${words[CURRENT]}" 2>/dev/null)"}; return ;;
     checkout|co)
-      compadd -- ${(f)"$(command wt __complete branches "${words[CURRENT]}" 2>/dev/null)"}; return ;;
+      compadd -- ${(f)"$(command wt __complete all-branches "${words[CURRENT]}" 2>/dev/null)"}; return ;;
     pr)
       compadd -- ${(f)"$(command wt __complete pr-numbers "${words[CURRENT]}" 2>/dev/null)"}; return ;;
   esac
@@ -146,8 +146,10 @@ end
 complete -c wt -f
 complete -c wt -n '__fish_seen_subcommand_from switch sw remove rm status path' \
     -a '(command wt __complete worktrees 2>/dev/null)'
-complete -c wt -n '__fish_seen_subcommand_from new checkout co' \
+complete -c wt -n '__fish_seen_subcommand_from new' \
     -a '(command wt __complete branches 2>/dev/null)'
+complete -c wt -n '__fish_seen_subcommand_from checkout co' \
+    -a '(command wt __complete all-branches 2>/dev/null)'
 complete -c wt -n '__fish_seen_subcommand_from pr' \
     -a '(command wt __complete pr-numbers 2>/dev/null)'
 complete -c wt -n '__fish_use_subcommand' \
@@ -175,7 +177,8 @@ Register-ArgumentCompleter -CommandName wt -Native -ScriptBlock {
     $sub = if ($elements.Count -ge 2) { $elements[1].ToString() } else { '' }
     switch -Regex ($sub) {
         '^(switch|sw|remove|rm|status|path)$' { & $exe __complete worktrees $wordToComplete }
-        '^(new|checkout|co)$' { & $exe __complete branches $wordToComplete }
+        '^new$' { & $exe __complete branches $wordToComplete }
+        '^(checkout|co)$' { & $exe __complete all-branches $wordToComplete }
         '^pr$'  { & $exe __complete pr-numbers $wordToComplete }
         default { 'new','checkout','co','list','switch','remove','prune','pr','status','path','root','init','config','completions','shell-init','ui','tui' | Where-Object { $_ -like "$wordToComplete*" } }
     }
@@ -302,6 +305,24 @@ mod tests {
             assert!(
                 s.contains("checkout"),
                 "{shell:?} wrapper does not mention checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_completes_local_and_remote_branches() {
+        // `wt checkout` switches to a local *or* remote-only branch (DWIM), so its
+        // completion must offer both via the `all-branches` kind, while `new`
+        // keeps the local-only `branches` kind (issue #32).
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell] {
+            let s = snippet(shell);
+            assert!(
+                s.contains("__complete all-branches"),
+                "{shell:?} checkout does not complete remote branches"
+            );
+            assert!(
+                s.contains("__complete branches"),
+                "{shell:?} dropped the local-only branches completion"
             );
         }
     }
