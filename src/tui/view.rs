@@ -18,7 +18,8 @@ use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
-    App, ComposeField, CreateState, CreateStep, Mode, Pane, PrComposeState, PrPickerState,
+    App, CheckoutState, ComposeField, CreateState, CreateStep, Mode, Pane, PrComposeState,
+    PrPickerState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::options::OptionList;
@@ -47,6 +48,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Create(state) => render_create(app, state, frame, area),
         Mode::PrPicker(state) => render_pr_picker(app, state, frame, area),
         Mode::PrCompose(state) => render_pr_compose(app, state, frame, area),
+        Mode::Checkout(state) => render_checkout(app, state, frame, area),
         Mode::ConfirmRemove(index) => render_confirm(app, *index, frame, area),
         _ => {}
     }
@@ -470,6 +472,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::Create(_) => "CREATE",
         Mode::PrPicker(_) => "PR",
         Mode::PrCompose(_) => "COMPOSE",
+        Mode::Checkout(_) => "CHECKOUT",
         Mode::ConfirmRemove(_) => "REMOVE",
         Mode::Help => "HELP",
     }
@@ -499,6 +502,11 @@ fn mode_hints(mode: &Mode) -> &'static [(&'static str, &'static str)] {
             ("Ctrl-S", "submit"),
             ("Ctrl-D", "draft"),
             ("Tab", "field"),
+            ("Esc", "cancel"),
+        ],
+        Mode::Checkout(_) => &[
+            ("↑/↓", "branches"),
+            ("Enter", "checkout"),
             ("Esc", "cancel"),
         ],
         Mode::ConfirmRemove(_) => &[("y", "remove"), ("any other key", "cancels")],
@@ -674,6 +682,44 @@ fn render_create(app: &App, state: &CreateState, frame: &mut Frame, area: Rect) 
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("new worktree", theme.title(true)))),
+        rect,
+    );
+}
+
+/// Renders the checkout branch-picker: a single query line over the known
+/// branches with the type-ahead dropdown, the target worktree, and any error.
+fn render_checkout(app: &App, state: &CheckoutState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let target = app
+        .worktrees
+        .get(state.worktree_index)
+        .and_then(|w| w.branch.clone())
+        .unwrap_or_else(|| "worktree".to_string());
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("worktree: ", theme.label()),
+            Span::styled(target, theme.accent()),
+        ]),
+        Line::from(vec![
+            Span::styled("> branch: ", theme.accent()),
+            Span::raw(state.query.clone()),
+        ]),
+    ];
+    if let Some(err) = &state.error {
+        lines.push(Line::from(Span::styled(format!("! {err}"), theme.error())));
+    }
+    if state.options.is_open() {
+        lines.extend(option_lines(&theme, &state.options));
+    }
+    lines.push(Line::from(Span::styled(
+        "↑/↓: branches   Enter: checkout   Esc: cancel",
+        theme.hint_label(),
+    )));
+    let rect = centered(area, 60, lines.len() as u16 + 2);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("checkout branch", theme.title(true)))),
         rect,
     );
 }
@@ -1127,6 +1173,25 @@ mod tests {
         assert!(text.contains("origin/dev"));
         assert!(text.contains('▌')); // selection bar on the highlighted row
         assert!(text.contains("options")); // status hint mentions ↑/↓ options
+    }
+
+    #[test]
+    fn checkout_overlay_renders_branches_and_target() {
+        use crate::tui::app::CheckoutState;
+        use crate::tui::options::OptionList;
+        let mut a = app(&[("main", true), ("feature/x", false)]);
+        let mut options = OptionList::new(vec!["main".into(), "feature/x".into()]);
+        options.open();
+        a.mode = Mode::Checkout(CheckoutState {
+            worktree_index: 0,
+            query: "feat".into(),
+            options,
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("checkout branch"));
+        assert!(text.contains("feature/x"));
+        assert!(text.contains("branches")); // the hint row
     }
 
     #[test]

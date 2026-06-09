@@ -6,7 +6,7 @@ use crate::cli::CompleteArgs;
 use crate::cx::Cx;
 use crate::error::Result;
 use crate::git::discover::Repo;
-use crate::git::local_branches;
+use crate::git::{all_branches, local_branches};
 use crate::worktree_service::enumerate_worktrees;
 
 /// Prints completion candidates for the requested kind, filtered by the partial
@@ -49,6 +49,9 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
             Ok(names)
         }
         "branches" => local_branches(repo.gix()),
+        // `wt checkout` can switch to a remote-only branch (git DWIM), so its
+        // completion offers local *and* remote-tracking branches (issue #32).
+        "all-branches" => all_branches(repo.gix()),
         "pr-numbers" => {
             // Best-effort: silent when gh is missing/unauthenticated (§9).
             let dir = repo.current_workdir().unwrap_or_else(|| cx.cwd.clone());
@@ -97,6 +100,22 @@ mod tests {
         let out = t.out.contents();
         assert!(out.contains("main"));
         assert!(out.contains("topic"));
+    }
+
+    #[test]
+    fn completes_all_branches_including_remote() {
+        // `checkout` completion (the `all-branches` kind) lists local branches and
+        // remote-tracking branches, so a remote-only branch is suggested.
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]);
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/remote-only", &head]);
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &args("all-branches", None)).unwrap();
+        let out = t.out.contents();
+        assert!(out.contains("main"));
+        assert!(out.contains("topic"));
+        assert!(out.contains("origin/remote-only"));
     }
 
     #[test]

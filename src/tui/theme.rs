@@ -300,6 +300,7 @@ impl Theme {
             Mode::Create(_) => self.palette.green,
             Mode::PrPicker(_) => self.palette.magenta,
             Mode::PrCompose(_) => self.palette.green,
+            Mode::Checkout(_) => self.palette.accent,
             Mode::ConfirmRemove(_) => self.palette.red,
             Mode::Help => self.palette.cyan,
         };

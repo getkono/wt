@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// A TUI action that can be bound to a key (spec §10/§11). The 23 variants match
+/// A TUI action that can be bound to a key (spec §10/§11). The 24 variants match
 /// the action names accepted by `ui.keybindings`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyAction {
@@ -42,6 +42,8 @@ pub enum KeyAction {
     Remove,
     /// Open the PR picker.
     PrCheckout,
+    /// Check out a branch in the selected worktree (syncs with origin).
+    Checkout,
     /// Open the selected worktree in the editor.
     OpenEditor,
     /// Force a full async refresh.
@@ -64,7 +66,7 @@ pub enum KeyAction {
 
 impl KeyAction {
     /// All actions, in the order documented in §11.
-    pub const ALL: [KeyAction; 23] = [
+    pub const ALL: [KeyAction; 24] = [
         KeyAction::NavigateUp,
         KeyAction::NavigateDown,
         KeyAction::PageUp,
@@ -79,6 +81,7 @@ impl KeyAction {
         KeyAction::New,
         KeyAction::Remove,
         KeyAction::PrCheckout,
+        KeyAction::Checkout,
         KeyAction::OpenEditor,
         KeyAction::Refresh,
         KeyAction::SortCycle,
@@ -107,6 +110,7 @@ impl KeyAction {
             KeyAction::New => "new",
             KeyAction::Remove => "remove",
             KeyAction::PrCheckout => "pr-checkout",
+            KeyAction::Checkout => "checkout",
             KeyAction::OpenEditor => "open-editor",
             KeyAction::Refresh => "refresh",
             KeyAction::SortCycle => "sort-cycle",
@@ -323,6 +327,7 @@ impl Keymap {
             (KeyAction::New, KeyChord::key(KeyCode::Char('n'))),
             (KeyAction::Remove, KeyChord::key(KeyCode::Char('d'))),
             (KeyAction::PrCheckout, KeyChord::key(KeyCode::Char('p'))),
+            (KeyAction::Checkout, KeyChord::key(KeyCode::Char('c'))),
             (KeyAction::OpenEditor, KeyChord::key(KeyCode::Char('o'))),
             (KeyAction::Refresh, KeyChord::key(KeyCode::Char('r'))),
             (KeyAction::SortCycle, KeyChord::key(KeyCode::Char('s'))),
@@ -374,7 +379,7 @@ mod tests {
 
     #[test]
     fn action_names_round_trip_and_are_unique() {
-        assert_eq!(KeyAction::ALL.len(), 23);
+        assert_eq!(KeyAction::ALL.len(), 24);
         let mut names = std::collections::HashSet::new();
         for action in KeyAction::ALL {
             assert_eq!(KeyAction::parse(action.name()), Some(action));
@@ -538,6 +543,10 @@ mod tests {
         assert_eq!(
             m.action_for(KeyChord::key(KeyCode::Char('S'))),
             Some(KeyAction::SortReverse)
+        );
+        assert_eq!(
+            m.action_for(KeyChord::key(KeyCode::Char('c'))),
+            Some(KeyAction::Checkout)
         );
         assert_eq!(m.action_for(KeyChord::key(KeyCode::Char('z'))), None);
     }

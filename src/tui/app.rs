@@ -30,6 +30,8 @@ pub enum Mode {
     PrPicker(PrPickerState),
     /// PR compose form (`wt pr open`): edit a title + body, then submit.
     PrCompose(PrComposeState),
+    /// Branch picker for checking out a branch in the selected worktree.
+    Checkout(CheckoutState),
     /// Confirm-remove dialog (the worktree index).
     ConfirmRemove(usize),
     /// Help overlay.
@@ -81,6 +83,22 @@ pub enum CreateStep {
     Branch,
     /// Editing the base ref.
     Base,
+}
+
+/// The checkout-branch picker state: a type-ahead branch list plus the target
+/// worktree to switch in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckoutState {
+    /// Index into [`App::worktrees`] of the target worktree (the selected row).
+    pub worktree_index: usize,
+    /// The type-ahead query (the branch the user is filtering/typing).
+    pub query: String,
+    /// The inline branch-options dropdown (local + remote branches to check out).
+    pub options: OptionList,
+    /// An inline error from a failed checkout (e.g. a dirty worktree).
+    pub error: Option<String>,
+    /// Whether a checkout is in flight (input is ignored while set).
+    pub submitting: bool,
 }
 
 /// One PR shown in the picker.

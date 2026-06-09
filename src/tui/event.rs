@@ -42,6 +42,13 @@ pub enum Effect {
     FetchPrs,
     /// Check out the PR with the given number.
     CheckoutPr(u64),
+    /// Check out `branch` in the worktree at `worktree_index` (in place).
+    CheckoutBranch {
+        /// Index into `App::worktrees` of the target worktree.
+        worktree_index: usize,
+        /// The branch to check out.
+        branch: String,
+    },
     /// Open the given path in the editor.
     OpenEditor(PathBuf),
     /// Force a full async refresh.
@@ -174,6 +181,7 @@ impl App {
             Mode::Create(_) => self.key_create(key),
             Mode::PrPicker(_) => self.key_pr(key),
             Mode::PrCompose(_) => self.key_compose(key),
+            Mode::Checkout(_) => self.key_checkout_picker(key),
             Mode::ConfirmRemove(_) => self.key_confirm(key),
             Mode::Help => {
                 self.mode = Mode::List;
@@ -225,6 +233,22 @@ impl App {
                     ..Default::default()
                 });
                 return Effect::FetchPrs;
+            }
+            KeyAction::Checkout => {
+                // Seed a branch picker for the selected worktree (its index into
+                // `worktrees`, matching the `Remove` pattern).
+                if let Some(&index) = self.visible.get(self.selected) {
+                    // Open the dropdown immediately so the local + remote branch
+                    // list is browsable with ↑/↓ from the start — checkout is a
+                    // pick-an-existing-branch action, not free text entry (#32).
+                    let mut options = crate::tui::OptionList::new(self.branches.clone());
+                    options.open();
+                    self.mode = Mode::Checkout(crate::tui::app::CheckoutState {
+                        worktree_index: index,
+                        options,
+                        ..Default::default()
+                    });
+                }
             }
             KeyAction::OpenEditor => {
                 if let Some(wt) = self.selected_worktree() {
@@ -430,6 +454,63 @@ impl App {
                 ComposeField::Effort => state.field = ComposeField::Title,
             },
             KeyCode::Esc => self.mode = Mode::List,
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// Checkout branch-picker key handling. A single type-ahead field over the
+    /// known branches (issue #32): typing filters the dropdown, `↑/↓` move into
+    /// it, and `Enter` checks out the highlighted suggestion (when engaged) or the
+    /// typed text. A first `Esc` closes an open dropdown; a second cancels.
+    fn key_checkout_picker(&mut self, key: KeyEvent) -> Effect {
+        let Mode::Checkout(state) = &mut self.mode else {
+            return Effect::None;
+        };
+        // Ignore input while a checkout is in flight.
+        if state.submitting {
+            return Effect::None;
+        }
+        match key.code {
+            KeyCode::Char(c) => {
+                state.query.push(c);
+                state.error = None;
+                state.options.refilter(&state.query);
+                state.options.open();
+            }
+            KeyCode::Backspace => {
+                state.query.pop();
+                state.error = None;
+                state.options.refilter(&state.query);
+                state.options.open();
+            }
+            KeyCode::Up => state.options.up(),
+            KeyCode::Down => state.options.down(),
+            KeyCode::Esc => {
+                if state.options.is_open() {
+                    state.options.close();
+                } else {
+                    self.mode = Mode::List;
+                }
+            }
+            KeyCode::Enter => {
+                // Accept the highlighted suggestion once engaged; else the typed
+                // text (so a branch the list does not contain still works).
+                let branch = state
+                    .options
+                    .selected()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| state.query.trim().to_string());
+                if branch.is_empty() {
+                    state.error = Some("branch name is required".into());
+                } else {
+                    let worktree_index = state.worktree_index;
+                    return Effect::CheckoutBranch {
+                        worktree_index,
+                        branch,
+                    };
+                }
+            }
             _ => {}
         }
         Effect::None
@@ -805,6 +886,112 @@ mod tests {
         a.handle_event(press(KeyCode::Down));
         let effect = a.handle_event(press(KeyCode::Enter));
         assert_eq!(effect, Effect::CheckoutPr(9));
+    }
+
+    #[test]
+    fn checkout_key_opens_picker_for_selected_worktree() {
+        let mut a = app(&[("main", true), ("feature/x", false)]);
+        a.branches = vec!["main".into(), "feature/x".into()];
+        a.selected = 1; // the feature/x row
+        a.handle_event(press(KeyCode::Char('c')));
+        if let Mode::Checkout(s) = &a.mode {
+            // The target is the selected row's index into `worktrees`.
+            assert_eq!(s.worktree_index, a.visible[1]);
+            assert_eq!(s.options.match_count(), 2);
+            // The branch list is open immediately so ↑/↓ browse it without typing.
+            assert!(s.options.is_open());
+        } else {
+            panic!("expected checkout mode");
+        }
+    }
+
+    #[test]
+    fn checkout_picker_arrows_select_a_branch_without_typing() {
+        // The dropdown opens on entry, so ↓ then Enter checks out the highlighted
+        // branch with no type-ahead — picking a local or remote branch directly.
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into(), "origin/feature/x".into()];
+        a.handle_event(press(KeyCode::Char('c')));
+        a.handle_event(press(KeyCode::Down)); // engage the list, move off `main`
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::CheckoutBranch {
+                worktree_index: 0,
+                branch: "origin/feature/x".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_picker_submits_typed_branch() {
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into(), "feature/x".into()];
+        a.handle_event(press(KeyCode::Char('c')));
+        for ch in "feature/x".chars() {
+            a.handle_event(press(KeyCode::Char(ch)));
+        }
+        // Enter without engaging the list submits the typed text.
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::CheckoutBranch {
+                worktree_index: 0,
+                branch: "feature/x".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_picker_submits_highlighted_suggestion() {
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into(), "feature/x".into(), "feature/y".into()];
+        a.handle_event(press(KeyCode::Char('c')));
+        for ch in "feature".chars() {
+            a.handle_event(press(KeyCode::Char(ch)));
+        }
+        // Matches follow seeded order [feature/x, feature/y]; one Down lands on y.
+        a.handle_event(press(KeyCode::Down));
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(
+            effect,
+            Effect::CheckoutBranch {
+                worktree_index: 0,
+                branch: "feature/y".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn checkout_picker_empty_query_errors() {
+        let mut a = app(&[("main", true)]);
+        a.handle_event(press(KeyCode::Char('c')));
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(effect, Effect::None);
+        if let Mode::Checkout(s) = &a.mode {
+            assert!(s.error.is_some());
+        } else {
+            panic!("expected checkout mode (still open)");
+        }
+    }
+
+    #[test]
+    fn checkout_picker_escape_closes_dropdown_then_cancels() {
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into()];
+        a.handle_event(press(KeyCode::Char('c')));
+        a.handle_event(press(KeyCode::Char('m'))); // dropdown open on entry; filters to "main"
+        if let Mode::Checkout(s) = &a.mode {
+            assert!(s.options.is_open());
+        }
+        a.handle_event(press(KeyCode::Esc)); // first Esc closes the dropdown
+        if let Mode::Checkout(s) = &a.mode {
+            assert!(!s.options.is_open());
+        } else {
+            panic!("expected checkout mode (still open)");
+        }
+        a.handle_event(press(KeyCode::Esc)); // second Esc cancels the modal
+        assert_eq!(a.mode, Mode::List);
     }
 
     #[test]
