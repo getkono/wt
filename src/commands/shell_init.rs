@@ -7,6 +7,12 @@
 //! `--print-path`, and the clap help/version flags (`-h`/`--help`/`-V`/
 //! `--version`) — bypass the capture and run straight through. It also wires
 //! up completion, including the dynamic `wt __complete` helper.
+//!
+//! The `cd` is additionally gated on the captured stdout being a *real
+//! directory*: nav commands always emit an existing worktree path, while
+//! `wt pr open` succeeds by printing a PR *URL*. Without the guard the wrapper
+//! would `cd` into that URL and fail with "no such file or directory" — so any
+//! non-directory stdout is reprinted instead (issue #40).
 
 use clap_complete::Shell;
 
@@ -41,7 +47,9 @@ wt() {
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
-      if [ "$__wt_code" -eq 0 ] && [ -n "$__wt_out" ]; then
+      # Only cd into a real directory: `wt pr open` succeeds by printing a PR
+      # URL, which must be reprinted, not navigated into (issue #40).
+      if [ "$__wt_code" -eq 0 ] && [ -d "$__wt_out" ]; then
         builtin cd -- "$__wt_out"
       else
         [ -n "$__wt_out" ] && printf '%s\n' "$__wt_out"
@@ -94,7 +102,9 @@ wt() {
       done
       local __wt_out __wt_code
       __wt_out="$(command wt "$@")"; __wt_code=$?
-      if [[ $__wt_code -eq 0 && -n "$__wt_out" ]]; then
+      # Only cd into a real directory: `wt pr open` succeeds by printing a PR
+      # URL, which must be reprinted, not navigated into (issue #40).
+      if [[ $__wt_code -eq 0 && -d "$__wt_out" ]]; then
         builtin cd -- "$__wt_out"
       else
         [[ -n "$__wt_out" ]] && print -r -- "$__wt_out"
@@ -132,7 +142,9 @@ function wt
         end
         set -l __wt_out (command wt $argv)
         set -l __wt_code $status
-        if test $__wt_code -eq 0; and test -n "$__wt_out"
+        # Only cd into a real directory: `wt pr open` succeeds by printing a PR
+        # URL, which must be reprinted, not navigated into (issue #40).
+        if test $__wt_code -eq 0; and test -d "$__wt_out"
             cd $__wt_out
         else
             test -n "$__wt_out"; and printf '%s\n' $__wt_out
@@ -163,7 +175,9 @@ function wt {
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
         if ($args -contains '--json' -or $args -contains '--print-path' -or $args -contains '-h' -or $args -contains '--help' -or $args -contains '-V' -or $args -contains '--version') { & $exe @args; return }
         $out = & $exe @args
-        if ($LASTEXITCODE -eq 0 -and $out) { Set-Location -- $out }
+        # Only cd into a real directory: `wt pr open` succeeds by printing a PR
+        # URL, which must be reprinted, not navigated into (issue #40).
+        if ($LASTEXITCODE -eq 0 -and $out -and (Test-Path -LiteralPath "$out" -PathType Container)) { Set-Location -LiteralPath "$out" }
         elseif ($out) { Write-Output $out }
     } else {
         & $exe @args
@@ -194,8 +208,14 @@ fn wt {|@a|
             return
         }
         var out = (external wt $@a | slurp | str:trim-space (one))
+        # Only cd into a real directory: `wt pr open` succeeds by printing a PR
+        # URL. cd raises on a non-directory, so echo it instead (issue #40).
         if (and (== $edit:command-exit-status 0) (not-eq $out "")) {
-            cd $out
+            try {
+                cd $out
+            } catch _ {
+                echo $out
+            }
         } elif (not-eq $out "") {
             echo $out
         }
@@ -248,6 +268,35 @@ mod tests {
                 "no --print-path passthrough for {shell:?}"
             );
         }
+    }
+
+    #[test]
+    fn wrappers_only_cd_into_real_directories() {
+        // Regression for #40: `wt pr open` succeeds by printing a PR *URL* to
+        // stdout. The wrapper must gate its `cd` on the output being an actual
+        // directory, otherwise it `cd`s into the URL ("no such file or
+        // directory"). Every shell guards the navigation differently, so assert
+        // the directory check is present in each.
+        for shell in [Shell::Bash, Shell::Zsh] {
+            let s = snippet(shell);
+            assert!(
+                s.contains(r#"-d "$__wt_out""#),
+                "{shell:?} cd is not gated on a directory test"
+            );
+        }
+        assert!(
+            snippet(Shell::Fish).contains(r#"test -d "$__wt_out""#),
+            "fish cd is not gated on a directory test"
+        );
+        assert!(
+            snippet(Shell::PowerShell).contains("-PathType Container"),
+            "powershell cd is not gated on a container test"
+        );
+        // Elvish has no portable directory predicate, so it guards `cd` in a
+        // try/catch and echoes the value when navigation fails.
+        let elvish = snippet(Shell::Elvish);
+        assert!(elvish.contains("try {"), "elvish cd is not guarded");
+        assert!(elvish.contains("catch"), "elvish has no cd fallback");
     }
 
     #[test]
