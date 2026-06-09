@@ -1,16 +1,30 @@
-//! `wt prune` — bulk cleanup of merged or stale worktrees (spec §7/§12).
+//! `wt prune` — bulk cleanup of merged or stale worktrees, and the local
+//! branches they leave behind (spec §7/§12).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cli::PruneArgs;
-use crate::commands::{candidate_label, confirm, open_session};
+use crate::commands::{Session, candidate_label, confirm, open_session};
 use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{default_branch, is_ancestor, upstream_of};
+use crate::git::discover::Repo;
+use crate::git::{current_branch, default_branch, is_ancestor, local_branches, upstream_of};
 use crate::model::Worktree;
 use crate::worktree_service::{build_worktrees, guard_status};
+
+/// A prune target: an existing worktree (an index into the worktree list) or a
+/// bare local branch — one with no worktree — that qualified for removal.
+enum Candidate {
+    /// An existing worktree, identified by its index in the worktree list.
+    Worktree(usize),
+    /// A local branch with no worktree. `merged` records whether it is an
+    /// ancestor of the default branch (a safe `git branch -d`); a gone-only
+    /// branch (`merged == false`) may hold unmerged commits and needs `--force`.
+    Branch { name: String, merged: bool },
+}
 
 /// Selects and removes prune candidates after confirmation (spec §7/§12).
 pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
@@ -23,23 +37,53 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let root = session.primary_root.clone();
     let worktrees = build_worktrees(&session.repo, git)?;
     let default = default_branch(session.repo.gix());
+    let current = current_branch(session.repo.gix());
 
-    let candidates: Vec<usize> = worktrees
+    // Branches that already have a worktree (the primary checkout and any branch
+    // checked out elsewhere) are handled by the worktree path; the bare-branch
+    // path skips them so a branch is never counted — or deleted — twice.
+    let worktree_branches: HashSet<String> =
+        worktrees.iter().filter_map(|w| w.branch.clone()).collect();
+
+    let mut candidates: Vec<Candidate> = worktrees
         .iter()
         .enumerate()
         .filter(|(_, w)| !w.is_main && is_candidate(git, &session.repo, &root, w, args, &default))
-        .map(|(i, _)| i)
+        .map(|(i, _)| Candidate::Worktree(i))
         .collect();
+    candidates.extend(branch_candidates(
+        git,
+        &session.repo,
+        &root,
+        args,
+        &default,
+        &current,
+        &worktree_branches,
+    )?);
+
+    // The worktree/branch gap is the signal when a prune surprises someone.
+    tracing::debug!(
+        default = ?default,
+        worktrees = worktrees.len(),
+        candidates = candidates.len(),
+        local_branches = local_branches(session.repo.gix()).map_or(0, |b| b.len()),
+        "prune: candidate selection",
+    );
 
     // `--dry-run` (and the `--json` form) only report the candidate set.
     if args.dry_run || json {
-        for &index in &candidates {
+        // Report the empty case explicitly on stderr (stdout stays clean for
+        // `--json`) so a dry-run that finds nothing is never silently blank.
+        if candidates.is_empty() && !json {
+            cx.err.line("nothing to prune")?;
+        }
+        for candidate in &candidates {
             if json {
-                cx.out.line(&worktrees[index].to_json_line()?)?;
+                cx.out.line(&candidate_json(&worktrees, candidate)?)?;
             } else {
                 cx.out.line(&format!(
                     "would remove {}",
-                    candidate_label(&worktrees[index])
+                    candidate_text(&worktrees, candidate)
                 ))?;
             }
         }
@@ -54,10 +98,10 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     // Confirmation prompt (unless --force).
     if !args.force {
-        cx.err.line("worktrees to remove:")?;
-        for &index in &candidates {
+        cx.err.line("to remove:")?;
+        for candidate in &candidates {
             cx.err
-                .line(&format!("  {}", candidate_label(&worktrees[index])))?;
+                .line(&format!("  {}", candidate_text(&worktrees, candidate)))?;
         }
         if !confirm(cx, "Proceed? [y/N] ")? {
             cx.err.line("aborted")?;
@@ -66,38 +110,156 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     }
 
     let mut removed = 0_usize;
-    for &index in &candidates {
-        let worktree = &worktrees[index];
-        // Dirty worktrees are skipped unless --force (spec §12).
-        if !args.force && guard_status(worktree, session.config.remove_untracked_blocks).dirty {
-            cx.err.line(&format!(
-                "skipping dirty worktree {}",
-                candidate_label(worktree)
-            ))?;
-            continue;
+    for candidate in &candidates {
+        let pruned = match candidate {
+            Candidate::Worktree(index) => {
+                remove_worktree(cx, git, &session, &root, &worktrees[*index], args, &default)?
+            }
+            Candidate::Branch { name, merged } => {
+                remove_branch(cx, git, &root, name, *merged, args.force)?
+            }
+        };
+        if pruned {
+            removed += 1;
         }
-        if !worktree.is_missing {
-            let path = worktree.path.to_string_lossy();
-            let _ = git.run_raw(&root, &["worktree", "remove", "--force", &path]);
-        }
-        delete_merged_branch(
-            git,
-            &session.repo,
-            &root,
-            worktree,
-            &session.config,
-            &default,
-        );
-        if let Some(branch) = &worktree.branch {
-            let _ = wtconfig::clear_meta(git, &root, branch);
-        }
-        removed += 1;
     }
 
     // Reconcile Git's worktree admin metadata (equivalent to `git worktree prune`).
     git.run(&root, &["worktree", "prune"])?;
-    cx.err.line(&format!("pruned {removed} worktree(s)"))?;
+    tracing::debug!(removed, "prune: done");
+    cx.err.line(&format!("pruned {removed} item(s)"))?;
     Ok(0)
+}
+
+/// Selects local branches that have no worktree but qualify for pruning: merged
+/// into the default branch (`--merged`) or with a gone upstream (`--gone`). The
+/// default branch and the current branch are never selected, and branches that
+/// already have a worktree are left to the worktree path.
+fn branch_candidates(
+    git: &dyn GitCli,
+    repo: &Repo,
+    root: &Path,
+    args: &PruneArgs,
+    default: &Option<String>,
+    current: &Option<String>,
+    worktree_branches: &HashSet<String>,
+) -> Result<Vec<Candidate>> {
+    let mut out = Vec::new();
+    for branch in local_branches(repo.gix())? {
+        if worktree_branches.contains(&branch)
+            || default.as_deref() == Some(branch.as_str())
+            || current.as_deref() == Some(branch.as_str())
+        {
+            continue;
+        }
+        let merged = default
+            .as_deref()
+            .is_some_and(|d| is_ancestor(git, root, &format!("refs/heads/{branch}"), d));
+        let gone = upstream_of(repo.gix(), &branch).is_some_and(|u| u.is_gone);
+        tracing::trace!(branch = %branch, merged, gone, "prune: branch classified");
+        if (args.merged && merged) || (args.gone && gone) {
+            out.push(Candidate::Branch {
+                name: branch,
+                merged,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Removes one worktree candidate, returning whether it was removed (a dirty
+/// worktree is skipped unless `--force`). This is the per-worktree body of the
+/// prune loop (spec §12).
+fn remove_worktree(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    session: &Session,
+    root: &Path,
+    worktree: &Worktree,
+    args: &PruneArgs,
+    default: &Option<String>,
+) -> Result<bool> {
+    // Dirty worktrees are skipped unless --force (spec §12).
+    if !args.force && guard_status(worktree, session.config.remove_untracked_blocks).dirty {
+        cx.err.line(&format!(
+            "skipping dirty worktree {}",
+            candidate_label(worktree)
+        ))?;
+        return Ok(false);
+    }
+    if !worktree.is_missing {
+        let path = worktree.path.to_string_lossy();
+        let _ = git.run_raw(root, &["worktree", "remove", "--force", &path]);
+    }
+    delete_merged_branch(git, &session.repo, root, worktree, &session.config, default);
+    if let Some(branch) = &worktree.branch {
+        let _ = wtconfig::clear_meta(git, root, branch);
+    }
+    tracing::debug!(target_wt = %candidate_label(worktree), "prune: removed worktree");
+    Ok(true)
+}
+
+/// Deletes one bare-branch candidate, returning whether it was deleted. A merged
+/// branch is removed with `git branch -d`; a gone-only branch (not merged into
+/// the default) may hold unmerged commits, so it is skipped unless `--force`,
+/// which force-deletes it (`git branch -D`). A delete failure is reported and
+/// skipped rather than aborting the whole prune.
+fn remove_branch(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    root: &Path,
+    name: &str,
+    merged: bool,
+    force: bool,
+) -> Result<bool> {
+    if !merged && !force {
+        cx.err.line(&format!(
+            "skipping {name}: branch may have unmerged commits; use --force"
+        ))?;
+        tracing::debug!(branch = %name, "prune: skip protected gone branch");
+        return Ok(false);
+    }
+    let flag = if merged { "-d" } else { "-D" };
+    match git.run_raw(root, &["branch", flag, name]) {
+        Ok(out) if out.success => {
+            let _ = wtconfig::clear_meta(git, root, name);
+            tracing::debug!(branch = %name, flag, "prune: deleted branch");
+            Ok(true)
+        }
+        Ok(out) => {
+            cx.err
+                .line(&format!("could not delete {name}: {}", out.stderr.trim()))?;
+            tracing::warn!(branch = %name, "prune: branch delete failed");
+            Ok(false)
+        }
+        Err(error) => {
+            cx.err.line(&format!("could not delete {name}: {error}"))?;
+            tracing::warn!(branch = %name, "prune: branch delete errored");
+            Ok(false)
+        }
+    }
+}
+
+/// A human label for a prune candidate (worktree or bare branch).
+fn candidate_text(worktrees: &[Worktree], candidate: &Candidate) -> String {
+    match candidate {
+        Candidate::Worktree(index) => candidate_label(&worktrees[*index]),
+        Candidate::Branch { name, .. } => format!("{name} (branch)"),
+    }
+}
+
+/// A machine-readable (`--json`) line for a prune candidate. A worktree emits its
+/// full row; a bare branch emits a small object tagged `"kind": "branch"`.
+fn candidate_json(worktrees: &[Worktree], candidate: &Candidate) -> Result<String> {
+    match candidate {
+        Candidate::Worktree(index) => worktrees[*index].to_json_line(),
+        Candidate::Branch { name, merged } => Ok(serde_json::json!({
+            "branch": name,
+            "kind": "branch",
+            "merged": merged,
+        })
+        .to_string()),
+    }
 }
 
 /// Whether a worktree is a prune candidate for the given flags.
@@ -193,6 +355,32 @@ mod tests {
         .unwrap();
     }
 
+    /// A branch at the current tip — an ancestor of the default branch (merged),
+    /// with no worktree.
+    fn bare_branch(repo: &TestRepo, name: &str) {
+        repo.git(&["branch", name]);
+    }
+
+    /// A branch carrying its own commit, so it is NOT an ancestor of the default
+    /// branch; leaves the repo back on `main`.
+    fn diverged_branch(repo: &TestRepo, name: &str) {
+        repo.git(&["checkout", "-q", "-b", name]);
+        repo.write(&format!("{name}.txt"), "x\n");
+        repo.commit_all("diverge");
+        repo.git(&["checkout", "-q", "main"]);
+    }
+
+    /// Configures an upstream for `name` whose tracking ref does not exist, so
+    /// `upstream_of(...).is_gone` is true.
+    fn give_gone_upstream(repo: &TestRepo, name: &str) {
+        repo.git(&["config", &format!("branch.{name}.remote"), "origin"]);
+        repo.git(&[
+            "config",
+            &format!("branch.{name}.merge"),
+            &format!("refs/heads/{name}"),
+        ]);
+    }
+
     #[test]
     fn requires_a_mode_flag() {
         let repo = TestRepo::init();
@@ -211,6 +399,16 @@ mod tests {
         assert!(t.out.contents().contains("would remove merged-wt"));
         // Still present (dry-run).
         assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
+    }
+
+    #[test]
+    fn dry_run_reports_nothing_when_no_candidates() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, true, false), false).unwrap();
+        // A dry-run that finds nothing says so on stderr; stdout stays empty.
+        assert!(t.err.contents().contains("nothing to prune"));
+        assert!(t.out.contents().is_empty());
     }
 
     #[test]
@@ -277,5 +475,92 @@ mod tests {
         assert_eq!(v["branch"], serde_json::json!("merged-wt"));
         // --json implies dry-run: still present.
         assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
+    }
+
+    #[test]
+    fn merged_bare_branch_is_pruned() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old"); // no worktree, merged into main
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, false, true), false).unwrap();
+        assert!(repo.git(&["branch", "--list", "old"]).trim().is_empty());
+        // The default/current branch is never touched.
+        assert!(repo.git(&["branch", "--list", "main"]).contains("main"));
+    }
+
+    #[test]
+    fn gone_merged_bare_branch_is_pruned() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        give_gone_upstream(&repo, "old"); // merged AND upstream gone
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(false, true, false, true), false).unwrap();
+        assert!(repo.git(&["branch", "--list", "old"]).trim().is_empty());
+    }
+
+    #[test]
+    fn gone_unmerged_branch_needs_force() {
+        let repo = TestRepo::init();
+        diverged_branch(&repo, "wip"); // not an ancestor of main
+        give_gone_upstream(&repo, "wip");
+        // Without --force the protected branch is skipped (confirmation says yes).
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.input = Box::new(CannedInput::new(&["y"]));
+        super::run(&mut t.cx, &prune_args(false, true, false, false), false).unwrap();
+        assert!(t.err.contents().contains("use --force"));
+        assert!(repo.git(&["branch", "--list", "wip"]).contains("wip"));
+        // With --force it is force-deleted.
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(false, true, false, true), false).unwrap();
+        assert!(repo.git(&["branch", "--list", "wip"]).trim().is_empty());
+    }
+
+    #[test]
+    fn default_and_current_never_deleted() {
+        let repo = TestRepo::init(); // only `main` (default + current)
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, true, false, true), false).unwrap();
+        assert!(t.err.contents().contains("nothing to prune"));
+        assert!(repo.git(&["branch", "--list", "main"]).contains("main"));
+    }
+
+    #[test]
+    fn dry_run_lists_bare_branch_without_deleting() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, true, false), false).unwrap();
+        assert!(t.out.contents().contains("would remove old (branch)"));
+        assert!(repo.git(&["branch", "--list", "old"]).contains("old"));
+    }
+
+    #[test]
+    fn branch_with_worktree_uses_worktree_path() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "merged-wt"); // branch + worktree
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, false, true), false).unwrap();
+        // Pruned once via the worktree path — not double-counted as a bare branch.
+        assert!(!repo.git(&["worktree", "list"]).contains("merged-wt"));
+        assert!(
+            repo.git(&["branch", "--list", "merged-wt"])
+                .trim()
+                .is_empty()
+        );
+        assert!(t.err.contents().contains("pruned 1 item(s)"));
+    }
+
+    #[test]
+    fn json_lists_bare_branch() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, false, false), true).unwrap();
+        let out = t.out.contents();
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["branch"], serde_json::json!("old"));
+        assert_eq!(v["kind"], serde_json::json!("branch"));
+        // --json implies dry-run: still present.
+        assert!(repo.git(&["branch", "--list", "old"]).contains("old"));
     }
 }
