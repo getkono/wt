@@ -17,7 +17,7 @@ use crate::cx::Env;
 use crate::error::{Error, Result};
 
 pub use parse::parse_layer;
-pub use schema::{Config, ConfigLayer};
+pub use schema::{Config, ConfigLayer, SubmoduleInit};
 pub use wtconfig::WtMeta;
 
 /// The path to the global `config.toml`, honoring `$XDG_CONFIG_HOME` and falling

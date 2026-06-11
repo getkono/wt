@@ -20,7 +20,7 @@ pub mod switch;
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, SubmoduleInit};
 use crate::cx::{Cx, Env};
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
@@ -157,6 +157,40 @@ pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
     let line = cx.input.read_line()?;
     let answer = line.trim().to_ascii_lowercase();
     Ok(answer == "y" || answer == "yes")
+}
+
+/// Initializes git submodules in `dir` when enabled, after a worktree is created
+/// or a branch is checked out (issue #50). `flag_override` is the resolved
+/// `--init-submodules`/`--no-init-submodules` choice and wins over `policy`;
+/// without a flag, `policy` (`[submodules] init`) decides. Disabled is the common
+/// case and costs nothing — no `git` runs. A failure is non-fatal: the worktree
+/// already exists, so it is surfaced as a warning rather than propagated.
+pub(crate) fn maybe_init_submodules(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    dir: &Path,
+    policy: SubmoduleInit,
+    flag_override: Option<bool>,
+) -> Result<()> {
+    let enabled = flag_override.unwrap_or(matches!(policy, SubmoduleInit::Always));
+    if !enabled {
+        return Ok(());
+    }
+    let pending = crate::git::submodule::uninitialized(git, dir)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    // A heads-up on stderr (never stdout — the `cd` path must stay clean); a
+    // submodule clone can block for a while, so silence would be confusing.
+    let _ = cx
+        .err
+        .line(&format!("initializing {} submodule(s)…", pending.len()));
+    if let Err(e) = crate::git::submodule::update_init(git, dir) {
+        let _ = cx
+            .err
+            .line(&format!("warning: failed to initialize submodules: {e}"));
+    }
+    Ok(())
 }
 
 /// The git directory used for the `.git`-containment check (spec §6).
@@ -400,5 +434,134 @@ mod tests {
         });
         assert!(matches!(r, Resolution::Ambiguous));
         assert!(err.contents().is_empty());
+    }
+
+    mod submodules {
+        use super::cx_with_err_tty;
+        use crate::commands::maybe_init_submodules;
+        use crate::config::SubmoduleInit;
+        use crate::git::cli::{GitCli, GitOutput, RealGit};
+        use crate::git::submodule::uninitialized;
+        use crate::testutil::TestRepo;
+        use std::path::Path;
+
+        /// A repo with one submodule deinitialized, so it reports as uninitialized
+        /// but `update --init` can reuse `.git/modules` (no file-protocol clone).
+        fn repo_with_uninitialized_submodule() -> TestRepo {
+            let repo = TestRepo::init();
+            repo.add_submodule("libs/sub");
+            repo.deinit_submodule("libs/sub");
+            repo
+        }
+
+        fn is_initialized(repo: &TestRepo) -> bool {
+            repo.root().join("libs/sub/sub.txt").exists()
+        }
+
+        #[test]
+        fn disabled_policy_is_a_noop() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules(&mut t.cx, &RealGit, repo.root(), SubmoduleInit::Never, None)
+                .unwrap();
+            assert!(!is_initialized(&repo));
+            assert!(err.contents().is_empty());
+        }
+
+        #[test]
+        fn always_policy_initializes() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Always,
+                None,
+            )
+            .unwrap();
+            assert!(is_initialized(&repo));
+            assert!(uninitialized(&RealGit, repo.root()).unwrap().is_empty());
+            assert!(err.contents().contains("initializing 1 submodule"));
+        }
+
+        #[test]
+        fn flag_override_forces_init_over_never() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, _err) = cx_with_err_tty(true);
+            maybe_init_submodules(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Never,
+                Some(true),
+            )
+            .unwrap();
+            assert!(is_initialized(&repo));
+        }
+
+        #[test]
+        fn flag_override_forces_skip_over_always() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, _err) = cx_with_err_tty(true);
+            maybe_init_submodules(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Always,
+                Some(false),
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+        }
+
+        #[test]
+        fn enabled_with_no_submodules_is_a_noop() {
+            let repo = TestRepo::init();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Always,
+                None,
+            )
+            .unwrap();
+            assert!(err.contents().is_empty());
+        }
+
+        /// A `git` whose `submodule status` reports one uninitialized submodule but
+        /// whose `submodule update` (routed through `run`) fails.
+        struct StatusOkUpdateFails;
+        impl GitCli for StatusOkUpdateFails {
+            fn run_raw(&self, _repo: &Path, _args: &[&str]) -> crate::error::Result<GitOutput> {
+                Ok(GitOutput {
+                    success: true,
+                    stdout: "-deadbeef libs/sub\n".into(),
+                    stderr: String::new(),
+                })
+            }
+            fn run(&self, _repo: &Path, _args: &[&str]) -> crate::error::Result<String> {
+                Err(crate::error::Error::operation("boom"))
+            }
+        }
+
+        #[test]
+        fn update_failure_is_non_fatal_and_warns() {
+            let (mut t, err) = cx_with_err_tty(true);
+            // Returns Ok despite the failed update; the error is surfaced as a warning.
+            maybe_init_submodules(
+                &mut t.cx,
+                &StatusOkUpdateFails,
+                Path::new("/work"),
+                SubmoduleInit::Always,
+                None,
+            )
+            .unwrap();
+            let out = err.contents();
+            assert!(out.contains("initializing 1 submodule"));
+            assert!(out.contains("warning: failed to initialize submodules"));
+            assert!(out.contains("boom"));
+        }
     }
 }

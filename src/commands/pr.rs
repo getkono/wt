@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::{PrArgs, PrSub};
-use crate::commands::{Session, emit_worktree, open_session, resolve_target, rollback_worktree};
+use crate::commands::{
+    Session, emit_worktree, maybe_init_submodules, open_session, resolve_target, rollback_worktree,
+};
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
 use crate::cx::Cx;
@@ -246,6 +248,16 @@ pub(crate) fn checkout_pr_worktree(
         session.config.hooks_post_create.as_deref(),
         &ctx,
         no_hooks,
+    )?;
+
+    // Honor `[submodules] init` for PR worktrees too (issue #50); no
+    // per-invocation flag here. Non-fatal.
+    maybe_init_submodules(
+        cx,
+        git,
+        &worktree_path,
+        session.config.submodules_init,
+        None,
     )?;
 
     Ok((worktree_path, false))

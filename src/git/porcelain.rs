@@ -119,6 +119,57 @@ fn strip_branch_ref(reference: &str) -> String {
         .to_string()
 }
 
+/// One submodule as reported by `git submodule status`. The leading marker is
+/// `' '` (in sync), `'-'` (not initialized), `'+'` (checked-out commit differs
+/// from the index), or `'U'` (merge conflicts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmoduleStatus {
+    /// The leading status marker character.
+    pub state: char,
+    /// The submodule's path, relative to the superproject.
+    pub path: String,
+}
+
+impl SubmoduleStatus {
+    /// Whether the submodule is not yet initialized (marker `'-'`).
+    pub fn is_uninitialized(&self) -> bool {
+        self.state == '-'
+    }
+}
+
+/// Parses `git submodule status` output. Each line is
+/// `<marker><sha> <path>[ (<describe>)]`; the marker is the first character and
+/// is *not* separated from the SHA by a space. Lines that do not parse are
+/// skipped.
+pub fn parse_submodule_status(output: &str) -> Vec<SubmoduleStatus> {
+    let mut result = Vec::new();
+    for line in output.lines() {
+        let mut chars = line.chars();
+        let Some(state) = chars.next() else {
+            continue;
+        };
+        // After the marker char comes `<sha> <path>[ (<describe>)]`.
+        let rest = chars.as_str();
+        let Some((_sha, after_sha)) = rest.split_once(' ') else {
+            continue;
+        };
+        // Drop a trailing ` (<describe>)` annotation, keeping paths intact.
+        let path = match after_sha.rfind(" (") {
+            Some(i) => &after_sha[..i],
+            None => after_sha,
+        }
+        .trim();
+        if path.is_empty() {
+            continue;
+        }
+        result.push(SubmoduleStatus {
+            state,
+            path: path.to_string(),
+        });
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +228,38 @@ mod tests {
     #[test]
     fn empty_input_yields_no_worktrees() {
         assert!(parse_worktree_list("").is_empty());
+    }
+
+    #[test]
+    fn parses_submodule_status_markers() {
+        let input = "-aaa111 libs/uninit\n cccddd libs/ok (heads/main)\n\
+            +bbb222 vendor/drift (v1.2-3-gabcdef)\nUeee444 vendor/conflict\n";
+        let subs = parse_submodule_status(input);
+        assert_eq!(subs.len(), 4);
+        assert_eq!(subs[0].state, '-');
+        assert_eq!(subs[0].path, "libs/uninit");
+        assert!(subs[0].is_uninitialized());
+        assert_eq!(subs[1].state, ' ');
+        assert_eq!(subs[1].path, "libs/ok");
+        assert!(!subs[1].is_uninitialized());
+        assert_eq!(subs[2].state, '+');
+        assert_eq!(subs[2].path, "vendor/drift");
+        assert_eq!(subs[3].state, 'U');
+        assert_eq!(subs[3].path, "vendor/conflict");
+    }
+
+    #[test]
+    fn submodule_status_keeps_paths_with_spaces() {
+        let subs = parse_submodule_status("-deadbeef my libs/sub\n");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].path, "my libs/sub");
+    }
+
+    #[test]
+    fn submodule_status_skips_unparseable_lines() {
+        // Empty input, a marker with no SHA/path, and a marker+SHA with no path.
+        assert!(parse_submodule_status("").is_empty());
+        assert!(parse_submodule_status("-\n").is_empty());
+        assert!(parse_submodule_status("-onlysha\n").is_empty());
     }
 }

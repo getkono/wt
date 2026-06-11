@@ -11,6 +11,30 @@ use crate::output::color::{ColorChoice, resolve_color};
 use crate::template::DEFAULT_TEMPLATE;
 use crate::tui::theme::{Palette, ThemePreset};
 
+/// When to initialize git submodules after a worktree is created or a branch is
+/// checked out (`[submodules] init`, issue #50). Opt-in: the default never
+/// touches submodules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmoduleInit {
+    /// Never initialize submodules automatically (the default).
+    #[default]
+    Never,
+    /// Always run `git submodule update --init --recursive` when uninitialized
+    /// submodules are present.
+    Always,
+}
+
+impl SubmoduleInit {
+    /// Parses a `submodules.init` value (`never`, `always`).
+    pub fn parse(value: &str) -> Option<SubmoduleInit> {
+        match value {
+            "never" => Some(SubmoduleInit::Never),
+            "always" => Some(SubmoduleInit::Always),
+            _ => None,
+        }
+    }
+}
+
 /// The fully-resolved configuration after merging all layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -33,6 +57,8 @@ pub struct Config {
     pub remove_untracked_blocks: bool,
     /// Remote used for PR fetches.
     pub pr_default_remote: String,
+    /// When to auto-initialize git submodules on create/checkout (issue #50).
+    pub submodules_init: SubmoduleInit,
     /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
     /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
     pub agent_model: AgentModel,
@@ -69,6 +95,7 @@ impl Default for Config {
             remove_delete_merged_branch: true,
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
+            submodules_init: SubmoduleInit::default(),
             agent_model: AgentModel::default(),
             agent_effort: Effort::default(),
             list_show_untracked: true,
@@ -116,6 +143,9 @@ impl Config {
         }
         if let Some(v) = layer.pr_default_remote {
             self.pr_default_remote = v;
+        }
+        if let Some(v) = layer.submodules_init {
+            self.submodules_init = v;
         }
         if let Some(v) = layer.agent_model {
             self.agent_model = v;
@@ -197,6 +227,8 @@ pub struct ConfigLayer {
     pub remove_untracked_blocks: Option<bool>,
     /// `pr.default_remote`.
     pub pr_default_remote: Option<String>,
+    /// `submodules.init`.
+    pub submodules_init: Option<SubmoduleInit>,
     /// `agent.model`.
     pub agent_model: Option<AgentModel>,
     /// `agent.effort`.
@@ -309,6 +341,7 @@ mod tests {
         assert!(c.remove_delete_merged_branch);
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
+        assert_eq!(c.submodules_init, SubmoduleInit::Never);
         assert_eq!(c.agent_model, AgentModel::Sonnet);
         assert_eq!(c.agent_effort, Effort::Medium);
         assert!(c.list_show_untracked);
@@ -361,6 +394,7 @@ mod tests {
             hooks_pre_remove: Some("teardown".into()),
             remove_delete_merged_branch: Some(false),
             remove_untracked_blocks: Some(true),
+            submodules_init: Some(SubmoduleInit::Always),
             agent_model: Some(AgentModel::Haiku),
             agent_effort: Some(Effort::Low),
             list_show_untracked: Some(false),
@@ -375,6 +409,7 @@ mod tests {
         assert_eq!(c.hooks_pre_remove.as_deref(), Some("teardown"));
         assert!(!c.remove_delete_merged_branch);
         assert!(c.remove_untracked_blocks);
+        assert_eq!(c.submodules_init, SubmoduleInit::Always);
         assert_eq!(c.agent_model, AgentModel::Haiku);
         assert_eq!(c.agent_effort, Effort::Low);
         assert!(!c.list_show_untracked);

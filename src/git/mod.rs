@@ -4,6 +4,7 @@
 //! - [`cli`] — the [`GitCli`](cli::GitCli) subprocess trait + [`RealGit`](cli::RealGit).
 //! - [`discover`] — repository discovery and identity via `gix`.
 //! - [`porcelain`] — pure parsers for `git` porcelain output.
+//! - [`submodule`] — submodule detection (`status`) and init (`update --init`).
 //! - [`worktrees`] — worktree enumeration + missing detection.
 
 pub mod aheadbehind;
@@ -13,13 +14,14 @@ pub mod discover;
 pub mod porcelain;
 pub mod refs;
 pub mod status;
+pub mod submodule;
 pub mod worktrees;
 
 pub use aheadbehind::ahead_behind;
 pub use cli::{GitCli, GitOutput, RealGit};
 pub use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
 pub use discover::Repo;
-pub use porcelain::{RawWorktree, parse_worktree_list};
+pub use porcelain::{RawWorktree, SubmoduleStatus, parse_submodule_status, parse_worktree_list};
 pub use refs::{
     Upstream, all_branches, current_branch, default_branch, is_ancestor, local_branches,
     remote_branches, resolve_hex, upstream_of, validate_branch_name,

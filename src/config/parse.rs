@@ -7,7 +7,7 @@ use ratatui::style::Color;
 use toml::Value;
 
 use crate::agent::{AgentModel, Effort};
-use crate::config::schema::ConfigLayer;
+use crate::config::schema::{ConfigLayer, SubmoduleInit};
 use crate::error::{Error, Result};
 use crate::keys::{KeyAction, KeyChord};
 use crate::model::Column;
@@ -71,6 +71,7 @@ pub fn parse_layer(text: &str, file: &str) -> Result<ConfigLayer> {
             "hooks" => parse_hooks(file, val, &mut layer)?,
             "remove" => parse_remove(file, val, &mut layer)?,
             "pr" => parse_pr(file, val, &mut layer)?,
+            "submodules" => parse_submodules(file, val, &mut layer)?,
             "agent" => parse_agent(file, val, &mut layer)?,
             "list" => parse_list(file, val, &mut layer)?,
             "ui" => parse_ui(file, val, &mut layer)?,
@@ -116,6 +117,23 @@ fn parse_pr(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
         let key = format!("pr.{sub}");
         match sub.as_str() {
             "default_remote" => layer.pr_default_remote = Some(as_string(file, &key, val)?),
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `[submodules]` table, validating the `init` policy (issue #50).
+fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "submodules", value)? {
+        let key = format!("submodules.{sub}");
+        match sub.as_str() {
+            "init" => {
+                let text = as_string(file, &key, val)?;
+                let policy = SubmoduleInit::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: never, always"))?;
+                layer.submodules_init = Some(policy);
+            }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
@@ -283,6 +301,9 @@ mod tests {
             [pr]
             default_remote = "upstream"
 
+            [submodules]
+            init = "always"
+
             [agent]
             model = "opus"
             effort = "high"
@@ -313,6 +334,7 @@ mod tests {
         assert_eq!(layer.remove_delete_merged_branch, Some(false));
         assert_eq!(layer.remove_untracked_blocks, Some(true));
         assert_eq!(layer.pr_default_remote.as_deref(), Some("upstream"));
+        assert_eq!(layer.submodules_init, Some(SubmoduleInit::Always));
         assert_eq!(layer.agent_model, Some(AgentModel::Opus));
         assert_eq!(layer.agent_effort, Some(Effort::High));
         assert_eq!(layer.list_show_untracked, Some(false));
@@ -383,6 +405,21 @@ mod tests {
         assert!(reason.contains("low, medium, high"));
         let (key, _) = config_reason(parse("[agent]\nwiggle = true").unwrap_err());
         assert_eq!(key, "agent.wiggle");
+    }
+
+    #[test]
+    fn submodules_init_parses_and_validates() {
+        assert_eq!(
+            parse("[submodules]\ninit = \"never\"")
+                .unwrap()
+                .submodules_init,
+            Some(SubmoduleInit::Never)
+        );
+        let (key, reason) = config_reason(parse("[submodules]\ninit = \"sometimes\"").unwrap_err());
+        assert_eq!(key, "submodules.init");
+        assert!(reason.contains("never, always"));
+        let (key, _) = config_reason(parse("[submodules]\nwiggle = true").unwrap_err());
+        assert_eq!(key, "submodules.wiggle");
     }
 
     #[test]
