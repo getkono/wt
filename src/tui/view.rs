@@ -19,8 +19,8 @@ use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
-    App, CheckoutState, ComposeField, CreateState, CreateStep, Mode, Pane, PrComposeState,
-    PrPickerState,
+    App, BusyState, CheckoutState, ComposeField, CreateState, CreateStep, Mode, Pane,
+    PrComposeState, PrPickerState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -55,6 +55,38 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::ConfirmCreate(index) => render_confirm_create(app, *index, frame, area),
         _ => {}
     }
+
+    // The busy-spinner overlay (issue #46) is drawn last so it sits on top of
+    // whatever mode triggered the action (e.g. the checkout picker).
+    if let Some(busy) = &app.busy {
+        render_busy(app, busy, frame, area);
+    }
+}
+
+/// Renders the centered busy-spinner overlay shown while a shell-based action
+/// runs on a background task (issue #46): an animated spinner frame followed by
+/// the action label, e.g. `⠹ Removing feat/foo…`.
+fn render_busy(app: &App, busy: &BusyState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let glyphs = Glyphs::new(app.nerd_fonts);
+    let line = Line::from(vec![
+        Span::styled(
+            glyphs.spinner_frame(busy.frame).to_string(),
+            theme.spinner(),
+        ),
+        Span::raw(" "),
+        Span::styled(format!("{}…", busy.label), theme.label()),
+    ]);
+    // Size to the label (spinner + spacing + ellipsis + side padding); `centered`
+    // clamps to the available area.
+    let width = (busy.label.chars().count() as u16 + 8).clamp(20, area.width);
+    let rect = centered(area, width, 3);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(line)
+            .block(Block::bordered().title(Span::styled("working", theme.title(true)))),
+        rect,
+    );
 }
 
 /// Renders the worktree list pane.
@@ -2066,5 +2098,43 @@ mod tests {
         assert_ne!(cell_fg(&err, "Z"), Color::Reset); // error colored
         assert_eq!(cell_fg(&info, "Z"), Color::Reset); // info uncolored
         assert_ne!(cell_fg(&ok, "Z"), cell_fg(&err, "Z")); // success != error
+    }
+
+    #[test]
+    fn busy_overlay_renders_label_and_spinner() {
+        let mut a = app(&[("main", true)]);
+        a.begin_busy("Removing feat/foo");
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("working"));
+        assert!(text.contains("Removing feat/foo"));
+        assert!(text.contains('…'));
+        // The first ASCII spinner frame is shown.
+        let frame0 = Glyphs::new(false).spinner_frame(0);
+        assert!(text.contains(frame0));
+    }
+
+    #[test]
+    fn busy_overlay_animates_with_frame() {
+        let mut a = app(&[("main", true)]);
+        a.begin_busy("Working");
+        let glyphs = Glyphs::new(false);
+        let at0 = render_to_text(&a, 100, 20);
+        a.tick_busy();
+        let at1 = render_to_text(&a, 100, 20);
+        // The frame index flows into the rendered glyph; frame 1 differs from 0.
+        assert_ne!(glyphs.spinner_frame(0), glyphs.spinner_frame(1));
+        assert!(at1.contains(glyphs.spinner_frame(1)));
+        assert_ne!(at0, at1);
+    }
+
+    #[test]
+    fn busy_overlay_sits_over_mode() {
+        let mut a = app(&[("main", true)]);
+        a.mode = crate::tui::app::Mode::ConfirmRemove(0);
+        a.begin_busy("Removing main");
+        let text = render_to_text(&a, 100, 20);
+        // The overlay is drawn last, over the confirm dialog.
+        assert!(text.contains("working"));
+        assert!(text.contains("Removing main"));
     }
 }

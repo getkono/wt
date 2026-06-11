@@ -74,6 +74,17 @@ impl Input for StdinInput {
     }
 }
 
+/// An [`Input`] that always reports end-of-input (an empty line), so any prompt
+/// is auto-declined. Used by the TUI's background jobs (issue #46), whose
+/// command paths pass force/no-switch flags and never actually prompt.
+pub struct SilentInput;
+
+impl Input for SilentInput {
+    fn read_line(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+}
+
 /// A snapshot of environment variables, injectable for testing.
 #[derive(Clone)]
 pub struct Env {
@@ -209,6 +220,11 @@ mod tests {
     fn stream_reports_tty_flag() {
         let s = Stream::new(Box::new(SharedBuf::new()), true);
         assert!(s.is_tty());
+    }
+
+    #[test]
+    fn silent_input_reports_eof() {
+        assert_eq!(SilentInput.read_line().unwrap(), "");
     }
 
     #[test]
