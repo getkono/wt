@@ -78,6 +78,11 @@ Run `wt --help` (or `wt <command> --help`) for the complete command surface.
 These are the things worth knowing up front; the rest is discoverable from
 `--help` and the TUI.
 
+- **See every branch, not just worktrees.** The TUI lists your worktrees first,
+  then — dimmed beneath them — any local branch that has no worktree, each with how
+  far it is ahead/behind its base. Select one and press `Enter` to create a
+  worktree for it and switch in (it asks first). A branch left behind after you
+  remove its worktree stays visible here instead of vanishing.
 - **Pick options on pop-up fields.** TUI fields with known choices offer an
   inline dropdown instead of blind typing. The new-worktree branch/base fields
   suggest existing local **and** remote branches to fork from or check out — type

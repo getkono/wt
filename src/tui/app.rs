@@ -34,6 +34,9 @@ pub enum Mode {
     Checkout(CheckoutState),
     /// Confirm-remove dialog (the worktree index).
     ConfirmRemove(usize),
+    /// Confirm creating a worktree for the worktree-less branch row at the given
+    /// index, then switching into it (issue #47).
+    ConfirmCreate(usize),
     /// Help overlay.
     Help,
 }
@@ -476,13 +479,20 @@ impl App {
     }
 }
 
-/// The fuzzy-filter haystack for a worktree: branch + slug + path.
+/// The fuzzy-filter haystack for a worktree: branch + slug + path. A
+/// worktree-less branch row has only a virtual path (issue #47), so it matches on
+/// branch + slug alone.
 fn haystack(worktree: &Worktree) -> String {
+    let path = if worktree.has_worktree {
+        worktree.path.display().to_string()
+    } else {
+        String::new()
+    };
     format!(
         "{} {} {}",
         worktree.branch.as_deref().unwrap_or(""),
         worktree.slug.as_deref().unwrap_or(""),
-        worktree.path.display()
+        path
     )
 }
 
@@ -497,6 +507,15 @@ pub(crate) mod testutil {
         w.branch = Some(branch.to_string());
         w.slug = Some(branch.replace('/', "-"));
         w.is_current = current;
+        w
+    }
+
+    /// Builds a worktree-less branch row for tests (issue #47).
+    pub(crate) fn branch_row(branch: &str) -> Worktree {
+        let mut w = Worktree::new(PathBuf::from(format!("branch://{branch}")));
+        w.branch = Some(branch.to_string());
+        w.slug = Some(branch.replace('/', "-"));
+        w.has_worktree = false;
         w
     }
 
@@ -638,6 +657,28 @@ mod tests {
         assert!(!a.detail_visible());
         a.show_sidebar = false; // full-screen detail
         assert!(a.detail_visible());
+    }
+
+    #[test]
+    fn branch_rows_sort_below_worktrees_and_filter_by_name() {
+        use super::testutil::branch_row;
+        let mut a = app(&[("main", true), ("zebra", false)]);
+        a.worktrees.push(branch_row("feature/lonely"));
+        // A resort groups branch rows below the worktrees (issue #47).
+        a.resort_preserving_selection();
+        let order: Vec<&str> = a
+            .visible
+            .iter()
+            .map(|&i| a.worktrees[i].branch.as_deref().unwrap())
+            .collect();
+        assert_eq!(order, vec!["main", "zebra", "feature/lonely"]);
+        // The branch row matches on its name even though its path is virtual.
+        a.apply_filter("lonely".into());
+        assert_eq!(a.visible.len(), 1);
+        assert_eq!(
+            a.selected_worktree().unwrap().branch.as_deref(),
+            Some("feature/lonely")
+        );
     }
 
     #[test]

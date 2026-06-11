@@ -23,7 +23,7 @@ use crate::tui::app::{App, AppConfig, Mode, PrComposeState, PrItem, StatusKind};
 use crate::tui::event::Effect;
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
-use crate::worktree_service::{build_worktrees, enumerate_worktrees};
+use crate::worktree_service::{build_rows, enumerate_rows};
 
 /// Builds the [`AppConfig`] from the resolved configuration and the resolved
 /// color decision (spec §11 precedence).
@@ -70,9 +70,10 @@ pub fn run_pr_picker(cx: &mut Cx) -> Result<Option<PathBuf>> {
     drive_tui(cx, &session, app, Effect::FetchPrs)
 }
 
-/// Builds the [`App`] over the session's worktrees, seeding the branch list.
+/// Builds the [`App`] over the session's worktrees plus worktree-less branch
+/// rows (issue #47), seeding the branch list.
 fn build_app(cx: &Cx, session: &Session, git: &dyn GitCli) -> Result<App> {
-    let sync_worktrees = enumerate_worktrees(&session.repo, git)?;
+    let sync_worktrees = enumerate_rows(&session.repo, git)?;
     let size = crossterm::terminal::size().unwrap_or((100, 30));
     // The TUI draws to the alternate screen on stderr, so resolve color against
     // stderr (stdout is reserved for the chosen path and is usually piped).
@@ -189,6 +190,14 @@ fn dispatch_effect(
             tui.resume()?;
             Ok(false)
         }
+        Effect::MaterializeBranch { branch } => {
+            tui.suspend()?;
+            do_materialize_branch(cx, session, app, branch);
+            tui.resume()?;
+            // On success the new worktree is recorded as `chosen`; exit the loop
+            // so the wrapper `cd`s into it (issue #47).
+            Ok(app.chosen.is_some())
+        }
         Effect::CheckoutPr(number) => {
             tui.suspend()?;
             do_checkout_pr(cx, session, app, number);
@@ -223,7 +232,7 @@ fn spawn_enrichment(
 ) {
     tokio::task::spawn_blocking(move || {
         if let Ok(repo) = Repo::discover(&root)
-            && let Ok(worktrees) = build_worktrees(&repo, git.as_ref())
+            && let Ok(worktrees) = build_rows(&repo, git.as_ref())
         {
             let _ = tx.blocking_send(worktrees);
         }
@@ -248,7 +257,7 @@ pub(crate) fn do_refresh(cx: &Cx, app: &mut App, root: &Path) {
         if let Ok(branches) = crate::git::all_branches(repo.gix()) {
             app.branches = branches;
         }
-        if let Ok(worktrees) = build_worktrees(&repo, git.as_ref()) {
+        if let Ok(worktrees) = build_rows(&repo, git.as_ref()) {
             mark_all_loaded(app, worktrees);
         }
     }
@@ -341,6 +350,39 @@ pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: us
     }
     app.mode = Mode::List;
     do_refresh(cx, app, &session.primary_root);
+}
+
+/// Materializes a worktree for an existing worktree-less branch and switches into
+/// it (issue #47): creates the worktree via the `new` path (which checks out an
+/// existing branch as-is), refreshes, then records the new worktree as `chosen`
+/// so the loop exits and the wrapper `cd`s into it. Errors show in the status bar.
+pub(crate) fn do_materialize_branch(cx: &mut Cx, session: &Session, app: &mut App, branch: String) {
+    let args = NewArgs {
+        branch: branch.clone(),
+        from: None,
+        track: None,
+        no_track: false,
+        no_switch: true,
+        no_hooks: false,
+        copy_from: None,
+    };
+    match commands::new::run(cx, &RealHookRunner, &args, false) {
+        Ok(_) => {
+            app.set_status(format!("created {branch}"), StatusKind::Success);
+            do_refresh(cx, app, &session.primary_root);
+            // Switch into the freshly created worktree for this branch.
+            if let Some(path) = app
+                .worktrees
+                .iter()
+                .find(|w| w.has_worktree && w.branch.as_deref() == Some(branch.as_str()))
+                .map(|w| w.path.clone())
+            {
+                app.chosen = Some(path);
+            }
+        }
+        Err(e) => app.set_status(e.to_string(), StatusKind::Error),
+    }
+    app.mode = Mode::List;
 }
 
 /// Checks out a PR into a worktree. When `app.exit_on_pr_checkout` is set (the
@@ -695,7 +737,7 @@ mod tests {
     fn setup(repo: &TestRepo) -> (crate::testutil::TestCx, Session, App) {
         let t = test_cx(&[], repo.root().to_str().unwrap());
         let session = open_session(&t.cx, &crate::git::RealGit).unwrap();
-        let worktrees = build_worktrees(&session.repo, &crate::git::RealGit).unwrap();
+        let worktrees = build_rows(&session.repo, &crate::git::RealGit).unwrap();
         let app = App::new(worktrees, app_config(&session.config, true), (100, 30));
         (t, session, app)
     }
@@ -761,11 +803,63 @@ mod tests {
             .position(|w| w.branch.as_deref() == Some("feature/x"))
             .unwrap();
         do_remove(&mut t.cx, &session, &mut app, index);
+        // The worktree is gone; the branch itself survives (not wt-created) and now
+        // shows as a worktree-less branch row, so assert on the worktree row only.
         assert!(
             !app.worktrees
                 .iter()
-                .any(|w| w.branch.as_deref() == Some("feature/x"))
+                .any(|w| w.has_worktree && w.branch.as_deref() == Some("feature/x"))
         );
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| !w.has_worktree && w.branch.as_deref() == Some("feature/x"))
+        );
+    }
+
+    #[test]
+    fn do_materialize_branch_creates_worktree_and_switches() {
+        // A worktree-less branch (issue #47): materializing it creates a worktree,
+        // refreshes so the row becomes a real worktree, and records it as `chosen`.
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]);
+        let (mut t, session, mut app) = setup(&repo);
+        // Precondition: `topic` starts as a branch row with no worktree.
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| !w.has_worktree && w.branch.as_deref() == Some("topic"))
+        );
+        app.mode = Mode::ConfirmCreate(0);
+        do_materialize_branch(&mut t.cx, &session, &mut app, "topic".into());
+        assert_eq!(app.mode, Mode::List);
+        let chosen = app.chosen.clone().expect("chosen path set on materialize");
+        assert!(chosen.is_dir());
+        // `topic` is now a real worktree row, not a branch row.
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.has_worktree && w.branch.as_deref() == Some("topic"))
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("created topic")
+        );
+    }
+
+    #[test]
+    fn do_materialize_branch_error_shows_in_status() {
+        // Creating a worktree for a branch that is already checked out elsewhere
+        // fails; the error surfaces in the status bar and nothing is chosen.
+        let repo = TestRepo::init();
+        repo.add_worktree("dup", "../manual-dup");
+        let (mut t, session, mut app) = setup(&repo);
+        do_materialize_branch(&mut t.cx, &session, &mut app, "dup".into());
+        assert!(app.chosen.is_none());
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert!(app.status_message.is_some());
     }
 
     #[test]
