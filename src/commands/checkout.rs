@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use crate::cli::CheckoutArgs;
-use crate::commands::{Session, emit_worktree, open_session, same_path};
+use crate::commands::{Session, emit_worktree, maybe_init_submodules, open_session, same_path};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
@@ -45,8 +45,15 @@ pub fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
         .repo
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
-    let outcome =
-        checkout_branch_in_worktree(cx, git, &session, &worktree_dir, &args.branch, args.force)?;
+    let outcome = checkout_branch_in_worktree(
+        cx,
+        git,
+        &session,
+        &worktree_dir,
+        &args.branch,
+        args.force,
+        args.submodule_override(),
+    )?;
     log_sync_outcome(cx, &args.branch, outcome);
     emit_worktree(
         cx,
@@ -67,6 +74,7 @@ pub(crate) fn checkout_branch_in_worktree(
     worktree_dir: &Path,
     branch: &str,
     force: bool,
+    submodule_override: Option<bool>,
 ) -> Result<SyncOutcome> {
     let repo = &session.repo;
     let remote = session.config.pr_default_remote.clone();
@@ -140,7 +148,17 @@ pub(crate) fn checkout_branch_in_worktree(
     argv.push(branch);
     git.run(worktree_dir, &argv)?;
 
-    sync_with_upstream(cx, git, worktree_dir, branch, fetch_skipped)
+    let outcome = sync_with_upstream(cx, git, worktree_dir, branch, fetch_skipped)?;
+    // Switching can introduce new submodule definitions (issue #50); initialize
+    // them when the policy (or `--init-submodules`) asks. Non-fatal.
+    maybe_init_submodules(
+        cx,
+        git,
+        worktree_dir,
+        session.config.submodules_init,
+        submodule_override,
+    )?;
+    Ok(outcome)
 }
 
 /// After a checkout, fast-forwards `branch` to its upstream when strictly behind;
@@ -257,12 +275,24 @@ mod tests {
             branch: branch.to_string(),
             no_switch: false,
             force: false,
+            init_submodules: false,
+            no_init_submodules: false,
         }
     }
 
     /// Calls the shared core against `repo`'s current worktree, returning the
     /// test context (for stdout/stderr) and the result.
     fn checkout(repo: &TestRepo, branch: &str, force: bool) -> (TestCx, Result<SyncOutcome>) {
+        checkout_with_submodules(repo, branch, force, None)
+    }
+
+    /// Like [`checkout`] but with an explicit submodule-init override.
+    fn checkout_with_submodules(
+        repo: &TestRepo,
+        branch: &str,
+        force: bool,
+        submodule_override: Option<bool>,
+    ) -> (TestCx, Result<SyncOutcome>) {
         let mut t = test_cx(&[], repo.root().to_str().unwrap());
         let git = t.cx.git.clone();
         let session = open_session(&t.cx, git.as_ref()).unwrap();
@@ -274,6 +304,7 @@ mod tests {
             &dir,
             branch,
             force,
+            submodule_override,
         );
         (t, res)
     }
@@ -508,6 +539,39 @@ mod tests {
             repo.root()
         ));
         assert_eq!(current_branch(&repo), "topic");
+    }
+
+    /// A repo with a submodule committed on `main` and a `topic` branch sharing
+    /// it, then deinitialized so it reports as uninitialized while keeping its
+    /// objects under `.git/modules` (so init reuses them, no file-protocol clone).
+    fn repo_with_uninitialized_submodule_on_topic() -> TestRepo {
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        repo.git(&["branch", "topic"]);
+        repo.deinit_submodule("libs/sub");
+        repo
+    }
+
+    #[test]
+    fn checkout_initializes_submodules_when_enabled() {
+        // Switching to a branch with an uninitialized submodule, with init forced
+        // on, populates it (issue #50 — "new module definitions on branch switch").
+        let repo = repo_with_uninitialized_submodule_on_topic();
+        let (t, res) = checkout_with_submodules(&repo, "topic", false, Some(true));
+        assert!(res.is_ok());
+        assert_eq!(current_branch(&repo), "topic");
+        assert!(repo.root().join("libs/sub/sub.txt").exists());
+        assert!(t.err.contents().contains("initializing 1 submodule"));
+    }
+
+    #[test]
+    fn checkout_default_leaves_submodules_uninitialized() {
+        let repo = repo_with_uninitialized_submodule_on_topic();
+        let (t, res) = checkout(&repo, "topic", false);
+        assert!(res.is_ok());
+        assert_eq!(current_branch(&repo), "topic");
+        assert!(!repo.root().join("libs/sub/sub.txt").exists());
+        assert!(!t.err.contents().contains("initializing"));
     }
 
     #[test]

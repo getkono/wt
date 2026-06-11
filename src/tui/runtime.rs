@@ -477,6 +477,10 @@ fn run_create_command(
         no_switch: true,
         no_hooks: false,
         copy_from: None,
+        // No per-invocation override in the TUI; the `[submodules] init` policy
+        // (loaded by the rebuilt session) decides (issue #50).
+        init_submodules: false,
+        no_init_submodules: false,
     };
     commands::new::run(cx, &CapturingHookRunner, &args, false)
         .map(|_| ())
@@ -538,6 +542,8 @@ fn run_checkout_branch_command(
         worktree_dir,
         branch,
         false,
+        // No per-invocation override in the TUI; `[submodules] init` decides.
+        None,
     )
     .map_err(|e| e.to_string())
 }

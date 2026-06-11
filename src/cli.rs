@@ -122,6 +122,21 @@ pub struct NewArgs {
     /// Override the source worktree for the copy step.
     #[arg(long = "copy-from", value_name = "QUERY")]
     pub copy_from: Option<String>,
+    /// Initialize git submodules after creating the worktree (overrides config).
+    #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
+    pub init_submodules: bool,
+    /// Do not initialize git submodules (overrides `[submodules] init`).
+    #[arg(long = "no-init-submodules")]
+    pub no_init_submodules: bool,
+}
+
+impl NewArgs {
+    /// Resolves the submodule-init flags to an override for the config policy:
+    /// `Some(true)` for `--init-submodules`, `Some(false)` for
+    /// `--no-init-submodules`, `None` when neither is given (config decides).
+    pub fn submodule_override(&self) -> Option<bool> {
+        submodule_override(self.init_submodules, self.no_init_submodules)
+    }
 }
 
 /// Arguments for `wt checkout`.
@@ -135,6 +150,30 @@ pub struct CheckoutArgs {
     /// Discard uncommitted changes and switch anyway.
     #[arg(long)]
     pub force: bool,
+    /// Initialize git submodules after checking out (overrides config).
+    #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
+    pub init_submodules: bool,
+    /// Do not initialize git submodules (overrides `[submodules] init`).
+    #[arg(long = "no-init-submodules")]
+    pub no_init_submodules: bool,
+}
+
+impl CheckoutArgs {
+    /// Resolves the submodule-init flags to an override for the config policy
+    /// (see [`NewArgs::submodule_override`]).
+    pub fn submodule_override(&self) -> Option<bool> {
+        submodule_override(self.init_submodules, self.no_init_submodules)
+    }
+}
+
+/// Maps the mutually-exclusive `--init-submodules`/`--no-init-submodules` flag
+/// pair to an `Option<bool>` override: `Some(true)`, `Some(false)`, or `None`.
+fn submodule_override(init: bool, no_init: bool) -> Option<bool> {
+    match (init, no_init) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
 }
 
 /// Arguments for `wt list`.

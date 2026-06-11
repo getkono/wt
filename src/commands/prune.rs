@@ -351,6 +351,8 @@ mod tests {
                 no_switch: true,
                 no_hooks: true,
                 copy_from: None,
+                init_submodules: false,
+                no_init_submodules: false,
             },
             false,
         )

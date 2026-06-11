@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::NewArgs;
 use crate::commands::{
-    emit_worktree, open_session, render_target, resolve_target, rollback_worktree, same_path,
+    emit_worktree, maybe_init_submodules, open_session, render_target, resolve_target,
+    rollback_worktree, same_path,
 };
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
@@ -148,6 +149,16 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> R
         args.no_hooks,
     )?;
 
+    // Initialize submodules when the policy (or `--init-submodules`) asks for it
+    // (issue #50). Non-fatal — the worktree already exists.
+    maybe_init_submodules(
+        cx,
+        git,
+        &target,
+        session.config.submodules_init,
+        args.submodule_override(),
+    )?;
+
     emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
 }
 
@@ -241,6 +252,8 @@ mod tests {
             no_switch: false,
             no_hooks: true,
             copy_from: None,
+            init_submodules: false,
+            no_init_submodules: false,
         }
     }
 
@@ -445,6 +458,53 @@ mod tests {
         assert_eq!(std::fs::read_to_string(env_path).unwrap(), "SECRET=1\n");
         // Silent at the default verbosity (spec §8).
         assert!(!err.contains("copied"));
+    }
+
+    /// A repo with a committed submodule on `main`, so a new worktree inherits
+    /// the `.gitmodules` definition (uninitialized until populated).
+    fn repo_with_submodule() -> TestRepo {
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        repo
+    }
+
+    #[test]
+    fn new_default_does_not_init_submodules() {
+        let repo = repo_with_submodule();
+        let (code, out, err) = run(&repo, &args("feat"), false);
+        assert_eq!(code, 0);
+        // No policy/flag: submodules are left alone and nothing is logged.
+        assert!(!err.contains("initializing"));
+        assert!(!Path::new(out.trim()).join("libs/sub/sub.txt").exists());
+    }
+
+    #[test]
+    fn new_init_submodules_flag_runs_init() {
+        let repo = repo_with_submodule();
+        let mut a = args("feat");
+        a.init_submodules = true;
+        let (code, _out, err) = run(&repo, &a, false);
+        // `--init-submodules` runs the init (non-fatal even if a file-protocol
+        // clone is later refused), proving `new` wires the policy through.
+        assert_eq!(code, 0);
+        assert!(err.contains("initializing 1 submodule"));
+    }
+
+    #[test]
+    fn new_no_init_submodules_flag_overrides_always_config() {
+        let repo = repo_with_submodule();
+        std::fs::write(
+            repo.root().join(".wt.toml"),
+            "[submodules]\ninit = \"always\"\n",
+        )
+        .unwrap();
+        let mut a = args("feat");
+        a.no_init_submodules = true;
+        let (code, out, err) = run(&repo, &a, false);
+        assert_eq!(code, 0);
+        // The flag overrides `init = "always"`: no init runs.
+        assert!(!err.contains("initializing"));
+        assert!(!Path::new(out.trim()).join("libs/sub/sub.txt").exists());
     }
 
     #[test]

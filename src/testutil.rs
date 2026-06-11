@@ -400,6 +400,48 @@ impl TestRepo {
         run_git(&self.root, &["add", "-A"]);
         run_git(&self.root, &["commit", "-q", "-m", message]);
     }
+
+    /// Adds a submodule at `path` sourced from a throwaway sibling repo, commits
+    /// it, and returns the source repo path. The source lives inside this repo's
+    /// temp dir, so it is cleaned up on drop. File-protocol submodules are blocked
+    /// by default, so the `add` opts in via `protocol.file.allow=always`; the
+    /// source's objects then live under `.git/modules`, which lets a later
+    /// `git submodule update --init` reuse them (no second file-protocol clone) —
+    /// the production command never needs that opt-in.
+    pub(crate) fn add_submodule(&self, path: &str) -> PathBuf {
+        let src = self
+            .root
+            .parent()
+            .expect("temp dir")
+            .join(format!("{}-src", path.replace('/', "-")));
+        std::fs::create_dir_all(&src).expect("mkdir submodule src");
+        run_git(&src, &["init", "-q", "-b", "main"]);
+        std::fs::write(src.join("sub.txt"), "submodule\n").expect("write sub file");
+        run_git(&src, &["add", "-A"]);
+        run_git(&src, &["commit", "-q", "-m", "submodule init"]);
+        let src_str = src.to_string_lossy().into_owned();
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &src_str,
+                path,
+            ],
+        );
+        self.commit_all("add submodule");
+        src
+    }
+
+    /// Deinitializes the submodule at `path`: empties its working tree and clears
+    /// its configured URL so it reports as uninitialized, while keeping its
+    /// objects under `.git/modules` so it can be re-initialized without another
+    /// file-protocol clone.
+    pub(crate) fn deinit_submodule(&self, path: &str) {
+        run_git(&self.root, &["submodule", "deinit", "-q", "-f", path]);
+    }
 }
 
 /// Runs `git -C <dir> <args>` with isolated config and identity, asserting
