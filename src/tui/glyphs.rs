@@ -2,6 +2,11 @@
 //! fallbacks (the default) match the `wt list` markers; Nerd Font glyphs are an
 //! optional, purely cosmetic alternative.
 
+/// Braille busy-spinner frames (Nerd Font); cycled by a frame counter.
+const SPINNER_NERD: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// ASCII busy-spinner frames (the default).
+const SPINNER_ASCII: [&str; 4] = ["-", "\\", "|", "/"];
+
 /// A glyph set, ASCII by default or Nerd Font when enabled.
 pub struct Glyphs {
     nerd: bool,
@@ -16,6 +21,27 @@ impl Glyphs {
     /// The per-field loading spinner.
     pub fn spinner(&self) -> &'static str {
         "…"
+    }
+
+    /// The animated busy-spinner frame for `tick`, wrapping around the active
+    /// frame set (Nerd Font braille or the ASCII fallback). Drives the in-TUI
+    /// overlay shown while a shell-based action runs (issue #46).
+    pub fn spinner_frame(&self, tick: usize) -> &'static str {
+        let set: &[&str] = if self.nerd {
+            &SPINNER_NERD
+        } else {
+            &SPINNER_ASCII
+        };
+        set[tick % set.len()]
+    }
+
+    /// The number of frames in the active busy-spinner set.
+    pub fn spinner_frame_count(&self) -> usize {
+        if self.nerd {
+            SPINNER_NERD.len()
+        } else {
+            SPINNER_ASCII.len()
+        }
     }
 
     /// The "field unavailable" placeholder.
@@ -81,5 +107,27 @@ mod tests {
         assert_ne!(ascii.branchless(), nerd.branchless());
         // The spinner/absent are shared across both.
         assert_eq!(ascii.spinner(), nerd.spinner());
+    }
+
+    #[test]
+    fn spinner_frame_wraps_and_advances() {
+        for nerd in [false, true] {
+            let g = Glyphs::new(nerd);
+            let count = g.spinner_frame_count();
+            // Wraps around after a full cycle.
+            assert_eq!(g.spinner_frame(0), g.spinner_frame(count));
+            // Consecutive frames differ within a cycle.
+            assert_ne!(g.spinner_frame(0), g.spinner_frame(1));
+        }
+        assert_eq!(Glyphs::new(true).spinner_frame_count(), 10);
+        assert_eq!(Glyphs::new(false).spinner_frame_count(), 4);
+    }
+
+    #[test]
+    fn spinner_frames_differ_nerd_vs_ascii() {
+        assert_ne!(
+            Glyphs::new(true).spinner_frame(2),
+            Glyphs::new(false).spinner_frame(2)
+        );
     }
 }

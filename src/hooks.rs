@@ -32,35 +32,61 @@ pub trait HookRunner {
     fn run(&self, command: &str, ctx: &HookContext) -> Result<i32>;
 }
 
-/// The production [`HookRunner`] that spawns a shell.
+/// Builds the shell [`Command`] for a hook: `sh -c` (Unix) / `cmd /C` (Windows),
+/// run in the worktree directory with the `WT_*` variables set. Shared by both
+/// runners so they differ only in how the child's stdio is handled.
+fn build_hook_command(command: &str, ctx: &HookContext) -> Command {
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", command]);
+        c
+    };
+    cmd.current_dir(&ctx.worktree_path);
+    cmd.env("WT_WORKTREE_PATH", &ctx.worktree_path);
+    cmd.env("WT_BRANCH", &ctx.branch);
+    cmd.env("WT_REPO_ROOT", &ctx.repo_root);
+    if let Some(base) = &ctx.base_ref {
+        cmd.env("WT_BASE_REF", base);
+    }
+    if let Some(pr) = ctx.pr_number {
+        cmd.env("WT_PR_NUMBER", pr.to_string());
+    }
+    cmd
+}
+
+/// The production [`HookRunner`] that spawns a shell and lets the hook inherit
+/// the terminal's stdio (so output is visible to the user on the CLI paths,
+/// which suspend the TUI first).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealHookRunner;
 
 impl HookRunner for RealHookRunner {
     fn run(&self, command: &str, ctx: &HookContext) -> Result<i32> {
-        let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
-        cmd.current_dir(&ctx.worktree_path);
-        cmd.env("WT_WORKTREE_PATH", &ctx.worktree_path);
-        cmd.env("WT_BRANCH", &ctx.branch);
-        cmd.env("WT_REPO_ROOT", &ctx.repo_root);
-        if let Some(base) = &ctx.base_ref {
-            cmd.env("WT_BASE_REF", base);
-        }
-        if let Some(pr) = ctx.pr_number {
-            cmd.env("WT_PR_NUMBER", pr.to_string());
-        }
-        let status = cmd
+        let status = build_hook_command(command, ctx)
             .status()
             .map_err(|e| Error::operation(format!("failed to run hook: {e}")))?;
         Ok(status.code().unwrap_or(-1))
+    }
+}
+
+/// A [`HookRunner`] that captures the hook's stdout/stderr instead of inheriting
+/// the terminal. Used by the TUI's background jobs (issue #46), which keep the
+/// alternate screen up and animate a spinner — inherited hook output would
+/// otherwise paint over the rendered UI. Behaviorally identical to
+/// [`RealHookRunner`] except the captured output is discarded.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapturingHookRunner;
+
+impl HookRunner for CapturingHookRunner {
+    fn run(&self, command: &str, ctx: &HookContext) -> Result<i32> {
+        let output = build_hook_command(command, ctx)
+            .output()
+            .map_err(|e| Error::operation(format!("failed to run hook: {e}")))?;
+        Ok(output.status.code().unwrap_or(-1))
     }
 }
 
@@ -175,6 +201,31 @@ mod tests {
         assert!(env.contains("WT_WORKTREE_PATH="));
         // WT_PR_NUMBER is unset when there is no PR.
         assert!(!env.contains("WT_PR_NUMBER"));
+    }
+
+    #[test]
+    fn capturing_runner_sets_wt_env_and_returns_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = CapturingHookRunner
+            .run("env | grep '^WT_' > wt_env.txt", &ctx(dir.path()))
+            .unwrap();
+        assert_eq!(code, 0);
+        let env = std::fs::read_to_string(dir.path().join("wt_env.txt")).unwrap();
+        assert!(env.contains("WT_BRANCH=feature/x"));
+        assert!(env.contains("WT_REPO_ROOT="));
+        assert!(env.contains("WT_BASE_REF=main"));
+        assert!(env.contains("WT_WORKTREE_PATH="));
+    }
+
+    #[test]
+    fn capturing_runner_captures_output_and_propagates_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        // The hook writes to stdout (captured, not inherited) and exits non-zero;
+        // the captured output is discarded but the exit code is returned.
+        let code = CapturingHookRunner
+            .run("echo noise; exit 4", &ctx(dir.path()))
+            .unwrap();
+        assert_eq!(code, 4);
     }
 
     #[test]

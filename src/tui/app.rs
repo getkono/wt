@@ -62,6 +62,17 @@ pub enum StatusKind {
     Error,
 }
 
+/// An in-flight background action (issue #46): the label to display and the
+/// animation frame. While set, the TUI shows a centered spinner overlay and
+/// ignores input until the action completes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyState {
+    /// The human-facing label, e.g. `Removing feat/foo` or `Creating feat/bar`.
+    pub label: String,
+    /// The monotonic spinner frame counter, advanced on each animation tick.
+    pub frame: usize,
+}
+
 /// The create-worktree prompt state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateState {
@@ -232,6 +243,10 @@ pub struct App {
     pub status_kind: StatusKind,
     /// Set when the terminal became too small to continue (spec §10).
     pub too_small: bool,
+    /// An in-flight background action (issue #46): `Some` while a shell-based
+    /// action runs on a background task, driving the spinner overlay and gating
+    /// input. `None` when idle.
+    pub busy: Option<BusyState>,
     /// Local + remote-tracking branch names offered in the create-prompt
     /// options dropdown and used to tab-complete the base ref (best-effort;
     /// empty when enumeration fails).
@@ -274,6 +289,7 @@ impl App {
             status_message: None,
             status_kind: StatusKind::Info,
             too_small: false,
+            busy: None,
             branches: Vec::new(),
             worktrees,
             visible,
@@ -304,6 +320,33 @@ impl App {
     pub fn set_status(&mut self, message: impl Into<String>, kind: StatusKind) {
         self.status_message = Some(message.into());
         self.status_kind = kind;
+    }
+
+    /// Marks a background action in flight with the given label (issue #46),
+    /// resetting the spinner to its first frame.
+    pub fn begin_busy(&mut self, label: impl Into<String>) {
+        self.busy = Some(BusyState {
+            label: label.into(),
+            frame: 0,
+        });
+    }
+
+    /// Advances the busy spinner one frame (called on each animation tick); a
+    /// no-op when no action is in flight.
+    pub fn tick_busy(&mut self) {
+        if let Some(busy) = &mut self.busy {
+            busy.frame = busy.frame.wrapping_add(1);
+        }
+    }
+
+    /// Clears the busy state once the background action completes.
+    pub fn end_busy(&mut self) {
+        self.busy = None;
+    }
+
+    /// Whether a background action is in flight (input is gated while set).
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
     }
 
     /// The currently selected worktree, if any.
@@ -688,5 +731,27 @@ mod tests {
         assert_eq!(a.selected, 1);
         a.select_row(99); // out of bounds -> no change
         assert_eq!(a.selected, 1);
+    }
+
+    #[test]
+    fn busy_lifecycle_begin_tick_end() {
+        let mut a = app(&[("a", true)]);
+        assert!(!a.is_busy());
+        a.begin_busy("Removing feat/foo");
+        assert!(a.is_busy());
+        assert_eq!(a.busy.as_ref().unwrap().frame, 0);
+        assert_eq!(a.busy.as_ref().unwrap().label, "Removing feat/foo");
+        a.tick_busy();
+        a.tick_busy();
+        assert_eq!(a.busy.as_ref().unwrap().frame, 2);
+        a.end_busy();
+        assert!(!a.is_busy());
+    }
+
+    #[test]
+    fn tick_busy_is_noop_when_idle() {
+        let mut a = app(&[("a", true)]);
+        a.tick_busy();
+        assert!(!a.is_busy());
     }
 }
