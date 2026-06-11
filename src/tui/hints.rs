@@ -99,6 +99,13 @@ pub fn confirm_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Confirm-create dialog hints: `y` creates a worktree for the branch row and
+/// switches into it; any other key cancels (issue #47).
+pub fn confirm_create_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[hint("y", "create & switch"), hint("Esc", "cancel")];
+    HINTS
+}
+
 /// Help-overlay hints.
 pub fn help_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[hint("any key", "close")];
@@ -143,6 +150,7 @@ mod tests {
             compose_edit_hints(),
             checkout_hints(),
             confirm_hints(),
+            confirm_create_hints(),
             help_hints(),
         ];
         for table in tables {
@@ -236,6 +244,7 @@ mod tests {
                 });
             }
             "confirm" => a.mode = Mode::ConfirmRemove(0),
+            "confirm_create" => a.mode = Mode::ConfirmCreate(0),
             "help" => a.mode = Mode::Help,
             other => panic!("unknown mode {other}"),
         }
@@ -274,6 +283,7 @@ mod tests {
         assert_hints_live("compose", compose_edit_hints());
         assert_hints_live("checkout", checkout_hints());
         assert_hints_live("confirm", confirm_hints());
+        assert_hints_live("confirm_create", confirm_create_hints());
         assert_hints_live("help", help_hints());
     }
 }

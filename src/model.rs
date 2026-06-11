@@ -53,6 +53,13 @@ pub struct Worktree {
     pub commit: Option<Commit>,
     /// Recorded pull request; `None` when none.
     pub pr: Option<Pr>,
+    /// Whether a checked-out worktree exists for this row. `false` marks a
+    /// TUI-only "branch row": a local branch with no worktree, listed beneath the
+    /// real worktrees with its ahead/behind relative to its base (issue #47). Not
+    /// part of the §7 JSON schema (where every row is a real worktree), so it is
+    /// skipped during serialization and always `true` for serialized rows.
+    #[serde(skip)]
+    pub has_worktree: bool,
     /// Up to the last five commits, for the TUI detail pane only. Not part of
     /// the §7 JSON schema (which carries only the tip `commit`), so it is skipped
     /// during serialization.
@@ -72,8 +79,9 @@ pub struct Worktree {
 
 impl Worktree {
     /// Builds a worktree row with the given absolute path and all other fields
-    /// at their defaults (no branch, all flags false, all optionals `None`).
-    /// Callers populate the remaining fields.
+    /// at their defaults (no branch, all flags false, all optionals `None`, and
+    /// `has_worktree` true — a real checkout). Callers populate the remaining
+    /// fields.
     pub fn new(path: PathBuf) -> Self {
         Worktree {
             schema_version: SCHEMA_VERSION,
@@ -92,6 +100,7 @@ impl Worktree {
             base_ref: None,
             commit: None,
             pr: None,
+            has_worktree: true,
             recent_commits: Vec::new(),
             pr_url: None,
             merge_state: None,
@@ -379,6 +388,7 @@ mod tests {
                 state: PrState::Open,
                 title: "Add login page".into(),
             }),
+            has_worktree: true,
             recent_commits: Vec::new(),
             pr_url: None,
             merge_state: None,
@@ -416,6 +426,16 @@ mod tests {
         assert_eq!(v["branch"], serde_json::json!("feature/x"));
         assert_eq!(v["base_ref"], serde_json::json!("main"));
         assert_eq!(v["is_missing"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn has_worktree_defaults_true_and_is_not_serialized() {
+        // A fresh row is a real worktree, and the TUI-only flag never leaks into
+        // the stable §7 JSON schema (issue #47).
+        let wt = Worktree::new(PathBuf::from("/r"));
+        assert!(wt.has_worktree);
+        let v = serde_json::to_value(&wt).unwrap();
+        assert!(v.get("has_worktree").is_none());
     }
 
     #[test]

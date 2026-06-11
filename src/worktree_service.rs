@@ -5,7 +5,8 @@
 //! that the TUI loads asynchronously (dirty/untracked, ahead/behind, commit, PR).
 //! Also defines the remove/prune guards (spec §10/§12) shared by the CLI and TUI.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::config::wtconfig::{self, WtMeta};
 use crate::error::Result;
@@ -13,7 +14,7 @@ use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
     Upstream, abbrev_len, ahead_behind, commit_info, default_branch, enumerate, is_ancestor,
-    recent_commits, resolve_hex, status_of, upstream_of,
+    local_branches, recent_commits, resolve_hex, status_of, upstream_of,
 };
 use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
@@ -219,6 +220,117 @@ pub fn build_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     Ok(worktrees)
 }
 
+/// The virtual path key for a worktree-less branch row (issue #47). A branch row
+/// has no checkout, so this stable, non-filesystem sentinel exists only to key
+/// the row uniquely (selection and async-load tracking are path-keyed); it is
+/// never shown to the user or used as a real path.
+fn branch_row_path(branch: &str) -> PathBuf {
+    PathBuf::from(format!("branch://{branch}"))
+}
+
+/// The local branches that have no worktree, given the already-enumerated
+/// worktrees (issue #47). Best-effort: an empty list when branch enumeration
+/// fails.
+fn branchless_local_branches(repo: &Repo, worktrees: &[Worktree]) -> Vec<String> {
+    let checked_out: HashSet<&str> = worktrees
+        .iter()
+        .filter_map(|w| w.branch.as_deref())
+        .collect();
+    local_branches(repo.gix())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !checked_out.contains(name.as_str()))
+        .collect()
+}
+
+/// A bare (synchronous) branch row: branch name + slug only, marked
+/// worktree-less. The async fields (ahead/behind, commit) load later via
+/// [`enrich_branch_row`], so it renders with spinners first like a worktree row.
+fn branch_row(branch: &str) -> Worktree {
+    let mut row = Worktree::new(branch_row_path(branch));
+    row.has_worktree = false;
+    row.branch = Some(branch.to_string());
+    row.slug = Some(slugify(branch));
+    row
+}
+
+/// Fills a worktree-less branch row's asynchronously-loaded fields (issue #47):
+/// base ref + PR from `wt.*` config, the configured upstream (informational
+/// only), the tip commit, and — the point of the row — its ahead/behind relative
+/// to its base. The base is the recorded `wt.<branch>.baseRef`, falling back to
+/// the repo's default branch; ahead/behind is left unset when no base resolves.
+/// Best-effort, mirroring [`enrich_worktree`].
+fn enrich_branch_row(repo: &Repo, git: &dyn GitCli, abbrev: usize, row: &mut Worktree) {
+    let Some(branch) = row.branch.clone() else {
+        return;
+    };
+    let meta = wtconfig::read_meta(repo.gix(), &branch);
+    row.base_ref = meta.base_ref.clone();
+    row.pr = build_pr(&meta);
+    row.pr_url = meta.pr_url.clone();
+    if let Some(up) = upstream_of(repo.gix(), &branch) {
+        row.upstream = Some(up.display);
+    }
+
+    // Ahead/behind relative to the base (recorded base, else the default
+    // branch); refs resolve repo-globally, so it runs from any worktree dir.
+    let branch_ref = format!("refs/heads/{branch}");
+    let dir = repo.current_workdir().unwrap_or_else(|| repo.git_dir());
+    if let Some(base) = row.base_ref.clone().or_else(|| default_branch(repo.gix()))
+        && base != branch
+        && resolve_hex(repo.gix(), &base).is_some()
+        && let Ok((ahead, behind)) = ahead_behind(git, &dir, &base, &branch_ref)
+    {
+        row.ahead = Some(ahead);
+        row.behind = Some(behind);
+    }
+
+    if let Some(oid) = resolve_hex(repo.gix(), &branch_ref) {
+        if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
+            row.commit = Some(Commit {
+                hash: info.hash,
+                subject: info.subject,
+                author: info.author,
+                timestamp: iso8601(info.timestamp_unix),
+            });
+        }
+        row.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
+            .into_iter()
+            .map(|info| Commit {
+                hash: info.hash,
+                subject: info.subject,
+                author: info.author,
+                timestamp: iso8601(info.timestamp_unix),
+            })
+            .collect();
+    }
+}
+
+/// Enumerates worktrees plus the synchronous, unenriched branch rows for every
+/// local branch without a worktree (issue #47) — the immediate listing the TUI
+/// paints before async enrichment fills in ahead/behind. Branch rows render with
+/// spinners until [`build_rows`] replaces them.
+pub fn enumerate_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+    let mut rows = enumerate_worktrees(repo, git)?;
+    let names = branchless_local_branches(repo, &rows);
+    rows.extend(names.iter().map(|name| branch_row(name)));
+    Ok(rows)
+}
+
+/// Builds fully-enriched worktrees plus enriched worktree-less branch rows
+/// (issue #47): the TUI's complete listing, loaded off the event loop. The CLI
+/// uses [`build_worktrees`] (worktrees only); branch rows are TUI-only.
+pub fn build_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+    let mut rows = build_worktrees(repo, git)?;
+    let abbrev = abbrev_len(repo.gix());
+    for name in branchless_local_branches(repo, &rows) {
+        let mut row = branch_row(&name);
+        enrich_branch_row(repo, git, abbrev, &mut row);
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 /// A comparable sort key value (text or numeric).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum SortValue {
@@ -284,14 +396,19 @@ pub fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) 
     });
 }
 
-/// Sorts worktrees by `spec`, then pins the primary ("base") worktree to the
+/// Sorts worktrees by `spec`, groups any worktree-less branch rows (issue #47)
+/// below the real worktrees, then pins the primary ("base") worktree to the
 /// front so the TUI always shows it first regardless of the active sort
 /// (issue #4). The CLI's `list` calls [`sort_worktrees`] directly and keeps the
-/// pure `--sort` order.
+/// pure `--sort` order (it never has branch rows).
 pub fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
     sort_worktrees(worktrees, spec);
+    // Branch rows always sit beneath the real worktrees, each group keeping its
+    // sorted order (`sort_by_key` is stable; `false` < `true` ranks worktrees
+    // first). A no-op when there are no branch rows (the CLI path).
+    worktrees.sort_by_key(|w| !w.has_worktree);
     // Stable move-to-front of the primary worktree, preserving the sorted order
-    // of the remaining rows.
+    // of the remaining rows (the primary is always a real worktree).
     if let Some(pos) = worktrees.iter().position(|w| w.is_main) {
         worktrees[..=pos].rotate_right(1);
     }
@@ -561,6 +678,116 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let worktrees = build_worktrees(&r, &RealGit).unwrap();
         assert!(worktrees.is_empty());
+    }
+
+    #[test]
+    fn build_rows_includes_branchless_branches_with_ahead_behind() {
+        let repo = TestRepo::init();
+        // `feat` is one commit ahead of `main` (the default branch) and has no
+        // worktree (issue #47).
+        divergent_branch(&repo, "feat");
+        let r = Repo::discover(repo.root()).unwrap();
+        let rows = build_rows(&r, &RealGit).unwrap();
+
+        let main = rows.iter().find(|w| w.is_main).unwrap();
+        assert!(main.has_worktree);
+        let feat = rows
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("feat"))
+            .unwrap();
+        assert!(!feat.has_worktree);
+        assert_eq!(feat.slug.as_deref(), Some("feat"));
+        // Ahead/behind is measured against the base (here the default branch).
+        assert_eq!(feat.ahead, Some(1));
+        assert_eq!(feat.behind, Some(0));
+        // The tip commit loads for the detail pane.
+        assert_eq!(feat.commit.as_ref().unwrap().subject, "diverge");
+    }
+
+    #[test]
+    fn build_rows_excludes_checked_out_branches() {
+        let repo = TestRepo::init();
+        repo.add_worktree("feature/x", "../wt-x");
+        let r = Repo::discover(repo.root()).unwrap();
+        let rows = build_rows(&r, &RealGit).unwrap();
+        // `feature/x` has a worktree, so it appears once — as a worktree row, never
+        // also as a branch row.
+        let matches: Vec<_> = rows
+            .iter()
+            .filter(|w| w.branch.as_deref() == Some("feature/x"))
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].has_worktree);
+    }
+
+    #[test]
+    fn branch_row_ahead_behind_uses_recorded_base_not_default() {
+        // main advances past the fork point; `topic` forks from `develop` and adds
+        // a commit. Measured against the recorded base (develop) topic is 1/0;
+        // against the default branch (main) it would be 1/1 — so the counts prove
+        // the recorded base is honored (issue #47).
+        let repo = TestRepo::init(); // main @ c0
+        repo.git(&["branch", "develop"]); // develop @ c0
+        repo.write("m.txt", "1\n");
+        repo.commit_all("c1"); // main @ c1
+        repo.git(&["checkout", "-q", "-b", "topic", "develop"]); // topic @ c0
+        repo.write("t.txt", "x\n");
+        repo.commit_all("t1"); // topic @ t1 (parent c0)
+        repo.git(&["checkout", "-q", "main"]);
+        wtconfig::write_base_ref(&RealGit, repo.root(), "topic", "develop").unwrap();
+
+        let r = Repo::discover(repo.root()).unwrap();
+        let rows = build_rows(&r, &RealGit).unwrap();
+        let topic = rows
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("topic"))
+            .unwrap();
+        assert_eq!(topic.base_ref.as_deref(), Some("develop"));
+        assert_eq!(topic.ahead, Some(1));
+        assert_eq!(topic.behind, Some(0));
+    }
+
+    #[test]
+    fn enumerate_rows_adds_unenriched_branch_rows() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "lonely"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let rows = enumerate_rows(&r, &RealGit).unwrap();
+        let lonely = rows
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("lonely"))
+            .unwrap();
+        assert!(!lonely.has_worktree);
+        // The synchronous pass carries name + slug only; ahead/behind and the tip
+        // commit load later (the row shows spinners until then).
+        assert_eq!(lonely.slug.as_deref(), Some("lonely"));
+        assert!(lonely.ahead.is_none());
+        assert!(lonely.commit.is_none());
+    }
+
+    #[test]
+    fn sort_base_first_groups_branch_rows_below_worktrees() {
+        use crate::model::{SortKey, SortSpec};
+        let mut main = wt_named("main");
+        main.is_main = true;
+        let zebra = wt_named("zebra"); // a real worktree
+        let mut br_a = wt_named("aaa-branch");
+        br_a.has_worktree = false;
+        let mut br_z = wt_named("zzz-branch");
+        br_z.has_worktree = false;
+        let mut rows = vec![br_z, zebra, br_a, main];
+        sort_worktrees_base_first(
+            &mut rows,
+            SortSpec {
+                key: SortKey::Branch,
+                descending: false,
+            },
+        );
+        // Base first, then the other worktree, then the branch rows (sorted) last.
+        assert_eq!(
+            branches(&rows),
+            vec!["main", "zebra", "aaa-branch", "zzz-branch"]
+        );
     }
 
     fn guard_wt(dirty: Option<bool>, untracked: Option<bool>, ahead: Option<u32>) -> Worktree {

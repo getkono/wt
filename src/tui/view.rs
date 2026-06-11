@@ -52,6 +52,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::PrCompose(state) => render_pr_compose(app, state, frame, area),
         Mode::Checkout(state) => render_checkout(app, state, frame, area),
         Mode::ConfirmRemove(index) => render_confirm(app, *index, frame, area),
+        Mode::ConfirmCreate(index) => render_confirm_create(app, *index, frame, area),
         _ => {}
     }
 }
@@ -94,7 +95,9 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
                 app.show_untracked,
                 now,
             ));
-            if worktree.is_missing {
+            // Missing worktrees and worktree-less branch rows (issue #47) are both
+            // secondary, so they render dimmed.
+            if worktree.is_missing || !worktree.has_worktree {
                 item.style(Style::default().add_modifier(Modifier::DIM))
             } else {
                 item
@@ -111,18 +114,41 @@ fn render_list(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// The list-pane title: name, visible/total counts, and the active sort.
+/// The list-pane title: name, visible/total counts, the worktree-less branch
+/// count (issue #47), and the active sort.
 fn list_title(app: &App, theme: &Theme, focused: bool) -> Line<'static> {
-    let count = if app.visible.len() == app.worktrees.len() {
-        format!(" ({})", app.worktrees.len())
+    // Count worktrees and branch rows separately so the "worktrees (N)" tally
+    // never silently folds in the branch rows beneath them.
+    let wt_total = app.worktrees.iter().filter(|w| w.has_worktree).count();
+    let wt_visible = app
+        .visible
+        .iter()
+        .filter(|&&i| app.worktrees[i].has_worktree)
+        .count();
+    let count = if wt_visible == wt_total {
+        format!(" ({wt_total})")
     } else {
-        format!(" ({}/{})", app.visible.len(), app.worktrees.len())
+        format!(" ({wt_visible}/{wt_total})")
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("worktrees", theme.title(focused)),
         Span::styled(count, theme.label()),
-        Span::styled(format!(" · {}", sort_label(&app.sort)), theme.label()),
-    ])
+    ];
+    let br_total = app.worktrees.len() - wt_total;
+    if br_total > 0 {
+        let br_visible = app.visible.len() - wt_visible;
+        let branches = if br_visible == br_total {
+            format!(" · {br_total} branches")
+        } else {
+            format!(" · {br_visible}/{br_total} branches")
+        };
+        spans.push(Span::styled(branches, theme.label()));
+    }
+    spans.push(Span::styled(
+        format!(" · {}", sort_label(&app.sort)),
+        theme.label(),
+    ));
+    Line::from(spans)
 }
 
 /// A short label for the active sort field and direction (e.g. `branch ↑`).
@@ -148,7 +174,10 @@ fn list_row(
     show_untracked: bool,
     now: i64,
 ) -> Line<'static> {
-    let (status, status_style) = if worktree.is_current {
+    let (status, status_style) = if !worktree.has_worktree {
+        // A worktree-less branch row (issue #47): a branch with no checkout.
+        (glyphs.branchless(), theme.branchless())
+    } else if worktree.is_current {
         (glyphs.current(), theme.current())
     } else if worktree.is_missing {
         (glyphs.missing(), theme.missing())
@@ -163,9 +192,10 @@ fn list_row(
         (glyphs.dirty().to_string(), theme.dirty())
     } else if show_untracked && worktree.has_untracked == Some(true) {
         (glyphs.untracked().to_string(), theme.untracked())
-    } else if worktree.dirty.is_none() && !worktree.is_missing {
+    } else if worktree.dirty.is_none() && !worktree.is_missing && worktree.has_worktree {
         // Loaded but the status read failed: the absent marker, not a blank that
-        // would read as "clean" (spec §10).
+        // would read as "clean" (spec §10). A branch row has no working tree, so
+        // its `None` dirty is legitimate and stays blank (issue #47).
         (glyphs.absent().to_string(), theme.absent())
     } else {
         (" ".to_string(), Style::default())
@@ -271,6 +301,11 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
         );
         return;
     };
+    // A worktree-less branch row has its own (path-less) detail layout (issue #47).
+    if !worktree.has_worktree {
+        render_branch_detail(app, worktree, &theme, block, frame, area);
+        return;
+    }
     let now = now_unix();
     let glyphs = Glyphs::new(app.nerd_fonts);
     let mut lines: Vec<Line> = Vec::new();
@@ -355,6 +390,76 @@ fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             .end_symbol(None);
         frame.render_stateful_widget(scrollbar, area.inner(Margin::new(0, 1)), &mut sb_state);
     }
+}
+
+/// Renders the detail pane for a worktree-less branch row (issue #47): the
+/// worktree detail layout, but path-less and without working-tree status, with
+/// the ahead/behind labeled relative to the branch's base and a hint that Enter
+/// creates a worktree.
+fn render_branch_detail(
+    app: &App,
+    worktree: &Worktree,
+    theme: &Theme,
+    block: Block<'static>,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let now = now_unix();
+    let glyphs = Glyphs::new(app.nerd_fonts);
+    let loaded = app.is_loaded(worktree);
+    let branch_span = Span::styled(branch_display(worktree), theme.branch(false, false));
+    let mut lines: Vec<Line> = match &worktree.upstream {
+        Some(up) => vec![Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            branch_span,
+            Span::raw(" → "),
+            Span::styled(up.clone(), theme.accent()),
+        ])],
+        None => vec![Line::from(vec![
+            Span::styled("branch: ", theme.label()),
+            branch_span,
+            Span::styled(" (no upstream)", theme.label()),
+        ])],
+    };
+    lines.push(Line::from(Span::styled(
+        "(no worktree — press Enter to create one)",
+        theme.hint_label(),
+    )));
+    if let Some(base) = &worktree.base_ref {
+        lines.push(Line::from(vec![
+            Span::styled("base:   ", theme.label()),
+            Span::raw(base.clone()),
+        ]));
+    }
+    // Ahead/behind relative to the base — the point of a branch row.
+    if loaded {
+        let mut spans = vec![Span::styled("vs base: ", theme.label())];
+        spans.extend(ahead_behind_spans(worktree, theme, true, &glyphs));
+        lines.push(Line::from(spans));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("vs base: ", theme.label()),
+            Span::styled("…", theme.spinner()),
+        ]));
+    }
+    detail_commits(&mut lines, worktree, theme, now);
+    if let Some(pr) = &worktree.pr {
+        lines.push(Line::from(vec![
+            Span::styled("pr:     ", theme.label()),
+            Span::styled(
+                format!("#{} ({}) ", pr.number, pr.state.as_str()),
+                theme.pr_state(pr.state),
+            ),
+            Span::raw(pr.title.clone()),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll, 0)),
+        area,
+    );
 }
 
 /// Appends the "Last 5 commits" lines (short hash, subject, relative time) to
@@ -476,6 +581,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::PrCompose(_) => "COMPOSE",
         Mode::Checkout(_) => "CHECKOUT",
         Mode::ConfirmRemove(_) => "REMOVE",
+        Mode::ConfirmCreate(_) => "CREATE",
         Mode::Help => "HELP",
     }
 }
@@ -514,6 +620,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::PrCompose(_) => hint_pairs(hints::compose_edit_hints()),
         Mode::Checkout(_) => hint_pairs(hints::checkout_hints()),
         Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
+        Mode::ConfirmCreate(_) => hint_pairs(hints::confirm_create_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -1044,6 +1151,71 @@ fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
     );
 }
 
+/// Renders the confirm-create dialog for a worktree-less branch row (issue #47):
+/// the branch, its base and ahead/behind, and the tip commit — enough to decide —
+/// then a prompt to create a worktree and switch into it.
+fn render_confirm_create(app: &App, index: usize, frame: &mut Frame, area: Rect) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let Some(worktree) = app.worktrees.get(index) else {
+        return;
+    };
+    let now = now_unix();
+    let glyphs = Glyphs::new(app.nerd_fonts);
+    let loaded = app.is_loaded(worktree);
+
+    let branch_span = Span::styled(branch_display(worktree), theme.branch(false, false));
+    let mut lines = vec![Line::from(vec![
+        Span::styled("branch: ", theme.label()),
+        branch_span,
+    ])];
+    if let Some(base) = &worktree.base_ref {
+        lines.push(Line::from(vec![
+            Span::styled("base:   ", theme.label()),
+            Span::raw(base.clone()),
+        ]));
+    }
+    if loaded {
+        let mut spans = vec![Span::styled("vs base: ", theme.label())];
+        spans.extend(ahead_behind_spans(worktree, &theme, true, &glyphs));
+        lines.push(Line::from(spans));
+        if let Some(c) = &worktree.commit {
+            let rel = parse_iso8601(&c.timestamp)
+                .map(|u| relative(now, u))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("commit: ", theme.label()),
+                Span::styled(c.hash.clone(), theme.commit_hash()),
+                Span::raw(" "),
+                Span::raw(c.subject.clone()),
+                Span::raw(" "),
+                Span::styled(format!("({rel})"), theme.time()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("vs base: ", theme.label()),
+            Span::styled("…", theme.spinner()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("Create a worktree and switch into it? ["),
+        Span::styled("y", theme.success()),
+        Span::raw("/N]"),
+    ]));
+
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("create worktree", theme.title(true))))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1278,64 @@ mod tests {
         assert!(text.contains("feature/x"));
         // The current worktree shows the '*' marker.
         assert!(text.contains('*'));
+    }
+
+    #[test]
+    fn list_shows_branch_rows_with_marker_and_count() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        let mut br = branch_row("feature/lonely");
+        br.ahead = Some(3);
+        br.behind = Some(1);
+        a.worktrees.push(br);
+        a.apply_filter(String::new());
+        a.mark_loaded(a.worktrees[1].path.clone());
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("feature/lonely"));
+        assert!(text.contains('○')); // the worktree-less marker
+        assert!(text.contains("↑3"));
+        assert!(text.contains("↓1"));
+        // The title tallies branch rows separately from worktrees.
+        assert!(text.contains("branches"));
+    }
+
+    #[test]
+    fn detail_pane_for_branch_row_is_pathless() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        let mut br = branch_row("topic");
+        br.ahead = Some(2);
+        br.behind = Some(0);
+        br.base_ref = Some("main".into());
+        a.worktrees.push(br);
+        a.apply_filter(String::new());
+        a.mark_loaded(a.worktrees[1].path.clone());
+        a.selected = 1; // select the branch row
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("no worktree"));
+        assert!(text.contains("vs base"));
+        assert!(text.contains("base:"));
+        // The virtual path key is never surfaced to the user.
+        assert!(!text.contains("branch://"));
+    }
+
+    #[test]
+    fn confirm_create_dialog_renders() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        let mut br = branch_row("topic");
+        br.base_ref = Some("main".into());
+        br.ahead = Some(2);
+        br.behind = Some(0);
+        a.worktrees.push(br);
+        a.apply_filter(String::new());
+        a.mark_loaded(a.worktrees[1].path.clone());
+        a.mode = Mode::ConfirmCreate(1);
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("create worktree"));
+        assert!(text.contains("topic"));
+        assert!(text.contains("switch into it"));
+        assert!(text.contains("[y/N]"));
     }
 
     #[test]

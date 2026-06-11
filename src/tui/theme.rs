@@ -202,6 +202,12 @@ impl Theme {
         self.fg(self.palette.yellow)
     }
 
+    /// Style for the worktree-less branch marker (`○`): muted, since a branch row
+    /// is secondary to the real worktrees above it (issue #47).
+    pub fn branchless(&self) -> Style {
+        self.fg(self.palette.gray)
+    }
+
     /// Style for the dirty marker (`M`/●).
     pub fn dirty(&self) -> Style {
         self.fg(self.palette.yellow)
@@ -302,6 +308,7 @@ impl Theme {
             Mode::PrCompose(_) => self.palette.green,
             Mode::Checkout(_) => self.palette.accent,
             Mode::ConfirmRemove(_) => self.palette.red,
+            Mode::ConfirmCreate(_) => self.palette.green,
             Mode::Help => self.palette.cyan,
         };
         Style::default()
@@ -428,6 +435,9 @@ mod tests {
         assert_eq!(t.branch(false, true).fg, Some(YELLOW)); // detached
         assert_eq!(t.branch(true, false).fg, Some(ACCENT)); // current
         assert_eq!(t.branch(false, false), Style::default()); // plain
+        // The worktree-less branch marker is muted (issue #47).
+        assert_eq!(t.branchless().fg, Some(GRAY));
+        assert_eq!(Theme::new(false).branchless(), Style::default());
     }
 
     #[test]
@@ -450,6 +460,7 @@ mod tests {
         assert_eq!(t.mode_chip(&Mode::Filter).bg, Some(YELLOW));
         assert_eq!(t.mode_chip(&Mode::Help).bg, Some(CYAN));
         assert_eq!(t.mode_chip(&Mode::ConfirmRemove(0)).bg, Some(RED));
+        assert_eq!(t.mode_chip(&Mode::ConfirmCreate(0)).bg, Some(GREEN));
         // Disabled falls back to reversed video.
         assert!(
             Theme::new(false)

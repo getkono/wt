@@ -38,6 +38,12 @@ impl Glyphs {
         if self.nerd { "⚓" } else { "~" }
     }
 
+    /// The worktree-less branch marker (a hollow `○`): a local branch listed
+    /// beneath the worktrees with no checkout of its own (issue #47).
+    pub fn branchless(&self) -> &'static str {
+        if self.nerd { "" } else { "○" }
+    }
+
     /// The modified marker (`M`).
     pub fn dirty(&self) -> &'static str {
         if self.nerd { "●" } else { "M" }
@@ -59,6 +65,7 @@ mod tests {
         assert_eq!(g.current(), "*");
         assert_eq!(g.missing(), "!");
         assert_eq!(g.detached(), "~");
+        assert_eq!(g.branchless(), "○");
         assert_eq!(g.dirty(), "M");
         assert_eq!(g.untracked(), "?");
         assert_eq!(g.spinner(), "…");
@@ -71,6 +78,7 @@ mod tests {
         let nerd = Glyphs::new(true);
         assert_ne!(ascii.current(), nerd.current());
         assert_ne!(ascii.missing(), nerd.missing());
+        assert_ne!(ascii.branchless(), nerd.branchless());
         // The spinner/absent are shared across both.
         assert_eq!(ascii.spinner(), nerd.spinner());
     }

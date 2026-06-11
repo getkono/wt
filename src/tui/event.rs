@@ -38,6 +38,13 @@ pub enum Effect {
     },
     /// Remove the worktree at the given index (confirmed; force semantics).
     Remove(usize),
+    /// Create a worktree for an existing worktree-less branch and switch into it
+    /// (confirmed). The runtime materializes the branch via the `new` path and
+    /// records the new worktree as the chosen path (issue #47).
+    MaterializeBranch {
+        /// The branch to create a worktree for.
+        branch: String,
+    },
     /// Open the PR picker — the runtime fetches PRs.
     FetchPrs,
     /// Check out the PR with the given number.
@@ -183,6 +190,7 @@ impl App {
             Mode::PrCompose(_) => self.key_compose(key),
             Mode::Checkout(_) => self.key_checkout_picker(key),
             Mode::ConfirmRemove(_) => self.key_confirm(key),
+            Mode::ConfirmCreate(_) => self.key_confirm_create(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -205,10 +213,16 @@ impl App {
             KeyAction::GoToBottom => self.select_edge(true),
             KeyAction::FocusNextPane | KeyAction::FocusPrevPane => self.toggle_focus(),
             KeyAction::Switch => {
-                if let Some(wt) = self.selected_worktree() {
-                    let path = wt.path.clone();
-                    self.chosen = Some(path.clone());
-                    return Effect::Switch(path);
+                if let Some(&index) = self.visible.get(self.selected) {
+                    let wt = &self.worktrees[index];
+                    if wt.has_worktree {
+                        let path = wt.path.clone();
+                        self.chosen = Some(path.clone());
+                        return Effect::Switch(path);
+                    }
+                    // A worktree-less branch row: confirm before creating a
+                    // worktree and switching into it (issue #47).
+                    self.mode = Mode::ConfirmCreate(index);
                 }
             }
             KeyAction::Filter => self.mode = Mode::Filter,
@@ -223,7 +237,11 @@ impl App {
                 });
             }
             KeyAction::Remove => {
-                if let Some(&index) = self.visible.get(self.selected) {
+                // Removal applies to real worktrees only; a branch row has no
+                // worktree to remove (issue #47).
+                if let Some(&index) = self.visible.get(self.selected)
+                    && self.worktrees[index].has_worktree
+                {
                     self.mode = Mode::ConfirmRemove(index);
                 }
             }
@@ -236,8 +254,12 @@ impl App {
             }
             KeyAction::Checkout => {
                 // Seed a branch picker for the selected worktree (its index into
-                // `worktrees`, matching the `Remove` pattern).
-                if let Some(&index) = self.visible.get(self.selected) {
+                // `worktrees`, matching the `Remove` pattern). Checking out a
+                // branch needs a worktree to check it out *in*, so it is a no-op
+                // on a branch row (issue #47).
+                if let Some(&index) = self.visible.get(self.selected)
+                    && self.worktrees[index].has_worktree
+                {
                     // Open the dropdown immediately so the local + remote branch
                     // list is browsable with ↑/↓ from the start — checkout is a
                     // pick-an-existing-branch action, not free text entry (#32).
@@ -251,7 +273,10 @@ impl App {
                 }
             }
             KeyAction::OpenEditor => {
-                if let Some(wt) = self.selected_worktree() {
+                // A branch row has only a virtual path; nothing to open (issue #47).
+                if let Some(wt) = self.selected_worktree()
+                    && wt.has_worktree
+                {
                     return Effect::OpenEditor(wt.path.clone());
                 }
             }
@@ -530,6 +555,21 @@ impl App {
         }
     }
 
+    /// Confirm-create key handling: `y`/`Y` materializes a worktree for the
+    /// branch row and switches into it; any other key cancels (issue #47).
+    fn key_confirm_create(&mut self, key: KeyEvent) -> Effect {
+        let Mode::ConfirmCreate(index) = self.mode else {
+            return Effect::None;
+        };
+        self.mode = Mode::List;
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && let Some(branch) = self.worktrees.get(index).and_then(|w| w.branch.clone())
+        {
+            return Effect::MaterializeBranch { branch };
+        }
+        Effect::None
+    }
+
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         match mouse.kind {
@@ -613,6 +653,61 @@ mod tests {
         let effect = a.handle_event(press(KeyCode::Enter));
         assert_eq!(effect, Effect::Switch(std::path::PathBuf::from("/r/feat")));
         assert_eq!(a.chosen, Some(std::path::PathBuf::from("/r/feat")));
+    }
+
+    #[test]
+    fn enter_on_branch_row_opens_confirm_create() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        a.apply_filter(String::new()); // recompute `visible` to include the row
+        a.selected = a.visible.len() - 1; // select the branch row
+        let effect = a.handle_event(press(KeyCode::Enter));
+        assert_eq!(effect, Effect::None);
+        assert!(matches!(a.mode, Mode::ConfirmCreate(_)));
+        assert!(a.chosen.is_none()); // no switch yet — only after confirming
+    }
+
+    #[test]
+    fn confirm_create_y_materializes_other_cancels() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        let idx = a
+            .worktrees
+            .iter()
+            .position(|w| w.branch.as_deref() == Some("topic"))
+            .unwrap();
+        a.mode = Mode::ConfirmCreate(idx);
+        let effect = a.handle_event(press(KeyCode::Char('y')));
+        assert_eq!(
+            effect,
+            Effect::MaterializeBranch {
+                branch: "topic".into()
+            }
+        );
+        assert_eq!(a.mode, Mode::List);
+        // Any non-`y` key cancels.
+        a.mode = Mode::ConfirmCreate(idx);
+        let effect = a.handle_event(press(KeyCode::Char('n')));
+        assert_eq!(effect, Effect::None);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn mutating_actions_are_noops_on_branch_rows() {
+        // Remove / checkout / open-editor all need a worktree; on a branch row they
+        // do nothing (issue #47).
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        a.apply_filter(String::new());
+        a.selected = a.visible.len() - 1; // the branch row
+        assert_eq!(a.handle_event(press(KeyCode::Char('d'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+        assert_eq!(a.handle_event(press(KeyCode::Char('c'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+        assert_eq!(a.handle_event(press(KeyCode::Char('o'))), Effect::None);
     }
 
     #[test]
