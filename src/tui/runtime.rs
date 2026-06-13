@@ -790,6 +790,11 @@ fn apply_create(
             app.mode = Mode::List;
             app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
+            // Focus the newly created worktree (issue #52). `do_refresh` restores
+            // the prior selection by path, so this must run after it. If a filter
+            // hides the new row, the selection is left as-is (the filter is not
+            // cleared — that would be surprising).
+            let _ = app.select_branch(branch);
         }
         Err(e) => match &mut app.mode {
             Mode::Create(state) => state.error = Some(e),
@@ -1244,6 +1249,13 @@ mod tests {
                 .any(|w| w.branch.as_deref() == Some("feature/new"))
         );
         assert!(app.status_message.as_deref().unwrap().contains("created"));
+        // The newly created worktree is focused, not the prior selection (issue
+        // #52). `main` is the initial `is_current` row, so a non-focused create
+        // would leave it selected.
+        assert_eq!(
+            app.selected_worktree().unwrap().branch.as_deref(),
+            Some("feature/new")
+        );
     }
 
     #[test]
