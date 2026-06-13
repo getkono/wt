@@ -15,6 +15,7 @@ pub mod prune;
 pub mod remove;
 pub mod root;
 pub mod shell_init;
+pub mod staleness;
 pub mod status_cmd;
 pub mod switch;
 
@@ -157,6 +158,32 @@ pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
     let line = cx.input.read_line()?;
     let answer = line.trim().to_ascii_lowercase();
     Ok(answer == "y" || answer == "yes")
+}
+
+/// A three-way answer to the stale-base prompt (issue #56): update the base,
+/// proceed off it as-is, or cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// Update the base (fast-forward it to its upstream) before proceeding.
+    Update,
+    /// Proceed off the base as-is.
+    Proceed,
+    /// Abort the operation.
+    Cancel,
+}
+
+/// Prompts on stderr for an update/proceed/cancel choice (issue #56). Anything
+/// other than an explicit update/proceed — including an empty line or EOF — is
+/// `Cancel`, so a non-interactive run defaults to the safe choice.
+pub fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
+    cx.err.text(prompt)?;
+    cx.err.flush()?;
+    let line = cx.input.read_line()?;
+    Ok(match line.trim().to_ascii_lowercase().as_str() {
+        "u" | "update" => Choice::Update,
+        "p" | "proceed" => Choice::Proceed,
+        _ => Choice::Cancel,
+    })
 }
 
 /// Initializes git submodules in `dir` when enabled, after a worktree is created
@@ -434,6 +461,25 @@ mod tests {
         });
         assert!(matches!(r, Resolution::Ambiguous));
         assert!(err.contents().is_empty());
+    }
+
+    #[test]
+    fn choose_maps_answers_and_defaults_to_cancel() {
+        use crate::commands::{Choice, choose};
+        use crate::testutil::CannedInput;
+        let cases = [
+            ("update", Choice::Update),
+            ("u", Choice::Update),
+            ("proceed", Choice::Proceed),
+            ("p", Choice::Proceed),
+            ("", Choice::Cancel),
+            ("nonsense", Choice::Cancel),
+        ];
+        for (answer, expected) in cases {
+            let mut t = test_cx(&[], "/work");
+            t.cx.input = Box::new(CannedInput::new(&[answer]));
+            assert_eq!(choose(&mut t.cx, "? ").unwrap(), expected);
+        }
     }
 
     mod submodules {

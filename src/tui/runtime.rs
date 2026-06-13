@@ -21,8 +21,8 @@ use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::hooks::CapturingHookRunner;
 use crate::model::{SortSpec, Worktree};
-use crate::tui::app::{App, AppConfig, Mode, PrComposeState, PrItem, StatusKind};
-use crate::tui::event::Effect;
+use crate::tui::app::{App, AppConfig, Mode, PrComposeState, PrItem, StaleBaseState, StatusKind};
+use crate::tui::event::{CreateDecision, Effect};
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
 use crate::worktree_service::{build_rows, enumerate_rows};
@@ -292,12 +292,15 @@ impl JobCx {
 /// A shell-based action to run on a background task, with its arguments already
 /// resolved to owned values on the foreground thread (issue #46).
 enum Job {
-    /// Create a worktree for a new `branch` based on `base`.
+    /// Create a worktree for a new `branch` based on `base`. `decision` is `None`
+    /// to pre-flight the base for staleness (issue #56), else the user's choice.
     Create {
         /// The new branch name.
         branch: String,
         /// The base ref (or `None` for the default).
         base: Option<String>,
+        /// The stale-base decision (`None` pre-flights, else update/proceed).
+        decision: Option<CreateDecision>,
     },
     /// Remove the worktree matched by `query` (force semantics).
     Remove {
@@ -334,12 +337,15 @@ enum Job {
 /// Errors are stringified inside the job (the typed `Error` is not `'static`-
 /// friendly to ferry across the task boundary, and the UI only needs the text).
 enum JobOutcome {
-    /// A finished create; the branch echoes back for the status text.
+    /// A finished create attempt. `branch`/`base` echo back so the stale-base
+    /// modal can re-issue the create with a decision (issue #56).
     Create {
-        /// The branch that was created.
+        /// The branch that was (to be) created.
         branch: String,
-        /// Success, or the error message to surface.
-        result: std::result::Result<(), String>,
+        /// The base ref the create used (echoed for the modal's re-issue).
+        base: Option<String>,
+        /// Created, awaiting the stale-base confirmation, or failed.
+        outcome: CreateOutcome,
     },
     /// A finished remove.
     Remove {
@@ -380,6 +386,26 @@ enum JobOutcome {
     },
 }
 
+/// The result of a create job (issue #56). When the pre-flight finds the base
+/// behind its upstream it returns `NeedsStaleConfirm` *without* creating, so the
+/// loop can open the confirm modal; the modal then re-issues the create with a
+/// concrete decision.
+enum CreateOutcome {
+    /// The worktree was created.
+    Created,
+    /// The base is behind its upstream; the create paused for confirmation.
+    NeedsStaleConfirm {
+        /// How many commits the base is behind its upstream.
+        behind: u32,
+        /// The upstream display name, e.g. `origin/main`.
+        upstream_display: String,
+        /// Whether the base can be fast-forwarded (else "update" would fail).
+        can_fast_forward: bool,
+    },
+    /// The create failed; the message to surface.
+    Failed(String),
+}
+
 /// Resolves the worktree-identifying query for the row at `index` (its branch,
 /// or the directory name), mirroring the CLI's `remove` query.
 fn remove_query_of(app: &App, index: usize) -> Option<String> {
@@ -398,9 +424,20 @@ fn remove_query_of(app: &App, index: usize) -> Option<String> {
 /// when the effect's target row is gone.
 fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
     let (job, label) = match effect {
-        Effect::Create { branch, base } => {
+        Effect::Create {
+            branch,
+            base,
+            decision,
+        } => {
             let label = format!("Creating {branch}");
-            (Job::Create { branch, base }, label)
+            (
+                Job::Create {
+                    branch,
+                    base,
+                    decision,
+                },
+                label,
+            )
         }
         Effect::Remove(index) => {
             let query = remove_query_of(app, index)?;
@@ -458,9 +495,17 @@ fn spawn_job(cx: &Cx, app: &mut App, effect: Effect, tx: &mpsc::Sender<JobOutcom
 fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
     let mut cx = jobcx.into_cx();
     match job {
-        Job::Create { branch, base } => {
-            let result = run_create_command(&mut cx, &branch, base);
-            JobOutcome::Create { branch, result }
+        Job::Create {
+            branch,
+            base,
+            decision,
+        } => {
+            let outcome = run_create_command(&mut cx, &branch, base.clone(), decision);
+            JobOutcome::Create {
+                branch,
+                base,
+                outcome,
+            }
         }
         Job::Remove { query } => {
             let result = run_remove_command(&mut cx, &query);
@@ -475,7 +520,7 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
             }
         }
         Job::Materialize { branch } => {
-            let result = run_create_command(&mut cx, &branch, None);
+            let result = run_materialize_command(&mut cx, &branch);
             JobOutcome::Materialize { branch, result }
         }
         Job::CheckoutPr { number } => {
@@ -492,14 +537,10 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
     }
 }
 
-/// Creates a worktree (also the materialize path, which checks out an existing
-/// branch as-is). Hooks are captured so their output never paints the TUI.
-fn run_create_command(
-    cx: &mut Cx,
-    branch: &str,
-    base: Option<String>,
-) -> std::result::Result<(), String> {
-    let args = NewArgs {
+/// Builds the `NewArgs` a TUI create/materialize uses (no per-invocation
+/// submodule override — the `[submodules] init` policy decides, issue #50).
+fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
+    NewArgs {
         branch: branch.to_string(),
         from: base,
         track: None,
@@ -507,12 +548,55 @@ fn run_create_command(
         no_switch: true,
         no_hooks: false,
         copy_from: None,
-        // No per-invocation override in the TUI; the `[submodules] init` policy
-        // (loaded by the rebuilt session) decides (issue #50).
         init_submodules: false,
         no_init_submodules: false,
-    };
-    commands::new::run(cx, &CapturingHookRunner, &args, false)
+    }
+}
+
+/// Runs a create with staleness handling (issue #56). With no decision yet, it
+/// pre-flights the base and, if behind, returns `NeedsStaleConfirm` *without*
+/// creating; otherwise (or with a concrete decision) it creates, fast-forwarding
+/// the base first when the user chose to update. Hooks are captured so their
+/// output never paints the TUI.
+fn run_create_command(
+    cx: &mut Cx,
+    branch: &str,
+    base: Option<String>,
+    decision: Option<CreateDecision>,
+) -> CreateOutcome {
+    let args = tui_new_args(branch, base);
+    match decision {
+        None => match commands::new::detect_stale_base(cx, &args) {
+            Ok(Some(stale)) => CreateOutcome::NeedsStaleConfirm {
+                behind: stale.behind,
+                upstream_display: stale.upstream_display,
+                can_fast_forward: stale.can_fast_forward,
+            },
+            // No stale base, or detection failed (offline) — just create.
+            _ => create_core(cx, &args),
+        },
+        Some(CreateDecision::Update) => match commands::new::update_stale_base(cx, &args) {
+            Ok(()) => create_core(cx, &args),
+            Err(e) => CreateOutcome::Failed(e.to_string()),
+        },
+        Some(CreateDecision::Proceed) => create_core(cx, &args),
+    }
+}
+
+/// Creates the worktree (no staleness check) and maps the result to a
+/// [`CreateOutcome`].
+fn create_core(cx: &mut Cx, args: &NewArgs) -> CreateOutcome {
+    match commands::new::run_core(cx, &CapturingHookRunner, args, false) {
+        Ok(_) => CreateOutcome::Created,
+        Err(e) => CreateOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Materializes a worktree for an existing branch — checks it out as-is via the
+/// core create path (no staleness check; the branch already exists).
+fn run_materialize_command(cx: &mut Cx, branch: &str) -> std::result::Result<(), String> {
+    let args = tui_new_args(branch, None);
+    commands::new::run_core(cx, &CapturingHookRunner, &args, false)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -595,7 +679,11 @@ fn run_checkout_branch_command(
 fn apply_outcome(cx: &Cx, session: &Session, app: &mut App, outcome: JobOutcome) {
     let root = &session.primary_root;
     match outcome {
-        JobOutcome::Create { branch, result } => apply_create(cx, app, &branch, result, root),
+        JobOutcome::Create {
+            branch,
+            base,
+            outcome,
+        } => apply_create(cx, app, &branch, base, outcome, root),
         JobOutcome::Remove { query, result } => apply_remove(cx, app, &query, result, root),
         JobOutcome::DeleteBranch {
             branch,
@@ -699,7 +787,14 @@ pub(crate) fn do_create(
     branch: String,
     base: Option<String>,
 ) {
-    let outcome = run_job(JobCx::capture(cx), Job::Create { branch, base });
+    let outcome = run_job(
+        JobCx::capture(cx),
+        Job::Create {
+            branch,
+            base,
+            decision: None,
+        },
+    );
     apply_outcome(cx, session, app, outcome);
 }
 
@@ -782,11 +877,12 @@ fn apply_create(
     cx: &Cx,
     app: &mut App,
     branch: &str,
-    result: std::result::Result<(), String>,
+    base: Option<String>,
+    outcome: CreateOutcome,
     root: &Path,
 ) {
-    match result {
-        Ok(()) => {
+    match outcome {
+        CreateOutcome::Created => {
             app.mode = Mode::List;
             app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
@@ -796,7 +892,22 @@ fn apply_create(
             // cleared — that would be surprising).
             let _ = app.select_branch(branch);
         }
-        Err(e) => match &mut app.mode {
+        // The base is behind origin: open the confirm modal carrying the pending
+        // create's inputs so the user's choice can re-issue it (issue #56).
+        CreateOutcome::NeedsStaleConfirm {
+            behind,
+            upstream_display,
+            can_fast_forward,
+        } => {
+            app.mode = Mode::ConfirmStaleBase(StaleBaseState {
+                branch: branch.to_string(),
+                base,
+                behind,
+                upstream_display,
+                can_fast_forward,
+            });
+        }
+        CreateOutcome::Failed(e) => match &mut app.mode {
             Mode::Create(state) => state.error = Some(e),
             _ => app.set_status(e, StatusKind::Error),
         },
@@ -1278,6 +1389,66 @@ mod tests {
         }
     }
 
+    /// Leaves local `main` one commit behind `origin/main` (upstream configured,
+    /// no fetchable remote so the check's fetch is skipped). Returns origin's tip.
+    fn main_behind_origin(repo: &TestRepo) -> String {
+        let c1 = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("u.txt", "1\n");
+        repo.commit_all("ahead on origin");
+        let c2 = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &c2]);
+        repo.git(&["reset", "-q", "--hard", &c1]);
+        repo.git(&["config", "branch.main.remote", "origin"]);
+        repo.git(&["config", "branch.main.merge", "refs/heads/main"]);
+        c2
+    }
+
+    #[test]
+    fn do_create_stale_base_opens_confirm_modal() {
+        // The default base (main) is behind origin/main, so the create pauses at
+        // the stale-base confirm modal instead of creating (issue #56).
+        let repo = TestRepo::init();
+        main_behind_origin(&repo);
+        let (mut t, session, mut app) = setup(&repo);
+        app.mode = Mode::Create(Default::default());
+        do_create(&mut t.cx, &session, &mut app, "feature".into(), None);
+        match &app.mode {
+            Mode::ConfirmStaleBase(s) => {
+                assert_eq!(s.branch, "feature");
+                assert_eq!(s.behind, 1);
+                assert!(s.can_fast_forward);
+            }
+            other => panic!("expected ConfirmStaleBase, got {other:?}"),
+        }
+        // Nothing was created.
+        assert!(
+            !app.worktrees
+                .iter()
+                .any(|w| w.has_worktree && w.branch.as_deref() == Some("feature"))
+        );
+    }
+
+    #[test]
+    fn create_update_decision_fast_forwards_then_creates() {
+        // Re-issuing the create with the Update decision (as the modal does)
+        // fast-forwards the base and forks the new branch from it (issue #56).
+        let repo = TestRepo::init();
+        let c2 = main_behind_origin(&repo);
+        let (t, session, mut app) = setup(&repo);
+        let outcome = run_job(
+            JobCx::capture(&t.cx),
+            Job::Create {
+                branch: "feature".into(),
+                base: None,
+                decision: Some(CreateDecision::Update),
+            },
+        );
+        apply_outcome(&t.cx, &session, &mut app, outcome);
+        assert_eq!(app.mode, Mode::List);
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/main"]).trim(), c2);
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/feature"]).trim(), c2);
+    }
+
     #[test]
     fn do_remove_removes_selected() {
         let repo = TestRepo::init();
@@ -1750,7 +1921,8 @@ mod tests {
     fn is_background_action_matches_mutations_only() {
         assert!(is_background_action(&Effect::Create {
             branch: "x".into(),
-            base: None
+            base: None,
+            decision: None,
         }));
         assert!(is_background_action(&Effect::Remove(0)));
         assert!(is_background_action(&Effect::MaterializeBranch {
@@ -1778,6 +1950,7 @@ mod tests {
             Effect::Create {
                 branch: "feat/new".into(),
                 base: Some("main".into()),
+                decision: None,
             },
         )
         .unwrap();

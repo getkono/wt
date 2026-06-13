@@ -18,6 +18,16 @@ const MAX_SIDEBAR: u16 = 100;
 /// Rows above the first list row (border) for mouse hit-testing.
 const LIST_TOP: u16 = 1;
 
+/// The user's answer to the stale-base confirm modal (issue #56): update the
+/// base branch (fast-forward it) before creating, or proceed off it as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateDecision {
+    /// Fast-forward the base to its upstream, then create off the updated base.
+    Update,
+    /// Create off the (stale) base as-is.
+    Proceed,
+}
+
 /// An action for the runtime to perform after a state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -29,12 +39,17 @@ pub enum Effect {
     Quit,
     /// The terminal is too small; exit with a message (spec §10).
     TooSmall,
-    /// Create a worktree for `branch` based on `base`.
+    /// Create a worktree for `branch` based on `base`. `decision` is `None` for
+    /// the initial attempt — the runtime then pre-flights the base for staleness
+    /// (issue #56) and may bounce to the confirm modal — or a concrete choice when
+    /// re-issued from that modal (update the base first, or proceed as-is).
     Create {
         /// The new branch name.
         branch: String,
         /// The base ref (or `None` for the default).
         base: Option<String>,
+        /// The stale-base decision: `None` to pre-flight, else the chosen action.
+        decision: Option<CreateDecision>,
     },
     /// Remove the worktree at the given index (confirmed; force semantics).
     Remove(usize),
@@ -200,6 +215,7 @@ impl App {
             Mode::ConfirmRemove(_) => self.key_confirm(key),
             Mode::ConfirmCreate(_) => self.key_confirm_create(key),
             Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
+            Mode::ConfirmStaleBase(_) => self.key_confirm_stale_base(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -387,7 +403,13 @@ impl App {
                         CreateStep::Base => {
                             let branch = state.branch.clone();
                             let base = (!state.base.trim().is_empty()).then(|| state.base.clone());
-                            return Effect::Create { branch, base };
+                            // No decision yet — the runtime pre-flights the base
+                            // for staleness before creating (issue #56).
+                            return Effect::Create {
+                                branch,
+                                base,
+                                decision: None,
+                            };
                         }
                     }
                 }
@@ -602,6 +624,28 @@ impl App {
         Effect::None
     }
 
+    /// Confirm-stale-base key handling (issue #56): `u`/`U` updates the base
+    /// (fast-forward) then creates; `p`/`P` proceeds off the stale base; any other
+    /// key cancels. Re-issues the create with the chosen decision.
+    fn key_confirm_stale_base(&mut self, key: KeyEvent) -> Effect {
+        let Mode::ConfirmStaleBase(state) = &self.mode else {
+            return Effect::None;
+        };
+        let branch = state.branch.clone();
+        let base = state.base.clone();
+        self.mode = Mode::List;
+        let decision = match key.code {
+            KeyCode::Char('u') | KeyCode::Char('U') => CreateDecision::Update,
+            KeyCode::Char('p') | KeyCode::Char('P') => CreateDecision::Proceed,
+            _ => return Effect::None,
+        };
+        Effect::Create {
+            branch,
+            base,
+            decision: Some(decision),
+        }
+    }
+
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         match mouse.kind {
@@ -774,6 +818,44 @@ mod tests {
     }
 
     #[test]
+    fn confirm_stale_base_keys_reissue_create_or_cancel() {
+        use crate::tui::app::StaleBaseState;
+        let state = StaleBaseState {
+            branch: "feature".into(),
+            base: Some("main".into()),
+            behind: 2,
+            upstream_display: "origin/main".into(),
+            can_fast_forward: true,
+        };
+        let mut a = app(&[("main", true)]);
+        // `u` updates the base then creates.
+        a.mode = Mode::ConfirmStaleBase(state.clone());
+        assert_eq!(
+            a.handle_event(press(KeyCode::Char('u'))),
+            Effect::Create {
+                branch: "feature".into(),
+                base: Some("main".into()),
+                decision: Some(CreateDecision::Update),
+            }
+        );
+        assert_eq!(a.mode, Mode::List);
+        // `p` proceeds off the stale base.
+        a.mode = Mode::ConfirmStaleBase(state.clone());
+        assert_eq!(
+            a.handle_event(press(KeyCode::Char('p'))),
+            Effect::Create {
+                branch: "feature".into(),
+                base: Some("main".into()),
+                decision: Some(CreateDecision::Proceed),
+            }
+        );
+        // Any other key (Esc) cancels.
+        a.mode = Mode::ConfirmStaleBase(state);
+        assert_eq!(a.handle_event(press(KeyCode::Esc)), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
     fn quit_returns_quit() {
         let mut a = app(&[("a", true)]);
         assert_eq!(a.handle_event(press(KeyCode::Char('q'))), Effect::Quit);
@@ -825,7 +907,8 @@ mod tests {
             effect,
             Effect::Create {
                 branch: "feature/x".into(),
-                base: None
+                base: None,
+                decision: None,
             }
         );
     }
@@ -970,6 +1053,7 @@ mod tests {
             Effect::Create {
                 branch: "feature/login".into(),
                 base: Some("origin/dev".into()),
+                decision: None,
             }
         );
     }

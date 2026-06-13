@@ -228,7 +228,7 @@ fn normalize_remote_branch(repo: &Repo, branch: &str) -> String {
 }
 
 /// Whether `remote` is configured for the repository at `worktree_dir`.
-fn remote_configured(git: &dyn GitCli, worktree_dir: &Path, remote: &str) -> bool {
+pub(crate) fn remote_configured(git: &dyn GitCli, worktree_dir: &Path, remote: &str) -> bool {
     git.run_raw(worktree_dir, &["remote", "get-url", remote])
         .map(|o| o.success)
         .unwrap_or(false)

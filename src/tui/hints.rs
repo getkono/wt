@@ -113,6 +113,17 @@ pub fn confirm_delete_branch_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Confirm-stale-base dialog hints (issue #56): `u` updates the base, `p`
+/// proceeds off it as-is, any other key cancels.
+pub fn confirm_stale_base_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[
+        hint("u", "update"),
+        hint("p", "proceed"),
+        hint("Esc", "cancel"),
+    ];
+    HINTS
+}
+
 /// Help-overlay hints.
 pub fn help_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[hint("any key", "close")];
@@ -135,7 +146,7 @@ mod tests {
     use crate::tui::app::testutil::app;
     use crate::tui::app::{
         App, CheckoutState, ComposeField, CreateState, CreateStep, Mode, PrComposeState, PrItem,
-        PrPickerState,
+        PrPickerState, StaleBaseState,
     };
     use crate::tui::event::Effect;
     use crate::tui::options::OptionList;
@@ -159,6 +170,7 @@ mod tests {
             confirm_hints(),
             confirm_create_hints(),
             confirm_delete_branch_hints(),
+            confirm_stale_base_hints(),
             help_hints(),
         ];
         for table in tables {
@@ -184,6 +196,8 @@ mod tests {
             "Shift+Tab" => (KeyCode::BackTab, KeyModifiers::empty()),
             "Backspace" => (KeyCode::Backspace, KeyModifiers::empty()),
             "y" => (KeyCode::Char('y'), KeyModifiers::empty()),
+            "u" => (KeyCode::Char('u'), KeyModifiers::empty()),
+            "p" => (KeyCode::Char('p'), KeyModifiers::empty()),
             "Ctrl-A" => (KeyCode::Char('a'), KeyModifiers::CONTROL),
             "Ctrl-S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
             "Ctrl-D" => (KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -259,6 +273,15 @@ mod tests {
                     force: false,
                 }
             }
+            "confirm_stale_base" => {
+                a.mode = Mode::ConfirmStaleBase(StaleBaseState {
+                    branch: "feature".into(),
+                    base: Some("main".into()),
+                    behind: 1,
+                    upstream_display: "origin/main".into(),
+                    can_fast_forward: true,
+                })
+            }
             "help" => a.mode = Mode::Help,
             other => panic!("unknown mode {other}"),
         }
@@ -299,6 +322,7 @@ mod tests {
         assert_hints_live("confirm", confirm_hints());
         assert_hints_live("confirm_create", confirm_create_hints());
         assert_hints_live("confirm_delete_branch", confirm_delete_branch_hints());
+        assert_hints_live("confirm_stale_base", confirm_stale_base_hints());
         assert_hints_live("help", help_hints());
     }
 }
