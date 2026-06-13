@@ -219,6 +219,7 @@ fn dispatch_effect(
         // they never reach `dispatch_effect`.
         Effect::Create { .. }
         | Effect::Remove(_)
+        | Effect::DeleteBranch { .. }
         | Effect::MaterializeBranch { .. }
         | Effect::CheckoutPr(_)
         | Effect::CheckoutBranch { .. } => Ok(false),
@@ -235,6 +236,7 @@ fn is_background_action(effect: &Effect) -> bool {
         effect,
         Effect::Create { .. }
             | Effect::Remove(_)
+            | Effect::DeleteBranch { .. }
             | Effect::MaterializeBranch { .. }
             | Effect::CheckoutPr(_)
             | Effect::CheckoutBranch { .. }
@@ -302,6 +304,13 @@ enum Job {
         /// The branch (or directory name) identifying the worktree to remove.
         query: String,
     },
+    /// Delete the local branch `branch` of a worktree-less branch row (issue #53).
+    DeleteBranch {
+        /// The branch to delete.
+        branch: String,
+        /// Whether to force-delete an unmerged branch (`-D`).
+        force: bool,
+    },
     /// Materialize a worktree for an existing worktree-less `branch`.
     Materialize {
         /// The branch to create a worktree for.
@@ -336,6 +345,15 @@ enum JobOutcome {
     Remove {
         /// The query that was removed (for the status text).
         query: String,
+        /// Success, or the error message to surface.
+        result: std::result::Result<(), String>,
+    },
+    /// A finished branch deletion (issue #53).
+    DeleteBranch {
+        /// The branch that was deleted (for the status text).
+        branch: String,
+        /// Whether this was the force-delete attempt; gates the unmerged re-prompt.
+        force: bool,
         /// Success, or the error message to surface.
         result: std::result::Result<(), String>,
     },
@@ -388,6 +406,10 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
             let query = remove_query_of(app, index)?;
             let label = format!("Removing {query}");
             (Job::Remove { query }, label)
+        }
+        Effect::DeleteBranch { branch, force } => {
+            let label = format!("Deleting branch {branch}");
+            (Job::DeleteBranch { branch, force }, label)
         }
         Effect::MaterializeBranch { branch } => {
             let label = format!("Creating worktree for {branch}");
@@ -443,6 +465,14 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
         Job::Remove { query } => {
             let result = run_remove_command(&mut cx, &query);
             JobOutcome::Remove { query, result }
+        }
+        Job::DeleteBranch { branch, force } => {
+            let result = run_delete_branch_command(&mut cx, &branch, force);
+            JobOutcome::DeleteBranch {
+                branch,
+                force,
+                result,
+            }
         }
         Job::Materialize { branch } => {
             let result = run_create_command(&mut cx, &branch, None);
@@ -501,6 +531,18 @@ fn run_remove_command(cx: &mut Cx, query: &str) -> std::result::Result<(), Strin
         .map_err(|e| e.to_string())
 }
 
+/// Deletes the local branch of a worktree-less branch row (issue #53): a safe
+/// `git branch -d` unless `force` (the unmerged re-prompt), which uses `-D`.
+fn run_delete_branch_command(
+    cx: &mut Cx,
+    branch: &str,
+    force: bool,
+) -> std::result::Result<(), String> {
+    commands::remove::delete_branch_query(cx, branch, force, false)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Checks out a PR into a worktree, rebuilding the session from the job's `Cx`.
 fn run_checkout_pr_command(
     cx: &mut Cx,
@@ -555,6 +597,11 @@ fn apply_outcome(cx: &Cx, session: &Session, app: &mut App, outcome: JobOutcome)
     match outcome {
         JobOutcome::Create { branch, result } => apply_create(cx, app, &branch, result, root),
         JobOutcome::Remove { query, result } => apply_remove(cx, app, &query, result, root),
+        JobOutcome::DeleteBranch {
+            branch,
+            force,
+            result,
+        } => apply_delete_branch(cx, app, &branch, force, result, root),
         JobOutcome::Materialize { branch, result } => {
             apply_materialize(cx, app, &branch, result, root)
         }
@@ -669,6 +716,22 @@ pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: us
     apply_outcome(cx, session, app, outcome);
 }
 
+/// Deletes a worktree-less branch row's local branch and refreshes (issue #53).
+/// The confirm dialog is the guard: a safe `git branch -d` unless `force`, which
+/// `git branch -D`s an unmerged branch. A safe refusal leaves the app in the
+/// force-delete re-prompt.
+#[cfg(test)]
+pub(crate) fn do_delete_branch(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    branch: String,
+    force: bool,
+) {
+    let outcome = run_job(JobCx::capture(cx), Job::DeleteBranch { branch, force });
+    apply_outcome(cx, session, app, outcome);
+}
+
 /// Materializes a worktree for an existing worktree-less branch and switches into
 /// it (issue #47): creates the worktree via the `new` path (which checks out an
 /// existing branch as-is), refreshes, then records the new worktree as `chosen`
@@ -750,6 +813,44 @@ fn apply_remove(
     }
     app.mode = Mode::List;
     do_refresh(cx, app, root);
+}
+
+/// Applies a finished branch deletion (issue #53): on success report it and
+/// refresh; on a safe-delete refusal because the branch is unmerged, re-open the
+/// confirm to offer a force-delete; any other failure shows in the status bar.
+fn apply_delete_branch(
+    cx: &Cx,
+    app: &mut App,
+    branch: &str,
+    force: bool,
+    result: std::result::Result<(), String>,
+    root: &Path,
+) {
+    match result {
+        Ok(()) => {
+            app.mode = Mode::List;
+            app.set_status(format!("deleted branch {branch}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+        }
+        // A safe `git branch -d` refused an unmerged branch: re-prompt to force.
+        // The delete failed, so the branch row still exists — re-find it by name.
+        Err(e) if !force && e.contains("not fully merged") => {
+            if let Some(index) = app
+                .worktrees
+                .iter()
+                .position(|w| !w.has_worktree && w.branch.as_deref() == Some(branch))
+            {
+                app.mode = Mode::ConfirmDeleteBranch { index, force: true };
+            } else {
+                app.mode = Mode::List;
+                app.set_status(e, StatusKind::Error);
+            }
+        }
+        Err(e) => {
+            app.mode = Mode::List;
+            app.set_status(e, StatusKind::Error);
+        }
+    }
 }
 
 /// Applies a finished materialize: on success refresh and record the new
@@ -1188,6 +1289,69 @@ mod tests {
             app.worktrees
                 .iter()
                 .any(|w| !w.has_worktree && w.branch.as_deref() == Some("feature/x"))
+        );
+    }
+
+    #[test]
+    fn do_delete_branch_removes_branch_row_and_refreshes() {
+        // A worktree-less branch row (issue #53): deleting it removes the local
+        // branch and refreshes so the row disappears.
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]); // a merged branch row, no worktree
+        let (mut t, session, mut app) = setup(&repo);
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| !w.has_worktree && w.branch.as_deref() == Some("topic"))
+        );
+        do_delete_branch(&mut t.cx, &session, &mut app, "topic".into(), false);
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            !app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("topic"))
+        );
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("deleted branch topic")
+        );
+    }
+
+    #[test]
+    fn do_delete_branch_unmerged_reprompts_then_force_deletes() {
+        // Deleting an unmerged branch row is refused by the safe `-d` and re-opens
+        // the confirm in force mode (issue #53); a forced delete then removes it.
+        let repo = TestRepo::init();
+        // An unmerged branch with no worktree: branch off in a temp worktree,
+        // commit, then drop the worktree but keep the branch.
+        repo.add_worktree("unmerged", "../wt-unmerged");
+        let wt = repo.root().parent().unwrap().join("wt-unmerged");
+        std::fs::write(wt.join("c.txt"), "x\n").unwrap();
+        let dir = wt.to_string_lossy().into_owned();
+        repo.git(&["-C", &dir, "add", "-A"]);
+        repo.git(&["-C", &dir, "commit", "-q", "-m", "unmerged change"]);
+        repo.git(&["worktree", "remove", "--force", &dir]);
+        let (mut t, session, mut app) = setup(&repo);
+        // A safe delete is refused -> re-prompt in force mode.
+        do_delete_branch(&mut t.cx, &session, &mut app, "unmerged".into(), false);
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmDeleteBranch { force: true, .. }
+        ));
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("unmerged"))
+        );
+        // The forced delete removes it.
+        do_delete_branch(&mut t.cx, &session, &mut app, "unmerged".into(), true);
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            !app.worktrees
+                .iter()
+                .any(|w| w.branch.as_deref() == Some("unmerged"))
         );
     }
 

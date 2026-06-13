@@ -106,6 +106,13 @@ pub fn confirm_create_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Confirm-delete-branch dialog hints: `y` deletes the branch row's local branch;
+/// any other key cancels (issue #53).
+pub fn confirm_delete_branch_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[hint("y", "delete"), hint("Esc", "cancel")];
+    HINTS
+}
+
 /// Help-overlay hints.
 pub fn help_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[hint("any key", "close")];
@@ -151,6 +158,7 @@ mod tests {
             checkout_hints(),
             confirm_hints(),
             confirm_create_hints(),
+            confirm_delete_branch_hints(),
             help_hints(),
         ];
         for table in tables {
@@ -245,6 +253,12 @@ mod tests {
             }
             "confirm" => a.mode = Mode::ConfirmRemove(0),
             "confirm_create" => a.mode = Mode::ConfirmCreate(0),
+            "confirm_delete_branch" => {
+                a.mode = Mode::ConfirmDeleteBranch {
+                    index: 0,
+                    force: false,
+                }
+            }
             "help" => a.mode = Mode::Help,
             other => panic!("unknown mode {other}"),
         }
@@ -284,6 +298,7 @@ mod tests {
         assert_hints_live("checkout", checkout_hints());
         assert_hints_live("confirm", confirm_hints());
         assert_hints_live("confirm_create", confirm_create_hints());
+        assert_hints_live("confirm_delete_branch", confirm_delete_branch_hints());
         assert_hints_live("help", help_hints());
     }
 }

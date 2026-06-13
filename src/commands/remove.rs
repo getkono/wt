@@ -9,10 +9,10 @@ use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{default_branch, is_ancestor};
+use crate::git::{default_branch, is_ancestor, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
-use crate::worktree_service::{build_worktrees, guard_status};
+use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status};
 
 /// Options controlling a removal. The worktree-removal force (skip the
 /// dirty/unpushed guards) is decoupled from the branch-deletion force (delete a
@@ -167,6 +167,68 @@ pub fn remove_query(
     );
     clear_metadata(git, &root, &worktree);
     finish(cx, &worktree, json, deleted)
+}
+
+/// Deletes a local branch that has no worktree — a TUI "branch row" (issue #53),
+/// for which there is no worktree to remove, only the branch itself. Runs a safe
+/// `git branch -d` unless `force` is set (then `git branch -D`, to delete a branch
+/// that is not fully merged). Errors if the branch does not exist or is currently
+/// checked out in a worktree (the user should remove that worktree first). When a
+/// safe delete is refused because the branch is unmerged, the returned error
+/// message contains the stable substring "not fully merged", which the TUI keys on
+/// to offer a force-delete.
+pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -> Result<u8> {
+    let git = cx.git.clone();
+    let git = git.as_ref();
+    let session = open_session(cx, git)?;
+    let root = session.primary_root.clone();
+
+    // The branch must exist as a local ref.
+    if resolve_hex(session.repo.gix(), &format!("refs/heads/{branch}")).is_none() {
+        return Err(Error::NotFound {
+            query: branch.to_string(),
+        });
+    }
+
+    // A branch checked out in a worktree cannot be deleted directly — git refuses
+    // it anyway, and the user means to remove that worktree first.
+    let worktrees = enumerate_worktrees(&session.repo, git)?;
+    if worktrees
+        .iter()
+        .any(|w| w.branch.as_deref() == Some(branch))
+    {
+        return Err(Error::operation(format!(
+            "branch {branch:?} is checked out; remove its worktree first"
+        )));
+    }
+
+    let flag = if force { "-D" } else { "-d" };
+    let out = git.run_raw(&root, &["branch", flag, branch])?;
+    if !out.success {
+        // `git branch -d` refuses an unmerged branch; preserve the "not fully
+        // merged" sentinel so the TUI can re-prompt to force-delete (issue #53).
+        if !force && out.stderr.contains("not fully merged") {
+            return Err(Error::operation(format!(
+                "branch {branch:?} is not fully merged; not deleted"
+            )));
+        }
+        return Err(Error::operation(format!(
+            "failed to delete branch {branch:?}: {}",
+            out.stderr.trim()
+        )));
+    }
+    // Best-effort: clear any `wt.*` metadata recorded for this branch.
+    let _ = wtconfig::clear_meta(git, &root, branch);
+
+    if json {
+        cx.out.line(&serde_json::to_string(&serde_json::json!({
+            "branch": branch,
+            "deleted": true,
+        }))?)?;
+    } else {
+        cx.err.line(&format!("deleted branch {branch}"))?;
+    }
+    Ok(0)
 }
 
 /// Deletes the branch if it is wt-created and either fully merged (and the
@@ -427,5 +489,70 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["removed"], serde_json::json!(true));
         assert_eq!(v["branch"], serde_json::json!("featurej"));
+    }
+
+    /// Runs `delete_branch_query` against the repo, returning `(code, out, err)`.
+    fn delete_branch(repo: &TestRepo, branch: &str, force: bool) -> Result<(u8, String, String)> {
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let code = super::delete_branch_query(&mut t.cx, branch, force, false)?;
+        Ok((code, t.out.contents(), t.err.contents()))
+    }
+
+    #[test]
+    fn deletes_unattached_merged_branch() {
+        let repo = TestRepo::init();
+        // A branch at HEAD with no worktree (a TUI branch row); it is merged.
+        repo.git(&["branch", "merged-topic"]);
+        let (code, _, err) = delete_branch(&repo, "merged-topic", false).unwrap();
+        assert_eq!(code, 0);
+        assert!(err.contains("deleted branch merged-topic"));
+        assert!(
+            repo.git(&["branch", "--list", "merged-topic"])
+                .trim()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refuses_to_delete_checked_out_branch() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "active");
+        let err = delete_branch(&repo, "active", false).unwrap_err();
+        assert!(err.to_string().contains("checked out"));
+        assert!(!repo.git(&["branch", "--list", "active"]).trim().is_empty());
+    }
+
+    #[test]
+    fn safe_delete_refuses_unmerged_then_force_deletes() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "unmerged");
+        make_unmerged(&repo, "unmerged");
+        // Drop the worktree but keep the branch -> a worktree-less unmerged branch.
+        let dir = wt_dir(&repo, "unmerged").to_string_lossy().into_owned();
+        repo.git(&["worktree", "remove", "--force", &dir]);
+        // A safe delete refuses an unmerged branch; the branch survives.
+        let err = delete_branch(&repo, "unmerged", false).unwrap_err();
+        assert!(err.to_string().contains("not fully merged"));
+        assert!(
+            !repo
+                .git(&["branch", "--list", "unmerged"])
+                .trim()
+                .is_empty()
+        );
+        // Force delete removes it.
+        let (code, _, _) = delete_branch(&repo, "unmerged", true).unwrap();
+        assert_eq!(code, 0);
+        assert!(
+            repo.git(&["branch", "--list", "unmerged"])
+                .trim()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn delete_unknown_branch_is_not_found() {
+        let repo = TestRepo::init();
+        let err = delete_branch(&repo, "ghost", false).unwrap_err();
+        assert!(err.to_string().contains("ghost"));
     }
 }
