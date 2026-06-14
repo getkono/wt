@@ -44,6 +44,8 @@ pub enum KeyAction {
     PrCheckout,
     /// Check out a branch in the selected worktree (syncs with origin).
     Checkout,
+    /// Sync (pull then push) the selected worktree's branch.
+    Sync,
     /// Open the selected worktree in the editor.
     OpenEditor,
     /// Force a full async refresh.
@@ -66,7 +68,7 @@ pub enum KeyAction {
 
 impl KeyAction {
     /// All actions, in the order documented in §11.
-    pub const ALL: [KeyAction; 24] = [
+    pub const ALL: [KeyAction; 25] = [
         KeyAction::NavigateUp,
         KeyAction::NavigateDown,
         KeyAction::PageUp,
@@ -82,6 +84,7 @@ impl KeyAction {
         KeyAction::Remove,
         KeyAction::PrCheckout,
         KeyAction::Checkout,
+        KeyAction::Sync,
         KeyAction::OpenEditor,
         KeyAction::Refresh,
         KeyAction::SortCycle,
@@ -111,6 +114,7 @@ impl KeyAction {
             KeyAction::Remove => "remove",
             KeyAction::PrCheckout => "pr-checkout",
             KeyAction::Checkout => "checkout",
+            KeyAction::Sync => "sync",
             KeyAction::OpenEditor => "open-editor",
             KeyAction::Refresh => "refresh",
             KeyAction::SortCycle => "sort-cycle",
@@ -150,6 +154,7 @@ impl KeyAction {
             KeyAction::Remove => "remove",
             KeyAction::PrCheckout => "pr picker",
             KeyAction::Checkout => "checkout",
+            KeyAction::Sync => "sync",
             KeyAction::OpenEditor => "open in editor",
             KeyAction::Refresh => "refresh",
             KeyAction::SortCycle => "sort cycle",
@@ -412,6 +417,7 @@ impl Keymap {
             (KeyAction::Remove, KeyChord::key(KeyCode::Char('d'))),
             (KeyAction::PrCheckout, KeyChord::key(KeyCode::Char('p'))),
             (KeyAction::Checkout, KeyChord::key(KeyCode::Char('c'))),
+            (KeyAction::Sync, KeyChord::key(KeyCode::Char('y'))),
             (KeyAction::OpenEditor, KeyChord::key(KeyCode::Char('o'))),
             (KeyAction::Refresh, KeyChord::key(KeyCode::Char('r'))),
             (KeyAction::SortCycle, KeyChord::key(KeyCode::Char('s'))),
@@ -491,7 +497,7 @@ mod tests {
 
     #[test]
     fn action_names_round_trip_and_are_unique() {
-        assert_eq!(KeyAction::ALL.len(), 24);
+        assert_eq!(KeyAction::ALL.len(), 25);
         let mut names = std::collections::HashSet::new();
         for action in KeyAction::ALL {
             assert_eq!(KeyAction::parse(action.name()), Some(action));
@@ -659,6 +665,10 @@ mod tests {
         assert_eq!(
             m.action_for(KeyChord::key(KeyCode::Char('c'))),
             Some(KeyAction::Checkout)
+        );
+        assert_eq!(
+            m.action_for(KeyChord::key(KeyCode::Char('y'))),
+            Some(KeyAction::Sync)
         );
         assert_eq!(m.action_for(KeyChord::key(KeyCode::Char('z'))), None);
     }

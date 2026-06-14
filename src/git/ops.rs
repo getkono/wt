@@ -120,6 +120,14 @@ pub(crate) fn merge_ff_only(git: &dyn GitCli, dir: &Path, tracking_ref: &str) ->
     git.run(dir, &["merge", "--ff-only", tracking_ref])
 }
 
+/// Pushes `branch` to `remote` (`git push <remote> <branch>`), returning the raw
+/// [`GitOutput`] so the caller can interpret a rejected (non-fast-forward) push
+/// as a sentinel rather than a hard error. Never force-pushes, and always pushes
+/// the named branch explicitly (independent of `push.default`).
+pub(crate) fn push(git: &dyn GitCli, dir: &Path, remote: &str, branch: &str) -> Result<GitOutput> {
+    git.run_raw(dir, &["push", remote, branch])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +266,12 @@ mod tests {
             git.last(),
             ["merge", "--ff-only", "refs/remotes/origin/main"]
         );
+    }
+
+    #[test]
+    fn push_builds_explicit_remote_branch_push() {
+        let git = RecordingGit::new();
+        push(&git, &root(), "origin", "feature/x").unwrap();
+        assert_eq!(git.last(), ["push", "origin", "feature/x"]);
     }
 }

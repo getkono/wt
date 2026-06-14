@@ -62,6 +62,8 @@ pub(crate) enum Command {
     /// Switch the branch checked out in the current worktree (syncs with origin).
     #[command(visible_alias = "co")]
     Checkout(CheckoutArgs),
+    /// Pull then push the current (or selected) worktree's branch.
+    Sync(SyncArgs),
     /// List worktrees.
     #[command(visible_alias = "ls")]
     List(ListArgs),
@@ -159,6 +161,33 @@ pub(crate) struct CheckoutArgs {
 }
 
 impl CheckoutArgs {
+    /// Resolves the submodule-init flags to an override for the config policy
+    /// (see [`NewArgs::submodule_override`]).
+    pub(crate) fn submodule_override(&self) -> Option<bool> {
+        submodule_override(self.init_submodules, self.no_init_submodules)
+    }
+}
+
+/// Arguments for `wt sync`.
+#[derive(Debug, Args)]
+pub(crate) struct SyncArgs {
+    /// Worktree query (default: the current worktree).
+    pub(crate) query: Option<String>,
+    /// Sync every worktree.
+    #[arg(long)]
+    pub(crate) all: bool,
+    /// Pull only; do not push local commits.
+    #[arg(long = "no-push")]
+    pub(crate) no_push: bool,
+    /// Initialize git submodules after a fast-forward (overrides config).
+    #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
+    pub(crate) init_submodules: bool,
+    /// Do not initialize git submodules (overrides `[submodules] init`).
+    #[arg(long = "no-init-submodules")]
+    pub(crate) no_init_submodules: bool,
+}
+
+impl SyncArgs {
     /// Resolves the submodule-init flags to an override for the config policy
     /// (see [`NewArgs::submodule_override`]).
     pub(crate) fn submodule_override(&self) -> Option<bool> {
@@ -384,6 +413,7 @@ impl Cli {
             Some(
                 Command::New(_)
                 | Command::Checkout(_)
+                | Command::Sync(_)
                 | Command::List(_)
                 | Command::Remove(_)
                 | Command::Prune(_)
@@ -400,6 +430,7 @@ impl Cli {
         match &self.command {
             Some(Command::New(_)) => "new",
             Some(Command::Checkout(_)) => "checkout",
+            Some(Command::Sync(_)) => "sync",
             Some(Command::List(_)) => "list",
             Some(Command::Switch(_)) => "switch",
             Some(Command::Remove(_)) => "remove",
@@ -485,6 +516,7 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
             crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
         Some(Command::Checkout(args)) => crate::commands::checkout::run(cx, &args, json),
+        Some(Command::Sync(args)) => crate::commands::sync::run(cx, &args, json),
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),
         Some(Command::Remove(args)) => {
@@ -592,6 +624,29 @@ mod tests {
     }
 
     #[test]
+    fn sync_parses_with_flags() {
+        let cli = parse(&["sync", "feature/x", "--all", "--no-push"]).unwrap();
+        match cli.command {
+            Some(Command::Sync(a)) => {
+                assert_eq!(a.query.as_deref(), Some("feature/x"));
+                assert!(a.all);
+                assert!(a.no_push);
+            }
+            _ => panic!("expected sync"),
+        }
+        // No args: the current worktree, push on.
+        match parse(&["sync"]).unwrap().command {
+            Some(Command::Sync(a)) => {
+                assert!(a.query.is_none());
+                assert!(!a.all && !a.no_push);
+            }
+            _ => panic!("expected sync"),
+        }
+        // The submodule-init flags are mutually exclusive.
+        assert!(parse(&["sync", "--init-submodules", "--no-init-submodules"]).is_err());
+    }
+
+    #[test]
     fn no_subcommand_is_tui() {
         assert!(parse(&[]).unwrap().command.is_none());
     }
@@ -695,6 +750,7 @@ mod tests {
             vec!["status"],
             vec!["new", "b"],
             vec!["checkout", "b"],
+            vec!["sync"],
             vec!["remove", "q"],
             vec!["prune", "--merged"],
             vec!["pr", "list"],

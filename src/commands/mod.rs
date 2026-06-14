@@ -18,6 +18,7 @@ pub mod shell_init;
 pub mod staleness;
 pub mod status_cmd;
 pub mod switch;
+pub mod sync;
 
 use std::path::{Path, PathBuf};
 

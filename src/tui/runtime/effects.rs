@@ -146,6 +146,19 @@ pub(super) fn run_checkout_branch_command(
     .map_err(|e| e.to_string())
 }
 
+/// Syncs (pull then push) the branch in `worktree_dir` in place, rebuilding the
+/// session from the job's `Cx`. The TUI cannot prompt on a background job, so the
+/// submodule step follows the `[submodules] init` policy (no override, no prompt).
+pub(super) fn run_sync_command(
+    cx: &mut Cx,
+    worktree_dir: &Path,
+) -> std::result::Result<commands::sync::SyncOutcome, String> {
+    let git = cx.git.clone();
+    let session = open_session(cx, git.as_ref()).map_err(|e| e.to_string())?;
+    commands::sync::sync_worktree(cx, git.as_ref(), &session, worktree_dir, None, false, false)
+        .map_err(|e| e.to_string())
+}
+
 /// Spawns a blocking task that builds the fully-enriched worktrees and sends
 /// them to the loop.
 pub(super) fn spawn_enrichment(
@@ -310,6 +323,28 @@ pub(crate) fn do_checkout_branch(
         Job::CheckoutBranch {
             worktree_dir,
             branch,
+        },
+    );
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Syncs the worktree at `index` in place (fetch + ff/push), then refreshes and
+/// stays in the list. Outcomes (and errors) surface in the status bar.
+#[cfg(test)]
+pub(crate) fn do_sync(cx: &mut Cx, session: &Session, app: &mut App, index: usize) {
+    let Some(worktree) = app.worktrees.get(index) else {
+        return;
+    };
+    let worktree_dir = worktree.path.clone();
+    let label = worktree
+        .branch
+        .clone()
+        .unwrap_or_else(|| "worktree".to_string());
+    let outcome = run_job(
+        JobCx::capture(cx),
+        Job::Sync {
+            worktree_dir,
+            label,
         },
     );
     apply_outcome(cx, session, app, outcome);
@@ -498,6 +533,37 @@ pub(super) fn apply_checkout_branch(
             _ => app.set_status(e, StatusKind::Error),
         },
     }
+}
+
+/// Applies a finished sync (issue #63): stay in the (refreshed) list with a
+/// sync-annotated status. Refused/failed outcomes (diverged, dirty, push
+/// rejected) read as errors; everything else as a success. Sync acts directly
+/// from the list (no picker modal), so errors land in the status bar.
+pub(super) fn apply_sync(
+    cx: &Cx,
+    app: &mut App,
+    label: &str,
+    result: std::result::Result<commands::sync::SyncOutcome, String>,
+    root: &Path,
+) {
+    use commands::sync::SyncOutcome;
+    match result {
+        Ok(outcome) => {
+            let kind = match outcome {
+                SyncOutcome::Diverged | SyncOutcome::Dirty | SyncOutcome::PushRejected => {
+                    StatusKind::Error
+                }
+                _ => StatusKind::Success,
+            };
+            app.set_status(
+                format!("synced {label}{}", commands::sync::sync_suffix(outcome)),
+                kind,
+            );
+            do_refresh(cx, app, root);
+        }
+        Err(e) => app.set_status(e, StatusKind::Error),
+    }
+    app.mode = Mode::List;
 }
 
 /// Drafts the PR title/body with the code agent and seeds the compose form,
