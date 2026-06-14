@@ -1,0 +1,599 @@
+//! The TUI effect handlers (spec §10): the synchronous command runners that a
+//! background job executes (`run_*_command`), the `apply_*` functions that fold a
+//! finished [`JobOutcome`](super::JobOutcome) back into the [`App`], and the
+//! `do_*` entry points the event loop and tests drive. The async event loop, job
+//! scheduling, and the compose loop stay in the parent [`super`] module.
+
+use super::*;
+
+/// Builds the `NewArgs` a TUI create/materialize uses (no per-invocation
+/// submodule override — the `[submodules] init` policy decides, issue #50).
+pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
+    NewArgs {
+        branch: branch.to_string(),
+        from: base,
+        track: None,
+        no_track: false,
+        no_switch: true,
+        no_hooks: false,
+        copy_from: None,
+        init_submodules: false,
+        no_init_submodules: false,
+    }
+}
+
+/// Runs a create with staleness handling (issue #56). With no decision yet, it
+/// pre-flights the base and, if behind, returns `NeedsStaleConfirm` *without*
+/// creating; otherwise (or with a concrete decision) it creates, fast-forwarding
+/// the base first when the user chose to update. Hooks are captured so their
+/// output never paints the TUI.
+pub(super) fn run_create_command(
+    cx: &mut Cx,
+    branch: &str,
+    base: Option<String>,
+    decision: Option<CreateDecision>,
+) -> CreateOutcome {
+    let args = tui_new_args(branch, base);
+    match decision {
+        None => match commands::new::detect_stale_base(cx, &args) {
+            Ok(Some(stale)) => CreateOutcome::NeedsStaleConfirm {
+                behind: stale.behind,
+                upstream_display: stale.upstream_display,
+                can_fast_forward: stale.can_fast_forward,
+            },
+            // No stale base, or detection failed (offline) — just create.
+            _ => create_core(cx, &args),
+        },
+        Some(CreateDecision::Update) => match commands::new::update_stale_base(cx, &args) {
+            Ok(()) => create_core(cx, &args),
+            Err(e) => CreateOutcome::Failed(e.to_string()),
+        },
+        Some(CreateDecision::Proceed) => create_core(cx, &args),
+    }
+}
+
+/// Creates the worktree (no staleness check) and maps the result to a
+/// [`CreateOutcome`].
+pub(super) fn create_core(cx: &mut Cx, args: &NewArgs) -> CreateOutcome {
+    match commands::new::run_core(cx, &CapturingHookRunner, args, false) {
+        Ok(_) => CreateOutcome::Created,
+        Err(e) => CreateOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Materializes a worktree for an existing branch — checks it out as-is via the
+/// core create path (no staleness check; the branch already exists).
+pub(super) fn run_materialize_command(
+    cx: &mut Cx,
+    branch: &str,
+) -> std::result::Result<(), String> {
+    let args = tui_new_args(branch, None);
+    commands::new::run_core(cx, &CapturingHookRunner, &args, false)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Removes the worktree matched by `query` (force semantics, as the confirm
+/// dialog is the guard).
+pub(super) fn run_remove_command(cx: &mut Cx, query: &str) -> std::result::Result<(), String> {
+    let opts = commands::remove::RemoveOptions {
+        force_remove: true,
+        force_branch: false,
+        keep_branch: false,
+        no_hooks: false,
+    };
+    commands::remove::remove_query(cx, &CapturingHookRunner, query, &opts, false)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Deletes the local branch of a worktree-less branch row (issue #53): a safe
+/// `git branch -d` unless `force` (the unmerged re-prompt), which uses `-D`.
+pub(super) fn run_delete_branch_command(
+    cx: &mut Cx,
+    branch: &str,
+    force: bool,
+) -> std::result::Result<(), String> {
+    commands::remove::delete_branch_query(cx, branch, force, false)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Checks out a PR into a worktree, rebuilding the session from the job's `Cx`.
+pub(super) fn run_checkout_pr_command(
+    cx: &mut Cx,
+    number: u64,
+) -> std::result::Result<(PathBuf, bool), String> {
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let session = open_session(cx, git.as_ref()).map_err(|e| e.to_string())?;
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    commands::pr::checkout_pr_worktree(
+        cx,
+        git.as_ref(),
+        gh.as_ref(),
+        &CapturingHookRunner,
+        &session,
+        &dir,
+        &number.to_string(),
+        false,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Checks out `branch` in `worktree_dir` in place, rebuilding the session from
+/// the job's `Cx`.
+pub(super) fn run_checkout_branch_command(
+    cx: &mut Cx,
+    worktree_dir: &Path,
+    branch: &str,
+) -> std::result::Result<commands::checkout::SyncOutcome, String> {
+    let git = cx.git.clone();
+    let session = open_session(cx, git.as_ref()).map_err(|e| e.to_string())?;
+    commands::checkout::checkout_branch_in_worktree(
+        cx,
+        git.as_ref(),
+        &session,
+        worktree_dir,
+        branch,
+        false,
+        // No per-invocation override in the TUI; `[submodules] init` decides.
+        None,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Spawns a blocking task that builds the fully-enriched worktrees and sends
+/// them to the loop.
+pub(super) fn spawn_enrichment(
+    root: PathBuf,
+    git: Arc<dyn GitCli + Send + Sync>,
+    tx: mpsc::Sender<Vec<Worktree>>,
+) {
+    tokio::task::spawn_blocking(move || {
+        if let Ok(repo) = Repo::discover(&root)
+            && let Ok(worktrees) = build_rows(&repo, git.as_ref())
+        {
+            let _ = tx.blocking_send(worktrees);
+        }
+    });
+}
+
+/// Replaces the app's worktrees and marks every row loaded.
+pub(super) fn mark_all_loaded(app: &mut App, worktrees: Vec<Worktree>) {
+    let paths: Vec<PathBuf> = worktrees.iter().map(|w| w.path.clone()).collect();
+    app.set_worktrees(worktrees);
+    for path in paths {
+        app.mark_loaded(path);
+    }
+}
+
+/// Rebuilds the worktree list (after a mutation), preserving selection.
+pub(crate) fn do_refresh(cx: &Cx, app: &mut App, root: &Path) {
+    let git = cx.git.clone();
+    if let Ok(repo) = Repo::discover(root) {
+        // Refresh the branch options/completion candidates so a just-created
+        // branch becomes selectable (best-effort; keep the old list on failure).
+        if let Ok(branches) = crate::git::all_branches(repo.gix()) {
+            app.branches = branches;
+        }
+        if let Ok(worktrees) = build_rows(&repo, git.as_ref()) {
+            mark_all_loaded(app, worktrees);
+        }
+    }
+}
+
+/// Fetches open PRs into the picker (best-effort; errors shown inline).
+pub(crate) fn do_fetch_prs(cx: &Cx, session: &Session, app: &mut App) {
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let result = cx.gh.list_open_prs(&dir);
+    if let Mode::PrPicker(state) = &mut app.mode {
+        state.loading = false;
+        match result {
+            Ok(prs) => {
+                state.prs = prs
+                    .into_iter()
+                    .map(|p| {
+                        let pr_state = p.pr_state().as_str().to_string();
+                        PrItem {
+                            number: p.number,
+                            title: p.title,
+                            author: p.author.login,
+                            state: pr_state,
+                            created_at: p.created_at,
+                        }
+                    })
+                    .collect();
+            }
+            Err(e) => state.error = Some(e.to_string()),
+        }
+    }
+}
+
+// The `do_*` helpers below run the shell action synchronously (job then apply,
+// no `spawn_blocking`), keeping the original handler surface for unit tests; the
+// event loop instead spawns the job and applies the outcome asynchronously so it
+// can animate the spinner overlay (issue #46). They are test-only — the loop
+// never calls them.
+
+/// Creates a worktree and refreshes; errors show inline in the create modal.
+#[cfg(test)]
+pub(crate) fn do_create(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    branch: String,
+    base: Option<String>,
+) {
+    let outcome = run_job(
+        JobCx::capture(cx),
+        Job::Create {
+            branch,
+            base,
+            decision: None,
+        },
+    );
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Removes the worktree at `index` and refreshes. The confirm dialog is itself
+/// the guard, so the worktree is removed even if dirty/unpushed; but an unmerged
+/// branch is never force-deleted here (spec §10/§12) — only a fully-merged
+/// wt-created branch is cleaned up.
+#[cfg(test)]
+pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: usize) {
+    let Some(query) = remove_query_of(app, index) else {
+        return;
+    };
+    let outcome = run_job(JobCx::capture(cx), Job::Remove { query });
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Deletes a worktree-less branch row's local branch and refreshes (issue #53).
+/// The confirm dialog is the guard: a safe `git branch -d` unless `force`, which
+/// `git branch -D`s an unmerged branch. A safe refusal leaves the app in the
+/// force-delete re-prompt.
+#[cfg(test)]
+pub(crate) fn do_delete_branch(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    branch: String,
+    force: bool,
+) {
+    let outcome = run_job(JobCx::capture(cx), Job::DeleteBranch { branch, force });
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Materializes a worktree for an existing worktree-less branch and switches into
+/// it (issue #47): creates the worktree via the `new` path (which checks out an
+/// existing branch as-is), refreshes, then records the new worktree as `chosen`
+/// so the loop exits and the wrapper `cd`s into it. Errors show in the status bar.
+#[cfg(test)]
+pub(crate) fn do_materialize_branch(cx: &mut Cx, session: &Session, app: &mut App, branch: String) {
+    let outcome = run_job(JobCx::capture(cx), Job::Materialize { branch });
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Checks out a PR into a worktree. When `app.exit_on_pr_checkout` is set (the
+/// `wt pr` picker entry), records the new worktree as `chosen` so the loop exits
+/// and the wrapper `cd`s into it; otherwise returns to the list and refreshes
+/// (the in-TUI `p`-key flow).
+#[cfg(test)]
+pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, number: u64) {
+    let outcome = run_job(JobCx::capture(cx), Job::CheckoutPr { number });
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Checks out `branch` in the worktree at `index` in place, syncing with origin,
+/// then refreshes and stays in the list (the row updates in place). Errors show
+/// inline in the checkout picker; a successful sync's note is in the status bar.
+#[cfg(test)]
+pub(crate) fn do_checkout_branch(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    index: usize,
+    branch: String,
+) {
+    let Some(worktree_dir) = app.worktrees.get(index).map(|w| w.path.clone()) else {
+        return;
+    };
+    let outcome = run_job(
+        JobCx::capture(cx),
+        Job::CheckoutBranch {
+            worktree_dir,
+            branch,
+        },
+    );
+    apply_outcome(cx, session, app, outcome);
+}
+
+/// Applies a finished create: on success switch to the list with a status and
+/// refresh; on failure surface the error inline in the create modal.
+pub(super) fn apply_create(
+    cx: &Cx,
+    app: &mut App,
+    branch: &str,
+    base: Option<String>,
+    outcome: CreateOutcome,
+    root: &Path,
+) {
+    match outcome {
+        CreateOutcome::Created => {
+            app.mode = Mode::List;
+            app.set_status(format!("created {branch}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+            // Focus the newly created worktree (issue #52). `do_refresh` restores
+            // the prior selection by path, so this must run after it. If a filter
+            // hides the new row, the selection is left as-is (the filter is not
+            // cleared — that would be surprising).
+            let _ = app.select_branch(branch);
+        }
+        // The base is behind origin: open the confirm modal carrying the pending
+        // create's inputs so the user's choice can re-issue it (issue #56).
+        CreateOutcome::NeedsStaleConfirm {
+            behind,
+            upstream_display,
+            can_fast_forward,
+        } => {
+            app.mode = Mode::ConfirmStaleBase(StaleBaseState {
+                branch: branch.to_string(),
+                base,
+                behind,
+                upstream_display,
+                can_fast_forward,
+            });
+        }
+        CreateOutcome::Failed(e) => match &mut app.mode {
+            Mode::Create(state) => state.error = Some(e),
+            _ => app.set_status(e, StatusKind::Error),
+        },
+    }
+}
+
+/// Applies a finished remove: report success/error in the status bar, return to
+/// the list, and refresh.
+pub(super) fn apply_remove(
+    cx: &Cx,
+    app: &mut App,
+    query: &str,
+    result: std::result::Result<(), String>,
+    root: &Path,
+) {
+    match result {
+        Ok(()) => app.set_status(format!("removed {query}"), StatusKind::Success),
+        Err(e) => app.set_status(e, StatusKind::Error),
+    }
+    app.mode = Mode::List;
+    do_refresh(cx, app, root);
+}
+
+/// Applies a finished branch deletion (issue #53): on success report it and
+/// refresh; on a safe-delete refusal because the branch is unmerged, re-open the
+/// confirm to offer a force-delete; any other failure shows in the status bar.
+pub(super) fn apply_delete_branch(
+    cx: &Cx,
+    app: &mut App,
+    branch: &str,
+    force: bool,
+    result: std::result::Result<(), String>,
+    root: &Path,
+) {
+    match result {
+        Ok(()) => {
+            app.mode = Mode::List;
+            app.set_status(format!("deleted branch {branch}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+        }
+        // A safe `git branch -d` refused an unmerged branch: re-prompt to force.
+        // The delete failed, so the branch row still exists — re-find it by name.
+        Err(e) if !force && e.contains("not fully merged") => {
+            if let Some(index) = app
+                .worktrees
+                .iter()
+                .position(|w| !w.has_worktree && w.branch.as_deref() == Some(branch))
+            {
+                app.mode = Mode::ConfirmDeleteBranch { index, force: true };
+            } else {
+                app.mode = Mode::List;
+                app.set_status(e, StatusKind::Error);
+            }
+        }
+        Err(e) => {
+            app.mode = Mode::List;
+            app.set_status(e, StatusKind::Error);
+        }
+    }
+}
+
+/// Applies a finished materialize: on success refresh and record the new
+/// worktree as `chosen` (so the loop exits and the wrapper `cd`s into it); on
+/// failure surface the error in the status bar.
+pub(super) fn apply_materialize(
+    cx: &Cx,
+    app: &mut App,
+    branch: &str,
+    result: std::result::Result<(), String>,
+    root: &Path,
+) {
+    match result {
+        Ok(()) => {
+            app.set_status(format!("created {branch}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+            // Switch into the freshly created worktree for this branch.
+            if let Some(path) = app
+                .worktrees
+                .iter()
+                .find(|w| w.has_worktree && w.branch.as_deref() == Some(branch))
+                .map(|w| w.path.clone())
+            {
+                app.chosen = Some(path);
+            }
+        }
+        Err(e) => app.set_status(e, StatusKind::Error),
+    }
+    app.mode = Mode::List;
+}
+
+/// Applies a finished PR checkout: switch into the new worktree when
+/// `exit_on_pr_checkout` is set, else return to the list and refresh; errors
+/// show inline in the picker.
+pub(super) fn apply_checkout_pr(
+    cx: &Cx,
+    app: &mut App,
+    number: u64,
+    result: std::result::Result<(PathBuf, bool), String>,
+    root: &Path,
+) {
+    match result {
+        Ok((path, _existed)) => {
+            if app.exit_on_pr_checkout {
+                app.chosen = Some(path);
+            } else {
+                app.mode = Mode::List;
+                app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
+                do_refresh(cx, app, root);
+            }
+        }
+        Err(e) => match &mut app.mode {
+            Mode::PrPicker(state) => state.error = Some(e),
+            _ => app.set_status(e, StatusKind::Error),
+        },
+    }
+}
+
+/// Applies a finished in-place branch checkout: stay in the (refreshed) list
+/// with a sync-annotated status; errors show inline in the checkout picker.
+pub(super) fn apply_checkout_branch(
+    cx: &Cx,
+    app: &mut App,
+    branch: &str,
+    result: std::result::Result<commands::checkout::SyncOutcome, String>,
+    root: &Path,
+) {
+    match result {
+        Ok(outcome) => {
+            app.mode = Mode::List;
+            app.set_status(
+                format!(
+                    "checked out {branch}{}",
+                    commands::checkout::sync_suffix(outcome)
+                ),
+                StatusKind::Success,
+            );
+            do_refresh(cx, app, root);
+        }
+        Err(e) => match &mut app.mode {
+            Mode::Checkout(state) => {
+                state.error = Some(e);
+                state.submitting = false;
+            }
+            _ => app.set_status(e, StatusKind::Error),
+        },
+    }
+}
+
+/// Drafts the PR title/body with the code agent and seeds the compose form,
+/// using the model/effort currently selected in the form (`Ctrl-M`/`Ctrl-E`).
+/// Errors (including a missing agent) show inline in the form, which stays open.
+pub(crate) fn do_draft_pr_ai(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    ctx: &sendit::PrContext,
+) {
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    // Read the live model/effort from the form before borrowing it mutably.
+    let opts = match &app.mode {
+        Mode::PrCompose(state) => crate::agent::AgentOptions {
+            model: state.model,
+            effort: state.effort,
+        },
+        _ => crate::agent::AgentOptions::default(),
+    };
+    // The TUI is suspended during the (blocking) agent call, so a progress line
+    // on stderr is visible while the user waits.
+    let _ = cx.err.line(&format!(
+        "Drafting PR with {} (effort {})…",
+        opts.model.label(),
+        opts.effort.id()
+    ));
+    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), ctx, &dir, &opts);
+    if let Mode::PrCompose(state) = &mut app.mode {
+        match result {
+            Ok((title, body)) => {
+                state.title = title;
+                state.body = body;
+                state.error = None;
+            }
+            Err(e) => state.error = Some(e.to_string()),
+        }
+        state.submitting = false;
+    }
+}
+
+/// Submits the composed PR (push + create/update + metadata). On success stores
+/// the outcome and returns `true` to exit the loop; on failure shows the error
+/// inline and stays so the user can edit and retry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn do_submit_pr(
+    cx: &mut Cx,
+    session: &Session,
+    app: &mut App,
+    ctx: &sendit::PrContext,
+    action: sendit::PrAction,
+    title: String,
+    body: String,
+    draft: bool,
+    outcome: &mut Option<(sendit::PrOutcome, sendit::PrSpec)>,
+) -> bool {
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let spec = sendit::PrSpec { title, body, draft };
+    let result = crate::commands::pr_open::submit_pr(
+        git.as_ref(),
+        gh.as_ref(),
+        &session.primary_root,
+        &dir,
+        &session.config.pr_default_remote,
+        ctx,
+        &spec,
+        action,
+    );
+    match result {
+        Ok(out) => {
+            // Best-effort metadata so `wt list`/TUI show the new PR offline.
+            let _ = crate::commands::pr_open::record_pr_metadata(
+                git.as_ref(),
+                &session.primary_root,
+                &ctx.branch,
+                &ctx.trunk,
+                &out,
+                &spec.title,
+            );
+            *outcome = Some((out, spec));
+            true
+        }
+        Err(e) => {
+            if let Mode::PrCompose(state) = &mut app.mode {
+                state.error = Some(e.to_string());
+                state.submitting = false;
+            }
+            false
+        }
+    }
+}

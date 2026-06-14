@@ -612,4 +612,35 @@ mod tests {
         super::run(&mut t.cx, &args("feat"), false).unwrap();
         assert!(t.err.contents().contains("fast-forwarded"));
     }
+
+    #[test]
+    fn successful_fetch_without_upstream_reports_up_to_date() {
+        // A configured, reachable remote whose fetch succeeds, but the checked-out
+        // branch has no upstream: the sync reports UpToDate (a skipped or failed
+        // fetch would report FetchSkipped), and no offline warning is printed. This
+        // pins the fetch-skipped bool that `fetch_remote_best_effort` returns.
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        repo.git(&["push", "-q", "origin", "main"]);
+        repo.git(&["branch", "topic"]); // local branch, no upstream
+        let (t, res) = checkout(&repo, "topic", false);
+        assert_eq!(res.unwrap(), SyncOutcome::UpToDate);
+        assert_eq!(current_branch(&repo), "topic");
+        assert!(!t.err.contents().contains("failed to fetch"));
+    }
+
+    #[test]
+    fn failed_fetch_warns_and_checks_out_offline() {
+        // A configured but unreachable remote (bad URL): the fetch runs and fails,
+        // so a warning is printed and the checkout proceeds offline (FetchSkipped) —
+        // distinct from "fetch succeeded" (UpToDate) and from "no remote at all".
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", "/nonexistent/origin.git"]);
+        repo.git(&["branch", "topic"]); // local branch, no upstream
+        let (t, res) = checkout(&repo, "topic", false);
+        assert_eq!(res.unwrap(), SyncOutcome::FetchSkipped);
+        assert_eq!(current_branch(&repo), "topic");
+        assert!(t.err.contents().contains("failed to fetch origin"));
+    }
 }

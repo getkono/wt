@@ -336,9 +336,8 @@ fn delete_merged_branch(
 
 #[cfg(test)]
 mod tests {
-    use crate::cli::{NewArgs, PruneArgs};
-    use crate::hooks::RealHookRunner;
-    use crate::testutil::{CannedInput, TestRepo};
+    use crate::cli::PruneArgs;
+    use crate::testutil::{CannedInput, TestRepo, make_wt, wt_dir};
 
     fn prune_args(merged: bool, gone: bool, dry_run: bool, force: bool) -> PruneArgs {
         PruneArgs {
@@ -347,27 +346,6 @@ mod tests {
             dry_run,
             force,
         }
-    }
-
-    fn make_wt(repo: &TestRepo, branch: &str) {
-        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-        crate::commands::new::run(
-            &mut t.cx,
-            &RealHookRunner,
-            &NewArgs {
-                branch: branch.to_string(),
-                from: None,
-                track: None,
-                no_track: false,
-                no_switch: true,
-                no_hooks: true,
-                copy_from: None,
-                init_submodules: false,
-                no_init_submodules: false,
-            },
-            false,
-        )
-        .unwrap();
     }
 
     /// A branch at the current tip — an ancestor of the default branch (merged),
@@ -394,14 +372,6 @@ mod tests {
             &format!("branch.{name}.merge"),
             &format!("refs/heads/{name}"),
         ]);
-    }
-
-    fn wt_dir(repo: &TestRepo, branch: &str) -> std::path::PathBuf {
-        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
-        repo.root()
-            .parent()
-            .unwrap()
-            .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
     }
 
     /// Creates a worktree on `branch` and commits in it so the branch diverges

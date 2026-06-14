@@ -303,7 +303,7 @@ mod tests {
     use crate::cli::RemoveArgs;
     use crate::error::Result;
     use crate::hooks::RealHookRunner;
-    use crate::testutil::TestRepo;
+    use crate::testutil::{TestRepo, give_upstream, make_wt, wt_dir};
 
     fn args(query: &str, force: bool, keep_branch: bool) -> RemoveArgs {
         RemoveArgs {
@@ -318,52 +318,6 @@ mod tests {
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
         let code = super::run(&mut t.cx, &RealHookRunner, a, json)?;
         Ok((code, t.out.contents(), t.err.contents()))
-    }
-
-    /// Creates a wt-managed worktree via the real `new` command.
-    fn make_wt(repo: &TestRepo, branch: &str) {
-        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-        crate::commands::new::run(
-            &mut t.cx,
-            &RealHookRunner,
-            &crate::cli::NewArgs {
-                branch: branch.to_string(),
-                from: None,
-                track: None,
-                no_track: false,
-                no_switch: true,
-                no_hooks: true,
-                copy_from: None,
-                init_submodules: false,
-                no_init_submodules: false,
-            },
-            false,
-        )
-        .unwrap();
-    }
-
-    /// Gives `branch` an upstream at its current tip (ahead/behind 0), so the
-    /// no-upstream "unpushed" guard does not apply.
-    fn give_upstream(repo: &TestRepo, branch: &str) {
-        repo.git(&[
-            "update-ref",
-            &format!("refs/remotes/origin/{branch}"),
-            &format!("refs/heads/{branch}"),
-        ]);
-        repo.git(&["config", &format!("branch.{branch}.remote"), "origin"]);
-        repo.git(&[
-            "config",
-            &format!("branch.{branch}.merge"),
-            &format!("refs/heads/{branch}"),
-        ]);
-    }
-
-    fn wt_dir(repo: &TestRepo, branch: &str) -> std::path::PathBuf {
-        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
-        repo.root()
-            .parent()
-            .unwrap()
-            .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
     }
 
     #[test]
