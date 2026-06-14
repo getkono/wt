@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cli::PruneArgs;
-use crate::commands::{Session, candidate_label, confirm, open_session};
+use crate::commands::{Session, candidate_label, confirm, open_session, run_best_effort};
 use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
@@ -191,7 +191,12 @@ fn remove_worktree(
     }
     if !worktree.is_missing {
         let path = worktree.path.to_string_lossy();
-        let _ = git.run_raw(root, &["worktree", "remove", "--force", &path]);
+        run_best_effort(
+            git,
+            root,
+            &["worktree", "remove", "--force", &path],
+            "prune: worktree remove",
+        );
     }
     delete_merged_branch(git, &session.repo, root, worktree, &session.config, default);
     if let Some(branch) = &worktree.branch {
@@ -321,7 +326,12 @@ fn delete_merged_branch(
         .as_deref()
         .is_some_and(|d| is_ancestor(git, root, &branch_ref(branch), d));
     if merged {
-        let _ = git.run_raw(root, &["branch", "-D", branch]);
+        run_best_effort(
+            git,
+            root,
+            &["branch", "-D", branch],
+            "prune: delete merged branch",
+        );
     }
 }
 
