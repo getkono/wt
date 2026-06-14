@@ -9,7 +9,7 @@ use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{branch_ref, default_branch, is_ancestor, resolve_hex};
+use crate::git::{branch_ref, default_branch, is_ancestor, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
 use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status};
@@ -97,7 +97,7 @@ pub fn remove_query(
 
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
-        git.run(&root, &["worktree", "prune"])?;
+        ops::worktree_prune(git, &root)?;
         let deleted = maybe_delete_branch(
             git,
             &root,
@@ -150,11 +150,7 @@ pub fn remove_query(
 
     // Remove the worktree.
     let path = worktree.path.to_string_lossy().into_owned();
-    if opts.force_remove {
-        git.run(&root, &["worktree", "remove", "--force", &path])?;
-    } else {
-        git.run(&root, &["worktree", "remove", &path])?;
-    }
+    ops::worktree_remove(git, &root, &path, opts.force_remove)?;
 
     let deleted = maybe_delete_branch(
         git,
@@ -202,8 +198,7 @@ pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -
         )));
     }
 
-    let flag = if force { "-D" } else { "-d" };
-    let out = git.run_raw(&root, &["branch", flag, branch])?;
+    let out = ops::delete_branch(git, &root, branch, force)?;
     if !out.success {
         // `git branch -d` refuses an unmerged branch; preserve the "not fully
         // merged" sentinel so the TUI can re-prompt to force-delete (issue #53).
@@ -261,7 +256,7 @@ fn maybe_delete_branch(
     if !should_delete {
         return false;
     }
-    git.run_raw(root, &["branch", "-D", branch]).is_ok()
+    ops::delete_branch(git, root, branch, true).is_ok()
 }
 
 /// Clears the worktree's `wt.*` metadata, best-effort.

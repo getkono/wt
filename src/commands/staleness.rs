@@ -12,7 +12,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{ahead_behind, branch_ref, is_ancestor, resolve_hex, upstream_of};
+use crate::git::{ahead_behind, branch_ref, is_ancestor, ops, resolve_hex, upstream_of};
 use crate::worktree_service::enumerate_worktrees;
 
 /// A base branch found to be behind its upstream (issue #56).
@@ -58,7 +58,7 @@ pub fn check_base_behind(
     // Best-effort fetch so the comparison sees the latest origin (skipped when no
     // remote is configured / offline); a failure is non-fatal.
     if remote_configured(git, dir, &remote)
-        && let Err(e) = git.run_raw(dir, &["fetch", &remote])
+        && let Err(e) = ops::fetch(git, dir, &remote)
     {
         let _ = cx
             .err
@@ -99,9 +99,9 @@ pub fn fast_forward_base(
         .find(|w| w.branch.as_deref() == Some(base))
         .map(|w| w.path);
     if let Some(path) = checked_out {
-        git.run(&path, &["merge", "--ff-only", &stale.tracking_ref])?;
+        ops::merge_ff_only(git, &path, &stale.tracking_ref)?;
     } else {
-        git.run(root, &["branch", "-f", base, &stale.tracking_ref])?;
+        ops::set_branch_ref(git, root, base, &stale.tracking_ref)?;
     }
     let _ = cx.err.line(&format!(
         "updated {base} to {} (fast-forward)",

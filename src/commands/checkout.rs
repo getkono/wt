@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    branch_ref, is_ancestor, remote_branches, resolve_hex, status_of, upstream_of,
+    branch_ref, is_ancestor, ops, remote_branches, resolve_hex, status_of, upstream_of,
     validate_branch_name,
 };
 use crate::worktree_service::enumerate_worktrees;
@@ -115,7 +115,7 @@ pub(crate) fn checkout_branch_in_worktree(
     // the latest. Skipped when no remote is configured; a failure is non-fatal.
     let mut fetch_skipped = true;
     if remote_configured(git, worktree_dir, &remote) {
-        match git.run_raw(worktree_dir, &["fetch", &remote]) {
+        match ops::fetch(git, worktree_dir, &remote) {
             Ok(out) if out.success => fetch_skipped = false,
             _ => {
                 let _ = cx.err.line(&format!(
@@ -190,10 +190,7 @@ fn sync_with_upstream(
     match (ahead, behind) {
         // Strictly behind: a proven-clean fast-forward (the tree is clean here).
         (false, true) => {
-            git.run(
-                worktree_dir,
-                &["merge", "--ff-only", &upstream.tracking_ref],
-            )?;
+            ops::merge_ff_only(git, worktree_dir, &upstream.tracking_ref)?;
             Ok(SyncOutcome::FastForwarded)
         }
         // Diverged: never rewrite history — warn and leave the branch as-is.

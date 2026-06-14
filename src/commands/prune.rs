@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    branch_ref, current_branch, default_branch, is_ancestor, local_branches, upstream_of,
+    branch_ref, current_branch, default_branch, is_ancestor, local_branches, ops, upstream_of,
 };
 use crate::model::Worktree;
 use crate::worktree_service::{build_worktrees, guard_status};
@@ -94,7 +94,7 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     if candidates.is_empty() {
         cx.err.line("nothing to prune")?;
-        git.run(&root, &["worktree", "prune"])?;
+        ops::worktree_prune(git, &root)?;
         return Ok(0);
     }
 
@@ -127,7 +127,7 @@ pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     }
 
     // Reconcile Git's worktree admin metadata (equivalent to `git worktree prune`).
-    git.run(&root, &["worktree", "prune"])?;
+    ops::worktree_prune(git, &root)?;
     tracing::debug!(removed, "prune: done");
     cx.err.line(&format!("pruned {removed} item(s)"))?;
     Ok(0)
@@ -226,11 +226,10 @@ fn remove_branch(
         tracing::debug!(branch = %name, "prune: skip protected gone branch");
         return Ok(false);
     }
-    let flag = if merged { "-d" } else { "-D" };
-    match git.run_raw(root, &["branch", flag, name]) {
+    match ops::delete_branch(git, root, name, !merged) {
         Ok(out) if out.success => {
             let _ = wtconfig::clear_meta(git, root, name);
-            tracing::debug!(branch = %name, flag, "prune: deleted branch");
+            tracing::debug!(branch = %name, merged, "prune: deleted branch");
             Ok(true)
         }
         Ok(out) => {
