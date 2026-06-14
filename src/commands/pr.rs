@@ -13,7 +13,7 @@ use crate::cx::Cx;
 use crate::error::Result;
 use crate::gh::GhClient;
 use crate::git::cli::GitCli;
-use crate::git::resolve_hex;
+use crate::git::{branch_ref, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::slug::slugify_with_fallback;
 use crate::time::{now_unix, parse_iso8601, relative};
@@ -184,7 +184,7 @@ pub(crate) fn checkout_pr_worktree(
     let slug = slugify_with_fallback(&branch, &short_hash);
     // If a local branch of this name already exists (but has no worktree), check
     // it out as-is rather than failing on `-b` (mirrors `wt new`).
-    let branch_exists = resolve_hex(session.repo.gix(), &format!("refs/heads/{branch}")).is_some();
+    let branch_exists = resolve_hex(session.repo.gix(), &branch_ref(&branch)).is_some();
 
     let worktree_path = resolve_target(
         &session.config,

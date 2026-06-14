@@ -9,7 +9,7 @@ use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{default_branch, is_ancestor, resolve_hex};
+use crate::git::{branch_ref, default_branch, is_ancestor, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
 use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status};
@@ -184,7 +184,7 @@ pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -
     let root = session.primary_root.clone();
 
     // The branch must exist as a local ref.
-    if resolve_hex(session.repo.gix(), &format!("refs/heads/{branch}")).is_none() {
+    if resolve_hex(session.repo.gix(), &branch_ref(branch)).is_none() {
         return Err(Error::NotFound {
             query: branch.to_string(),
         });
@@ -252,7 +252,7 @@ fn maybe_delete_branch(
     let base = meta.base_ref.clone().or_else(|| default.clone());
     let merged = base
         .as_deref()
-        .is_some_and(|b| is_ancestor(git, root, &format!("refs/heads/{branch}"), b));
+        .is_some_and(|b| is_ancestor(git, root, &branch_ref(branch), b));
     let should_delete = if merged {
         config.remove_delete_merged_branch
     } else {

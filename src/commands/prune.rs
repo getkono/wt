@@ -11,7 +11,9 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{current_branch, default_branch, is_ancestor, local_branches, upstream_of};
+use crate::git::{
+    branch_ref, current_branch, default_branch, is_ancestor, local_branches, upstream_of,
+};
 use crate::model::Worktree;
 use crate::worktree_service::{build_worktrees, guard_status};
 
@@ -154,7 +156,7 @@ fn branch_candidates(
         }
         let merged = default
             .as_deref()
-            .is_some_and(|d| is_ancestor(git, root, &format!("refs/heads/{branch}"), d));
+            .is_some_and(|d| is_ancestor(git, root, &branch_ref(&branch), d));
         let gone = upstream_of(repo.gix(), &branch).is_some_and(|u| u.is_gone);
         tracing::trace!(branch = %branch, merged, gone, "prune: branch classified");
         if (args.merged && merged) || (args.gone && gone) {
@@ -277,7 +279,7 @@ fn is_candidate(
         // The default branch is an ancestor of itself; never prune a worktree
         // that is checked out on the default branch.
         && branch != default
-        && is_ancestor(git, root, &format!("refs/heads/{branch}"), default)
+        && is_ancestor(git, root, &branch_ref(branch), default)
     {
         return true;
     }
@@ -317,7 +319,7 @@ fn delete_merged_branch(
     }
     let merged = default
         .as_deref()
-        .is_some_and(|d| is_ancestor(git, root, &format!("refs/heads/{branch}"), d));
+        .is_some_and(|d| is_ancestor(git, root, &branch_ref(branch), d));
     if merged {
         let _ = git.run_raw(root, &["branch", "-D", branch]);
     }

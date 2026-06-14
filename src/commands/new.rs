@@ -13,7 +13,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{default_branch, resolve_hex};
+use crate::git::{branch_ref, default_branch, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
@@ -85,7 +85,7 @@ pub(crate) fn run_core(
     let branch = args.branch.clone();
 
     let worktrees = enumerate_worktrees(repo, git)?;
-    let branch_exists = resolve_hex(repo.gix(), &format!("refs/heads/{branch}")).is_some();
+    let branch_exists = resolve_hex(repo.gix(), &branch_ref(&branch)).is_some();
 
     let base_ref = if branch_exists {
         None
@@ -100,7 +100,7 @@ pub(crate) fn run_core(
     let base_commit = match &base_ref {
         Some(base) => resolve_hex(repo.gix(), base)
             .ok_or_else(|| Error::operation(format!("base ref {base:?} not found")))?,
-        None => resolve_hex(repo.gix(), &format!("refs/heads/{branch}")).unwrap_or_default(),
+        None => resolve_hex(repo.gix(), &branch_ref(&branch)).unwrap_or_default(),
     };
     let short_hash = base_commit.get(..7).unwrap_or(&base_commit).to_string();
     let slug = slugify_with_fallback(&branch, &short_hash);
@@ -253,7 +253,7 @@ pub(crate) fn prospective_base(
     args: &NewArgs,
     config: &crate::config::Config,
 ) -> Option<String> {
-    if resolve_hex(repo.gix(), &format!("refs/heads/{}", args.branch)).is_some() {
+    if resolve_hex(repo.gix(), &branch_ref(&args.branch)).is_some() {
         return None;
     }
     Some(resolve_base_ref(
