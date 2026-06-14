@@ -654,6 +654,20 @@ mod tests {
     }
 
     #[test]
+    fn merge_state_never_reports_branch_merged_into_itself() {
+        let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        // A worktree on the default branch: its only candidate merge target is
+        // itself, and a branch is trivially its own ancestor. That self-target
+        // must be skipped — otherwise it would wrongly report "merged into main".
+        let wt = merge_wt(&repo, "main", None, None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "main", None),
+            Some(MergeState::NoUpstreamLocal)
+        );
+    }
+
+    #[test]
     fn merge_state_ancestry_wins_over_merged_pr() {
         let repo = TestRepo::init();
         repo.git(&["branch", "feat"]); // ancestor of main

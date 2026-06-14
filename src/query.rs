@@ -157,4 +157,16 @@ mod tests {
             other => panic!("expected ambiguous, got {other:?}"),
         }
     }
+
+    #[test]
+    fn prefix_matches_on_slug_alone() {
+        // A worktree whose slug — but neither its branch nor its directory name —
+        // prefix-matches the query must still resolve. The three prefix checks
+        // are independent alternatives, not a conjunction.
+        let worktrees = vec![
+            wt("/r/main", Some("main"), Some("main")),
+            wt("/r/alpha", Some("alpha"), Some("zztop")),
+        ];
+        assert_eq!(resolve(&worktrees, "zz"), Resolved::One(1));
+    }
 }

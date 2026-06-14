@@ -530,9 +530,11 @@ mod tests {
         // Drop the worktree but keep the branch -> a worktree-less unmerged branch.
         let dir = wt_dir(&repo, "unmerged").to_string_lossy().into_owned();
         repo.git(&["worktree", "remove", "--force", &dir]);
-        // A safe delete refuses an unmerged branch; the branch survives.
+        // A safe delete refuses an unmerged branch; the branch survives. Assert
+        // the specific sentinel message (not just "not fully merged", which git's
+        // own stderr also contains) so the issue #53 TUI re-prompt keys on it.
         let err = delete_branch(&repo, "unmerged", false).unwrap_err();
-        assert!(err.to_string().contains("not fully merged"));
+        assert!(err.to_string().contains("is not fully merged; not deleted"));
         assert!(
             !repo
                 .git(&["branch", "--list", "unmerged"])

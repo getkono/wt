@@ -397,6 +397,25 @@ mod tests {
         ]);
     }
 
+    fn wt_dir(repo: &TestRepo, branch: &str) -> std::path::PathBuf {
+        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
+        repo.root()
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
+    }
+
+    /// Creates a worktree on `branch` and commits in it so the branch diverges
+    /// from main — i.e. it is not merged.
+    fn make_unmerged_wt(repo: &TestRepo, branch: &str) {
+        make_wt(repo, branch);
+        let wt = wt_dir(repo, branch);
+        std::fs::write(wt.join("change.txt"), "x\n").unwrap();
+        let dir = wt.to_string_lossy().into_owned();
+        repo.git(&["-C", &dir, "add", "-A"]);
+        repo.git(&["-C", &dir, "commit", "-q", "-m", "unmerged change"]);
+    }
+
     #[test]
     fn requires_a_mode_flag() {
         let repo = TestRepo::init();
@@ -538,6 +557,17 @@ mod tests {
         super::run(&mut t.cx, &prune_args(true, true, false, true), false).unwrap();
         assert!(t.err.contents().contains("nothing to prune"));
         assert!(repo.git(&["branch", "--list", "main"]).contains("main"));
+    }
+
+    #[test]
+    fn merged_only_skips_unmerged_worktree() {
+        // A worktree whose branch is not merged into main must never be a
+        // `--merged` prune candidate — a guard against pruning live work.
+        let repo = TestRepo::init();
+        make_unmerged_wt(&repo, "wip");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, true, false), false).unwrap();
+        assert!(t.err.contents().contains("nothing to prune"));
     }
 
     #[test]
