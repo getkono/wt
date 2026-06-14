@@ -1,7 +1,7 @@
 //! Worktree enumeration via `git worktree list --porcelain` (spec §4 sanctioned
 //! subprocess read) plus missing-directory detection.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::error::Result;
 use crate::git::cli::GitCli;
@@ -10,7 +10,7 @@ use crate::git::porcelain::{RawWorktree, parse_worktree_list};
 /// Enumerates the repository's worktrees from any directory inside it, marking
 /// any whose directory has been deleted externally as missing (spec §3). The
 /// main worktree is listed first.
-pub fn enumerate(git: &dyn GitCli, dir: &Path) -> Result<Vec<RawWorktree>> {
+pub(crate) fn enumerate(git: &dyn GitCli, dir: &Path) -> Result<Vec<RawWorktree>> {
     let output = git.run(dir, &["worktree", "list", "--porcelain"])?;
     let mut worktrees = parse_worktree_list(&output);
     for wt in &mut worktrees {
@@ -19,12 +19,6 @@ pub fn enumerate(git: &dyn GitCli, dir: &Path) -> Result<Vec<RawWorktree>> {
         wt.is_missing = !wt.is_bare && !wt.path.exists();
     }
     Ok(worktrees)
-}
-
-/// The primary worktree root (or bare repo path): the path of the main entry
-/// from [`enumerate`] (spec §3).
-pub fn primary_root(worktrees: &[RawWorktree]) -> Option<PathBuf> {
-    worktrees.iter().find(|w| w.is_main).map(|w| w.path.clone())
 }
 
 #[cfg(test)]
@@ -68,21 +62,5 @@ mod tests {
         assert_eq!(wts.len(), 1);
         assert!(wts[0].is_main);
         assert_eq!(wts[0].branch.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn primary_root_is_main_worktree_even_from_linked() {
-        let repo = TestRepo::init();
-        repo.add_worktree("feature/x", "../wt-x");
-        let linked = repo.root().parent().unwrap().join("wt-x");
-        // Enumerating from inside the linked worktree still reports the main
-        // worktree as the primary root.
-        let wts = enumerate(&RealGit, &linked).unwrap();
-        let root = primary_root(&wts).unwrap();
-        assert_eq!(canon(&root), canon(repo.root()));
-    }
-
-    fn canon(p: &std::path::Path) -> std::path::PathBuf {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 }

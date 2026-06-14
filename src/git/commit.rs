@@ -7,20 +7,20 @@ use crate::error::{Error, Result};
 
 /// Tip-commit metadata read from the object database.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitInfo {
+pub(crate) struct CommitInfo {
     /// Short commit hash (the full hex truncated to the abbreviation length).
-    pub hash: String,
+    pub(crate) hash: String,
     /// Commit subject (first line of the message).
-    pub subject: String,
+    pub(crate) subject: String,
     /// Author name.
-    pub author: String,
+    pub(crate) author: String,
     /// Author timestamp as Unix seconds.
-    pub timestamp_unix: i64,
+    pub(crate) timestamp_unix: i64,
 }
 
 /// The short-hash abbreviation length, honoring `core.abbrev` when set to a
 /// number, otherwise defaulting to 7 (spec §7 "Display conventions").
-pub fn abbrev_len(repo: &gix::Repository) -> usize {
+pub(crate) fn abbrev_len(repo: &gix::Repository) -> usize {
     repo.config_snapshot()
         .integer("core.abbrev")
         .and_then(|n| usize::try_from(n).ok())
@@ -29,7 +29,11 @@ pub fn abbrev_len(repo: &gix::Repository) -> usize {
 }
 
 /// Reads commit metadata for the object named by `oid_hex` (a full hex OID).
-pub fn commit_info(repo: &gix::Repository, oid_hex: &str, abbrev: usize) -> Result<CommitInfo> {
+pub(crate) fn commit_info(
+    repo: &gix::Repository,
+    oid_hex: &str,
+    abbrev: usize,
+) -> Result<CommitInfo> {
     let id = ObjectId::from_hex(oid_hex.as_bytes())
         .map_err(|e| Error::operation(format!("invalid object id {oid_hex:?}: {e}")))?;
     let commit = repo
@@ -61,7 +65,7 @@ pub fn commit_info(repo: &gix::Repository, oid_hex: &str, abbrev: usize) -> Resu
 /// Reads up to `max` recent commits starting at `start_hex` (newest first) by
 /// walking ancestry via `gix` (spec §4 reads). Best-effort: an invalid start or
 /// an unreadable commit simply truncates the result.
-pub fn recent_commits(
+pub(crate) fn recent_commits(
     repo: &gix::Repository,
     start_hex: &str,
     abbrev: usize,

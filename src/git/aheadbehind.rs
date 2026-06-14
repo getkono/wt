@@ -9,7 +9,7 @@ use crate::git::cli::GitCli;
 
 /// Counts how far `branch_ref` is ahead of and behind `upstream_ref`, run in
 /// `dir`. Returns `(ahead, behind)`.
-pub fn ahead_behind(
+pub(crate) fn ahead_behind(
     git: &dyn GitCli,
     dir: &Path,
     upstream_ref: &str,

@@ -6,27 +6,27 @@ use std::path::PathBuf;
 /// A worktree as reported by `git worktree list --porcelain`, before any
 /// filesystem checks or enrichment.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawWorktree {
+pub(crate) struct RawWorktree {
     /// Absolute path of the worktree.
-    pub path: PathBuf,
+    pub(crate) path: PathBuf,
     /// Checked-out commit (hex OID), or `None` for the bare entry.
-    pub head: Option<String>,
+    pub(crate) head: Option<String>,
     /// Branch name (without the `refs/heads/` prefix), or `None` if
     /// detached/bare.
-    pub branch: Option<String>,
+    pub(crate) branch: Option<String>,
     /// Whether this is the bare repository entry.
-    pub is_bare: bool,
+    pub(crate) is_bare: bool,
     /// Whether the worktree has a detached HEAD.
-    pub is_detached: bool,
+    pub(crate) is_detached: bool,
     /// Whether the worktree is locked.
-    pub is_locked: bool,
+    pub(crate) is_locked: bool,
     /// Whether Git considers the worktree prunable.
-    pub is_prunable: bool,
+    pub(crate) is_prunable: bool,
     /// Whether this is the main (first) worktree.
-    pub is_main: bool,
+    pub(crate) is_main: bool,
     /// Whether the worktree's directory is missing on disk. Left `false` by the
     /// parser; filled in by enumeration, which can touch the filesystem.
-    pub is_missing: bool,
+    pub(crate) is_missing: bool,
 }
 
 impl RawWorktree {
@@ -48,7 +48,7 @@ impl RawWorktree {
 /// Parses `git worktree list --porcelain` output. The first record is marked as
 /// the main worktree. Missing-directory detection is applied separately (it
 /// requires filesystem access).
-pub fn parse_worktree_list(porcelain: &str) -> Vec<RawWorktree> {
+pub(crate) fn parse_worktree_list(porcelain: &str) -> Vec<RawWorktree> {
     let mut result: Vec<RawWorktree> = Vec::new();
     let mut current: Option<RawWorktree> = None;
     for line in porcelain.lines() {
@@ -123,16 +123,16 @@ fn strip_branch_ref(reference: &str) -> String {
 /// `' '` (in sync), `'-'` (not initialized), `'+'` (checked-out commit differs
 /// from the index), or `'U'` (merge conflicts).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmoduleStatus {
+pub(crate) struct SubmoduleStatus {
     /// The leading status marker character.
-    pub state: char,
+    pub(crate) state: char,
     /// The submodule's path, relative to the superproject.
-    pub path: String,
+    pub(crate) path: String,
 }
 
 impl SubmoduleStatus {
     /// Whether the submodule is not yet initialized (marker `'-'`).
-    pub fn is_uninitialized(&self) -> bool {
+    pub(crate) fn is_uninitialized(&self) -> bool {
         self.state == '-'
     }
 }
@@ -141,7 +141,7 @@ impl SubmoduleStatus {
 /// `<marker><sha> <path>[ (<describe>)]`; the marker is the first character and
 /// is *not* separated from the SHA by a space. Lines that do not parse are
 /// skipped.
-pub fn parse_submodule_status(output: &str) -> Vec<SubmoduleStatus> {
+pub(crate) fn parse_submodule_status(output: &str) -> Vec<SubmoduleStatus> {
     let mut result = Vec::new();
     for line in output.lines() {
         let mut chars = line.chars();
