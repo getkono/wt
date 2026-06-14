@@ -444,6 +444,55 @@ impl TestRepo {
     }
 }
 
+/// Creates a wt-managed worktree on `branch` via the real `new` command, in a
+/// throwaway context. Shared by the prune/remove/checkout test modules.
+pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
+    let mut t = test_cx(&[], repo.root().to_str().unwrap());
+    crate::commands::new::run(
+        &mut t.cx,
+        &crate::hooks::RealHookRunner,
+        &crate::cli::NewArgs {
+            branch: branch.to_string(),
+            from: None,
+            track: None,
+            no_track: false,
+            no_switch: true,
+            no_hooks: true,
+            copy_from: None,
+            init_submodules: false,
+            no_init_submodules: false,
+        },
+        false,
+    )
+    .unwrap();
+}
+
+/// The path `wt new <branch>` produces for `repo` — the
+/// `<repo>.worktrees/<repo>-<branch>` sibling — without creating it.
+pub(crate) fn wt_dir(repo: &TestRepo, branch: &str) -> PathBuf {
+    let repo_name = repo.root().file_name().unwrap().to_string_lossy();
+    repo.root()
+        .parent()
+        .unwrap()
+        .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
+}
+
+/// Gives `branch` an upstream at its current tip (ahead/behind 0), so the
+/// no-upstream "unpushed" guard does not apply.
+pub(crate) fn give_upstream(repo: &TestRepo, branch: &str) {
+    repo.git(&[
+        "update-ref",
+        &format!("refs/remotes/origin/{branch}"),
+        &format!("refs/heads/{branch}"),
+    ]);
+    repo.git(&["config", &format!("branch.{branch}.remote"), "origin"]);
+    repo.git(&[
+        "config",
+        &format!("branch.{branch}.merge"),
+        &format!("refs/heads/{branch}"),
+    ]);
+}
+
 /// Runs `git -C <dir> <args>` with isolated config and identity, asserting
 /// success, and returns stdout.
 ///
