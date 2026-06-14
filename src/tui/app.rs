@@ -530,6 +530,22 @@ impl App {
             self.selected = pos;
         }
     }
+
+    /// Selects the visible row for the real worktree on `branch`, if present.
+    /// Returns whether a matching visible row was found — `false` when the row is
+    /// filtered out or absent, leaving the selection unchanged. Used to focus a
+    /// freshly created worktree (issue #52).
+    pub fn select_branch(&mut self, branch: &str) -> bool {
+        let Some(pos) = self.visible.iter().position(|&i| {
+            let w = &self.worktrees[i];
+            w.has_worktree && w.branch.as_deref() == Some(branch)
+        }) else {
+            return false;
+        };
+        self.selected = pos;
+        self.detail_scroll = 0;
+        true
+    }
 }
 
 /// The fuzzy-filter haystack for a worktree: branch + slug + path. A
@@ -741,6 +757,42 @@ mod tests {
         assert_eq!(a.selected, 1);
         a.select_row(99); // out of bounds -> no change
         assert_eq!(a.selected, 1);
+    }
+
+    #[test]
+    fn select_branch_focuses_match() {
+        let mut a = app(&[("main", true), ("feature/x", false), ("other", false)]);
+        a.selected = 0;
+        assert!(a.select_branch("feature/x"));
+        assert_eq!(
+            a.selected_worktree().unwrap().branch.as_deref(),
+            Some("feature/x")
+        );
+    }
+
+    #[test]
+    fn select_branch_misses_leave_selection_unchanged() {
+        let mut a = app(&[("alpha", true), ("beta", false)]);
+        a.selected = 1;
+        // A branch that exists but is filtered out of the visible set.
+        a.apply_filter("alph".into());
+        a.selected = 0;
+        assert!(!a.select_branch("beta"));
+        assert_eq!(a.selected, 0);
+        // A branch that is not present at all.
+        assert!(!a.select_branch("ghost"));
+        assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn select_branch_ignores_worktree_less_branch_rows() {
+        use super::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        a.apply_filter(String::new()); // include the branch row in `visible`
+        a.selected = 0;
+        // A worktree-less branch row is not a created worktree to focus.
+        assert!(!a.select_branch("topic"));
     }
 
     #[test]
