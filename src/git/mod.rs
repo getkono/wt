@@ -2,7 +2,7 @@
 //! network operations. Submodules:
 //!
 //! - [`cli`] — the [`GitCli`](cli::GitCli) subprocess trait + [`RealGit`](cli::RealGit).
-//! - `ops` — verb-named wrappers over [`GitCli`](cli::GitCli) for shared mutations.
+//! - `ops` — verb-named wrappers over [`GitCli`] for shared mutations.
 //! - [`discover`] — repository discovery and identity via `gix`.
 //! - [`porcelain`] — pure parsers for `git` porcelain output.
 //! - [`submodule`] — submodule detection (`status`) and init (`update --init`).

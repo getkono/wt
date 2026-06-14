@@ -10,8 +10,8 @@
 //! whole dispatch path testable without touching the real terminal.
 
 pub mod agent;
-pub mod cli;
-pub mod commands;
+pub(crate) mod cli;
+pub(crate) mod commands;
 pub mod config;
 pub mod copy;
 pub mod cx;
@@ -29,7 +29,7 @@ pub mod time;
 pub mod tui;
 pub mod util;
 pub mod version;
-pub mod worktree_service;
+pub(crate) mod worktree_service;
 
 #[cfg(test)]
 mod testutil;
