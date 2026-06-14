@@ -23,8 +23,8 @@ pub use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
 pub use discover::Repo;
 pub use porcelain::{RawWorktree, SubmoduleStatus, parse_submodule_status, parse_worktree_list};
 pub use refs::{
-    Upstream, all_branches, current_branch, default_branch, is_ancestor, local_branches,
-    remote_branches, resolve_hex, upstream_of, validate_branch_name,
+    Upstream, all_branches, branch_ref, current_branch, default_branch, is_ancestor,
+    local_branches, remote_branches, resolve_hex, upstream_of, validate_branch_name,
 };
 pub use status::{StatusSummary, status_of};
 pub use worktrees::{enumerate, primary_root};

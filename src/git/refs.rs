@@ -69,6 +69,15 @@ pub fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The fully-qualified ref of a local branch, i.e. `refs/heads/<branch>`.
+///
+/// Centralizes the single spelling of this path that the rest of the crate
+/// builds whenever it needs a branch's full ref — for `gix` rev-parsing,
+/// `git merge-base`, `git branch -f`, and so on.
+pub fn branch_ref(branch: &str) -> String {
+    format!("refs/heads/{branch}")
+}
+
 /// Validates a user-entered branch name as a legal git branch ref
 /// (`git check-ref-format --branch` semantics), returning a human-readable
 /// reason on failure. The name is validated as the full ref `refs/heads/<name>`,
@@ -77,7 +86,7 @@ pub fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// rejected.
 pub fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
     use gix::bstr::ByteSlice;
-    let full = format!("refs/heads/{name}");
+    let full = branch_ref(name);
     gix::validate::reference::branch_name(full.as_bytes().as_bstr())
         .map(|_| ())
         .map_err(|e| format!("invalid branch name: {e}"))
@@ -208,6 +217,13 @@ mod tests {
                 "expected {bad:?} to be rejected, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn branch_ref_prefixes_refs_heads() {
+        assert_eq!(branch_ref("main"), "refs/heads/main");
+        // Slashes in the branch name are preserved, not escaped.
+        assert_eq!(branch_ref("feature/login"), "refs/heads/feature/login");
     }
 
     #[test]
