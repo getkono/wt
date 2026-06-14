@@ -52,11 +52,12 @@ pub(crate) fn app_config(config: &Config, color: bool) -> AppConfig {
 pub fn run_tui(cx: &mut Cx, initial_filter: Option<&str>) -> Result<Option<PathBuf>> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
+    let opened_in = anchor_at_root(cx, &session);
     let mut app = build_app(cx, &session, git.as_ref())?;
     if let Some(filter) = initial_filter.filter(|f| !f.is_empty()) {
         app.apply_filter(filter.to_string());
     }
-    drive_tui(cx, &session, app, Effect::None)
+    drive_tui(cx, &session, app, Effect::None, &opened_in)
 }
 
 /// Runs the TUI directly in PR-picker mode (the `wt pr` no-argument entry).
@@ -66,13 +67,30 @@ pub fn run_tui(cx: &mut Cx, initial_filter: Option<&str>) -> Result<Option<PathB
 pub fn run_pr_picker(cx: &mut Cx) -> Result<Option<PathBuf>> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
+    let opened_in = anchor_at_root(cx, &session);
     let mut app = build_app(cx, &session, git.as_ref())?;
     app.exit_on_pr_checkout = true;
     app.mode = Mode::PrPicker(crate::tui::app::PrPickerState {
         loading: true,
         ..Default::default()
     });
-    drive_tui(cx, &session, app, Effect::FetchPrs)
+    drive_tui(cx, &session, app, Effect::FetchPrs, &opened_in)
+}
+
+/// Centres the session's git operations on the primary worktree root (issue #68):
+/// records the worktree the TUI was opened in, then repoints `cx.cwd` at the root
+/// so every subsequent operation — background jobs, refreshes, session rebuilds —
+/// anchors at the root rather than the opened-in worktree, which the user may
+/// remove during the session (deleting its directory out from under us). The
+/// returned path is the opened-in worktree root (the invocation directory for a
+/// bare repo), used on exit to detect whether it survived ([`finish_exit`]).
+fn anchor_at_root(cx: &mut Cx, session: &Session) -> PathBuf {
+    let opened_in = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| cx.cwd.clone());
+    cx.cwd = session.primary_root.clone();
+    opened_in
 }
 
 /// Builds the [`App`] over the session's worktrees plus worktree-less branch
@@ -96,6 +114,7 @@ fn drive_tui(
     session: &Session,
     mut app: App,
     initial: Effect,
+    opened_in: &Path,
 ) -> Result<Option<PathBuf>> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_loop(cx, session, &mut app, initial))?;
@@ -104,7 +123,45 @@ fn drive_tui(
         cx.err.line("terminal too small (need ≥5 rows)")?;
         return Err(Error::operation("terminal too small"));
     }
-    Ok(app.chosen.clone())
+    finish_exit(cx, opened_in, &session.primary_root, app.chosen.clone())
+}
+
+/// Resolves where the shell lands after a graceful TUI exit (issue #68).
+///
+/// An explicit switch (`chosen`) is always honoured. Otherwise, when the
+/// directory the TUI was opened in was deleted during the session — typically by
+/// removing the current worktree from the dashboard — the user must not be left
+/// in a directory that no longer exists. In that case the shell is steered back
+/// to the repository root (the returned path, printed to stdout) with a friendly
+/// note on stderr; if the root is also gone, only the note is emitted and no
+/// navigation occurs. When the opened-in directory survives, nothing is printed
+/// and the user stays put.
+fn finish_exit(
+    cx: &mut Cx,
+    opened_in: &Path,
+    primary_root: &Path,
+    chosen: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    if chosen.is_some() {
+        return Ok(chosen);
+    }
+    if opened_in.exists() {
+        return Ok(None);
+    }
+    if primary_root.exists() {
+        cx.err.line(&format!(
+            "worktree {} was removed during this session; returning to the repository root at {}",
+            opened_in.display(),
+            primary_root.display(),
+        ))?;
+        Ok(Some(primary_root.to_path_buf()))
+    } else {
+        cx.err.line(&format!(
+            "worktree {} was removed during this session, and the repository root is no longer available",
+            opened_in.display(),
+        ))?;
+        Ok(None)
+    }
 }
 
 /// The async event loop (terminal shell; not unit-tested). `initial` is an
@@ -1521,5 +1578,113 @@ mod tests {
         assert!(begin_job(&mut a, Effect::Refresh).is_none());
         // None of those marked the app busy.
         assert!(!a.is_busy());
+    }
+
+    #[test]
+    fn anchor_at_root_repoints_cwd_and_returns_opened_worktree() {
+        // The TUI opened in a linked worktree: git operations should re-anchor at
+        // the primary root, while the opened-in worktree path is returned so a
+        // later removal can be detected (issue #68).
+        let repo = TestRepo::init();
+        repo.add_worktree("feature/x", "../wt-x");
+        let linked = repo.root().parent().unwrap().join("wt-x");
+        let mut t = test_cx(&[], linked.to_str().unwrap());
+        let session = open_session(&t.cx, &crate::git::RealGit).unwrap();
+        let opened_in = anchor_at_root(&mut t.cx, &session);
+        assert_eq!(canon(&t.cx.cwd), canon(&session.primary_root));
+        assert_eq!(canon(&opened_in), canon(&linked));
+    }
+
+    #[test]
+    fn removing_opened_in_worktree_keeps_operations_working() {
+        // Issue #68: the TUI is opened inside a linked worktree which is then
+        // removed during the session. Because git operations are re-anchored at
+        // the root, the removal succeeds and a later session-open still works
+        // (instead of failing with the worktree's directory gone), and on exit
+        // the shell is steered back to the root with a friendly note.
+        let repo = TestRepo::init();
+        repo.add_worktree("feature/x", "../wt-x");
+        let linked = repo.root().parent().unwrap().join("wt-x");
+
+        // Open as if the TUI launched inside the linked worktree.
+        let mut t = test_cx(&[], linked.to_str().unwrap());
+        let session = open_session(&t.cx, &crate::git::RealGit).unwrap();
+        let opened_in = anchor_at_root(&mut t.cx, &session);
+        assert_eq!(canon(&opened_in), canon(&linked));
+        assert_eq!(canon(&t.cx.cwd), canon(&session.primary_root));
+
+        // Remove the worktree the TUI was opened in (the background-job path).
+        run_remove_command(&mut t.cx, "feature/x").unwrap();
+        assert!(!linked.exists());
+
+        // The session still opens: operations anchor at the surviving root.
+        let again = open_session(&t.cx, &crate::git::RealGit).unwrap();
+        assert_eq!(canon(&again.primary_root), canon(&session.primary_root));
+
+        // On graceful exit (no explicit switch), navigate back to the root.
+        let nav = finish_exit(&mut t.cx, &opened_in, &session.primary_root, None).unwrap();
+        assert_eq!(canon(&nav.unwrap()), canon(&session.primary_root));
+        assert!(t.err.contents().contains("was removed"));
+    }
+
+    #[test]
+    fn finish_exit_honors_explicit_switch() {
+        // An explicit switch is passed through untouched, even if the opened-in
+        // directory is gone.
+        let mut t = test_cx(&[], "/work");
+        let chosen = PathBuf::from("/somewhere/else");
+        let out = finish_exit(
+            &mut t.cx,
+            Path::new("/deleted"),
+            Path::new("/deleted-root"),
+            Some(chosen.clone()),
+        )
+        .unwrap();
+        assert_eq!(out, Some(chosen));
+        assert!(t.err.contents().is_empty());
+    }
+
+    #[test]
+    fn finish_exit_stays_put_when_opened_dir_survives() {
+        // No switch and the opened-in directory still exists: nothing is printed
+        // and the shell stays where it is.
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = test_cx(&[], "/work");
+        let out = finish_exit(&mut t.cx, dir.path(), dir.path(), None).unwrap();
+        assert_eq!(out, None);
+        assert!(t.err.contents().is_empty());
+    }
+
+    #[test]
+    fn finish_exit_returns_to_root_when_opened_dir_deleted() {
+        // The opened-in worktree was removed during the session but the root
+        // survives: navigate to the root and explain the move on stderr.
+        let root = tempfile::tempdir().unwrap();
+        let gone = root.path().join("wt-x");
+        let mut t = test_cx(&[], "/work");
+        let out = finish_exit(&mut t.cx, &gone, root.path(), None).unwrap();
+        assert_eq!(out.as_deref(), Some(root.path()));
+        let err = t.err.contents();
+        assert!(err.contains("was removed"));
+        assert!(err.contains(&root.path().display().to_string()));
+    }
+
+    #[test]
+    fn finish_exit_reports_when_root_also_gone() {
+        // Both the opened-in worktree and the root are gone: explain the
+        // situation and navigate nowhere.
+        let scratch = tempfile::tempdir().unwrap();
+        let gone = scratch.path().join("wt-x");
+        let gone_root = scratch.path().join("root");
+        let mut t = test_cx(&[], "/work");
+        let out = finish_exit(&mut t.cx, &gone, &gone_root, None).unwrap();
+        assert_eq!(out, None);
+        assert!(t.err.contents().contains("no longer available"));
+    }
+
+    /// Canonicalizes a path so comparisons ignore `/private` symlink prefixes on
+    /// macOS temp dirs.
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
     }
 }
