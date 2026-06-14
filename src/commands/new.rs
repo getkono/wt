@@ -20,10 +20,63 @@ use crate::query::{self, Resolved};
 use crate::slug::slugify_with_fallback;
 use crate::worktree_service::enumerate_worktrees;
 
+/// Creates a linked worktree for `branch`, prompting first when the base it would
+/// fork from is behind its origin counterpart (issue #56): the user can update the
+/// base, proceed off the stale base, or cancel. The check is skipped offline, for
+/// an existing branch, or when the base has no upstream. Delegates to [`run_core`]
+/// for the actual creation.
+pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
+    let git = cx.git.clone();
+    let git = git.as_ref();
+    // Pre-flight staleness check in its own scope so the session is dropped before
+    // `run_core` opens its own.
+    {
+        let session = open_session(cx, git)?;
+        if let Some(base) = prospective_base(cx, &session.repo, args, &session.config) {
+            let dir = session
+                .repo
+                .current_workdir()
+                .unwrap_or_else(|| session.primary_root.clone());
+            if let Some(stale) =
+                crate::commands::staleness::check_base_behind(cx, git, &session.repo, &dir, &base)?
+            {
+                let prompt = format!(
+                    "base {base:?} is {} commit(s) behind {}; [u]pdate / [p]roceed / [c]ancel (default cancel): ",
+                    stale.behind, stale.upstream_display
+                );
+                match crate::commands::choose(cx, &prompt)? {
+                    crate::commands::Choice::Update => {
+                        crate::commands::staleness::fast_forward_base(
+                            cx,
+                            git,
+                            &session.repo,
+                            &session.primary_root,
+                            &base,
+                            &stale,
+                        )?
+                    }
+                    crate::commands::Choice::Proceed => {}
+                    crate::commands::Choice::Cancel => {
+                        cx.err.line("aborted: base branch is behind origin")?;
+                        return Ok(1);
+                    }
+                }
+            }
+        }
+    }
+    run_core(cx, hooks, args, json)
+}
+
 /// Creates a linked worktree for `branch` (creating the branch if needed), runs
 /// the copy step and post-create hook, and prints the new path (unless
-/// `--no-switch`/`--json`).
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
+/// `--no-switch`/`--json`). The base-staleness check (issue #56) is the caller's
+/// responsibility — [`run`] does it for the CLI, the TUI before this is reached.
+pub(crate) fn run_core(
+    cx: &mut Cx,
+    hooks: &dyn HookRunner,
+    args: &NewArgs,
+    json: bool,
+) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
@@ -189,6 +242,74 @@ fn post_create_steps(
     }
     let source = copy_source(repo, worktrees, copy_from, root)?;
     copy_ignored_files(git, &source, target, &config.copy)
+}
+
+/// The base ref a `new` invocation would fork from, for the pre-flight staleness
+/// check (issue #56), or `None` when the branch already exists — then there is no
+/// fork and no base to check.
+pub(crate) fn prospective_base(
+    cx: &mut Cx,
+    repo: &Repo,
+    args: &NewArgs,
+    config: &crate::config::Config,
+) -> Option<String> {
+    if resolve_hex(repo.gix(), &format!("refs/heads/{}", args.branch)).is_some() {
+        return None;
+    }
+    Some(resolve_base_ref(
+        cx,
+        repo,
+        args.from.as_deref(),
+        &config.default_base,
+    ))
+}
+
+/// Detects whether the base `args` would fork from is behind its upstream (issue
+/// #56), for the TUI create pre-flight. `Ok(None)` when there is nothing to warn
+/// about (existing branch, no upstream, up to date, or offline).
+pub(crate) fn detect_stale_base(
+    cx: &mut Cx,
+    args: &NewArgs,
+) -> Result<Option<crate::commands::staleness::StaleBase>> {
+    let git = cx.git.clone();
+    let git = git.as_ref();
+    let session = open_session(cx, git)?;
+    let Some(base) = prospective_base(cx, &session.repo, args, &session.config) else {
+        return Ok(None);
+    };
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    crate::commands::staleness::check_base_behind(cx, git, &session.repo, &dir, &base)
+}
+
+/// Fast-forwards the base `args` would fork from to its upstream (issue #56, the
+/// TUI "update" action). A no-op when there is no stale base.
+pub(crate) fn update_stale_base(cx: &mut Cx, args: &NewArgs) -> Result<()> {
+    let git = cx.git.clone();
+    let git = git.as_ref();
+    let session = open_session(cx, git)?;
+    let Some(base) = prospective_base(cx, &session.repo, args, &session.config) else {
+        return Ok(());
+    };
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    if let Some(stale) =
+        crate::commands::staleness::check_base_behind(cx, git, &session.repo, &dir, &base)?
+    {
+        crate::commands::staleness::fast_forward_base(
+            cx,
+            git,
+            &session.repo,
+            &session.primary_root,
+            &base,
+            &stale,
+        )?;
+    }
+    Ok(())
 }
 
 /// Resolves the base ref for a new branch: `--from`, then `default_base`, then
@@ -518,5 +639,67 @@ mod tests {
         let err = t.err.contents();
         assert!(err.contains("copied"), "expected copy log at -v: {err}");
         assert!(err.contains(".env"));
+    }
+
+    /// Runs `new` with seeded prompt answers, returning `(code, out, err)`.
+    fn run_with_input(repo: &TestRepo, a: &NewArgs, inputs: &[&str]) -> (u8, String, String) {
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.input = Box::new(crate::testutil::CannedInput::new(inputs));
+        let code = super::run(&mut t.cx, &RealHookRunner, a, false).unwrap();
+        (code, t.out.contents(), t.err.contents())
+    }
+
+    /// Leaves local `main` one commit behind `origin/main` (with the upstream
+    /// configured but no fetchable remote, so the check's fetch is skipped).
+    /// Returns the `origin/main` commit.
+    fn make_main_behind(repo: &TestRepo) -> String {
+        let c1 = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("upstream.txt", "1\n");
+        repo.commit_all("ahead on origin");
+        let c2 = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &c2]);
+        repo.git(&["reset", "-q", "--hard", &c1]);
+        repo.git(&["config", "branch.main.remote", "origin"]);
+        repo.git(&["config", "branch.main.merge", "refs/heads/main"]);
+        c2
+    }
+
+    #[test]
+    fn stale_base_cancel_aborts_create() {
+        let repo = TestRepo::init();
+        make_main_behind(&repo);
+        // An empty answer defaults to cancel (issue #56).
+        let (code, out, err) = run_with_input(&repo, &args("feature"), &[""]);
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert!(err.contains("aborted"));
+        assert!(repo.git(&["branch", "--list", "feature"]).trim().is_empty());
+    }
+
+    #[test]
+    fn stale_base_proceed_creates_off_stale_base() {
+        let repo = TestRepo::init();
+        let c2 = make_main_behind(&repo);
+        let c1 = repo
+            .git(&["rev-parse", "refs/heads/main"])
+            .trim()
+            .to_string();
+        let (code, _, _) = run_with_input(&repo, &args("feature"), &["proceed"]);
+        assert_eq!(code, 0);
+        // Forked off the stale local main, not origin/main.
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/feature"]).trim(), c1);
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn stale_base_update_fast_forwards_then_creates() {
+        let repo = TestRepo::init();
+        let c2 = make_main_behind(&repo);
+        let (code, _, err) = run_with_input(&repo, &args("feature"), &["update"]);
+        assert_eq!(code, 0);
+        assert!(err.contains("updated main"));
+        // main was fast-forwarded to origin/main, and feature forks from it.
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/main"]).trim(), c2);
+        assert_eq!(repo.git(&["rev-parse", "refs/heads/feature"]).trim(), c2);
     }
 }

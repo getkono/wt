@@ -47,6 +47,9 @@ pub enum Mode {
         /// Whether this is the force-delete (`-D`) re-prompt for an unmerged branch.
         force: bool,
     },
+    /// Confirm dialog shown when the base a new worktree would fork from is behind
+    /// its origin counterpart (issue #56): update the base, proceed as-is, or cancel.
+    ConfirmStaleBase(StaleBaseState),
     /// Help overlay.
     Help,
 }
@@ -97,6 +100,24 @@ pub struct CreateState {
     /// The inline branch-options dropdown for the active field (issue #25):
     /// existing local + remote branches to fork from or check out.
     pub options: OptionList,
+}
+
+/// The stale-base confirm state (issue #56): the base a new worktree would fork
+/// from is behind its upstream. Carries the pending create's inputs so the
+/// user's choice (update / proceed) can re-issue it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleBaseState {
+    /// The new branch name being created.
+    pub branch: String,
+    /// The base ref the user entered (or `None` for the default).
+    pub base: Option<String>,
+    /// How many commits the base is behind its upstream.
+    pub behind: u32,
+    /// The upstream display name, e.g. `origin/main`.
+    pub upstream_display: String,
+    /// Whether the base can be fast-forwarded (no local-only commits); when
+    /// false, updating will fail and only proceed/cancel make sense.
+    pub can_fast_forward: bool,
 }
 
 /// Which create-prompt field is active.

@@ -20,7 +20,7 @@ use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
     App, BusyState, CheckoutState, ComposeField, CreateState, CreateStep, Mode, Pane,
-    PrComposeState, PrPickerState,
+    PrComposeState, PrPickerState, StaleBaseState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -56,6 +56,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::ConfirmDeleteBranch { index, force } => {
             render_confirm_delete_branch(app, *index, *force, frame, area)
         }
+        Mode::ConfirmStaleBase(state) => render_confirm_stale_base(app, state, frame, area),
         _ => {}
     }
 
@@ -618,6 +619,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::ConfirmRemove(_) => "REMOVE",
         Mode::ConfirmCreate(_) => "CREATE",
         Mode::ConfirmDeleteBranch { .. } => "DELETE",
+        Mode::ConfirmStaleBase(_) => "CREATE",
         Mode::Help => "HELP",
     }
 }
@@ -658,6 +660,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
         Mode::ConfirmCreate(_) => hint_pairs(hints::confirm_create_hints()),
         Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
+        Mode::ConfirmStaleBase(_) => hint_pairs(hints::confirm_stale_base_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -1337,6 +1340,56 @@ fn render_confirm_delete_branch(
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled(title, theme.error())))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// Renders the stale-base confirm dialog (issue #56): the base a new worktree
+/// would fork from is behind its upstream. Offers update / proceed / cancel; when
+/// the base has diverged it notes that updating would fail.
+fn render_confirm_stale_base(app: &App, state: &StaleBaseState, frame: &mut Frame, area: Rect) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("new branch: ", theme.label()),
+            Span::styled(state.branch.clone(), theme.branch(false, false)),
+        ]),
+        Line::from(vec![
+            Span::styled("base:       ", theme.label()),
+            Span::raw(state.base.clone().unwrap_or_else(|| "(default)".into())),
+        ]),
+        Line::from(vec![
+            Span::styled("status:     ", theme.label()),
+            Span::styled(
+                format!(
+                    "{} commit(s) behind {}",
+                    state.behind, state.upstream_display
+                ),
+                theme.warning(),
+            ),
+        ]),
+    ];
+    if !state.can_fast_forward {
+        lines.push(Line::from(Span::styled(
+            "(base has diverged — update will fail; proceed or cancel)",
+            theme.error(),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("u", theme.success()),
+        Span::raw("pdate the base, "),
+        Span::styled("p", theme.warning()),
+        Span::raw("roceed off it, or cancel?"),
+    ]));
+
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("base behind origin", theme.warning())))
             .wrap(Wrap { trim: false }),
         rect,
     );
