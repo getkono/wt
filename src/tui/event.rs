@@ -38,6 +38,14 @@ pub enum Effect {
     },
     /// Remove the worktree at the given index (confirmed; force semantics).
     Remove(usize),
+    /// Delete the local branch `branch` of a worktree-less branch row (confirmed;
+    /// issue #53). `force` uses `git branch -D` to delete an unmerged branch.
+    DeleteBranch {
+        /// The branch to delete.
+        branch: String,
+        /// Whether to force-delete an unmerged branch (`-D` vs `-d`).
+        force: bool,
+    },
     /// Create a worktree for an existing worktree-less branch and switch into it
     /// (confirmed). The runtime materializes the branch via the `new` path and
     /// records the new worktree as the chosen path (issue #47).
@@ -191,6 +199,7 @@ impl App {
             Mode::Checkout(_) => self.key_checkout_picker(key),
             Mode::ConfirmRemove(_) => self.key_confirm(key),
             Mode::ConfirmCreate(_) => self.key_confirm_create(key),
+            Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -237,12 +246,18 @@ impl App {
                 });
             }
             KeyAction::Remove => {
-                // Removal applies to real worktrees only; a branch row has no
-                // worktree to remove (issue #47).
-                if let Some(&index) = self.visible.get(self.selected)
-                    && self.worktrees[index].has_worktree
-                {
-                    self.mode = Mode::ConfirmRemove(index);
+                // A real worktree is removed; a worktree-less branch row has no
+                // worktree to remove, so Remove deletes its local branch instead
+                // (issue #53).
+                if let Some(&index) = self.visible.get(self.selected) {
+                    self.mode = if self.worktrees[index].has_worktree {
+                        Mode::ConfirmRemove(index)
+                    } else {
+                        Mode::ConfirmDeleteBranch {
+                            index,
+                            force: false,
+                        }
+                    };
                 }
             }
             KeyAction::PrCheckout => {
@@ -570,6 +585,23 @@ impl App {
         Effect::None
     }
 
+    /// Confirm-delete-branch key handling (issue #53): `y`/`Y` deletes the branch
+    /// row's local branch; any other key cancels. The `force` flag (set on the
+    /// unmerged re-prompt) is carried into the effect so the runtime uses
+    /// `git branch -D`.
+    fn key_confirm_delete_branch(&mut self, key: KeyEvent) -> Effect {
+        let Mode::ConfirmDeleteBranch { index, force } = self.mode else {
+            return Effect::None;
+        };
+        self.mode = Mode::List;
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            && let Some(branch) = self.worktrees.get(index).and_then(|w| w.branch.clone())
+        {
+            return Effect::DeleteBranch { branch, force };
+        }
+        Effect::None
+    }
+
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         match mouse.kind {
@@ -695,19 +727,50 @@ mod tests {
     }
 
     #[test]
-    fn mutating_actions_are_noops_on_branch_rows() {
-        // Remove / checkout / open-editor all need a worktree; on a branch row they
-        // do nothing (issue #47).
+    fn checkout_and_open_editor_are_noops_on_branch_rows() {
+        // Checkout / open-editor both need a worktree; on a branch row they do
+        // nothing (issue #47). Remove instead deletes the branch — see below.
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        a.apply_filter(String::new());
+        a.selected = a.visible.len() - 1; // the branch row
+        assert_eq!(a.handle_event(press(KeyCode::Char('c'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+        assert_eq!(a.handle_event(press(KeyCode::Char('o'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn remove_on_branch_row_confirms_then_deletes_branch() {
+        // Remove on a worktree-less branch row deletes its local branch (issue
+        // #53): first a confirm dialog, then `y` yields a DeleteBranch effect.
         use crate::tui::app::testutil::branch_row;
         let mut a = app(&[("main", true)]);
         a.worktrees.push(branch_row("topic"));
         a.apply_filter(String::new());
         a.selected = a.visible.len() - 1; // the branch row
         assert_eq!(a.handle_event(press(KeyCode::Char('d'))), Effect::None);
+        assert!(matches!(
+            a.mode,
+            Mode::ConfirmDeleteBranch { force: false, .. }
+        ));
+        let effect = a.handle_event(press(KeyCode::Char('y')));
+        assert_eq!(
+            effect,
+            Effect::DeleteBranch {
+                branch: "topic".into(),
+                force: false,
+            }
+        );
         assert_eq!(a.mode, Mode::List);
-        assert_eq!(a.handle_event(press(KeyCode::Char('c'))), Effect::None);
+        // A non-`y` key cancels back to the list.
+        a.mode = Mode::ConfirmDeleteBranch {
+            index: a.visible[a.selected],
+            force: true,
+        };
+        assert_eq!(a.handle_event(press(KeyCode::Char('n'))), Effect::None);
         assert_eq!(a.mode, Mode::List);
-        assert_eq!(a.handle_event(press(KeyCode::Char('o'))), Effect::None);
     }
 
     #[test]

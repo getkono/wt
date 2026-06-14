@@ -309,6 +309,7 @@ impl Theme {
             Mode::Checkout(_) => self.palette.accent,
             Mode::ConfirmRemove(_) => self.palette.red,
             Mode::ConfirmCreate(_) => self.palette.green,
+            Mode::ConfirmDeleteBranch { .. } => self.palette.red,
             Mode::Help => self.palette.cyan,
         };
         Style::default()

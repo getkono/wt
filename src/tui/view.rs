@@ -53,6 +53,9 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Checkout(state) => render_checkout(app, state, frame, area),
         Mode::ConfirmRemove(index) => render_confirm(app, *index, frame, area),
         Mode::ConfirmCreate(index) => render_confirm_create(app, *index, frame, area),
+        Mode::ConfirmDeleteBranch { index, force } => {
+            render_confirm_delete_branch(app, *index, *force, frame, area)
+        }
         _ => {}
     }
 
@@ -614,6 +617,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::Checkout(_) => "CHECKOUT",
         Mode::ConfirmRemove(_) => "REMOVE",
         Mode::ConfirmCreate(_) => "CREATE",
+        Mode::ConfirmDeleteBranch { .. } => "DELETE",
         Mode::Help => "HELP",
     }
 }
@@ -653,6 +657,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::Checkout(_) => hint_pairs(hints::checkout_hints()),
         Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
         Mode::ConfirmCreate(_) => hint_pairs(hints::confirm_create_hints()),
+        Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -1243,6 +1248,95 @@ fn render_confirm_create(app: &App, index: usize, frame: &mut Frame, area: Rect)
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::bordered().title(Span::styled("create worktree", theme.title(true))))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
+
+/// Renders the confirm-delete dialog for a worktree-less branch row (issue #53):
+/// the branch and its tip, then a prompt to delete the local branch. On the
+/// `force` re-prompt — after a safe `git branch -d` refused an unmerged branch —
+/// the prompt warns that deleting it may discard commits.
+fn render_confirm_delete_branch(
+    app: &App,
+    index: usize,
+    force: bool,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let Some(worktree) = app.worktrees.get(index) else {
+        return;
+    };
+    let now = now_unix();
+    let glyphs = Glyphs::new(app.nerd_fonts);
+    let loaded = app.is_loaded(worktree);
+
+    let branch_span = Span::styled(branch_display(worktree), theme.branch(false, false));
+    let mut lines = vec![Line::from(vec![
+        Span::styled("branch: ", theme.label()),
+        branch_span,
+    ])];
+    if let Some(base) = &worktree.base_ref {
+        lines.push(Line::from(vec![
+            Span::styled("base:   ", theme.label()),
+            Span::raw(base.clone()),
+        ]));
+    }
+    if loaded {
+        let mut spans = vec![Span::styled("vs base: ", theme.label())];
+        spans.extend(ahead_behind_spans(worktree, &theme, true, &glyphs));
+        lines.push(Line::from(spans));
+        if let Some(c) = &worktree.commit {
+            let rel = parse_iso8601(&c.timestamp)
+                .map(|u| relative(now, u))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("commit: ", theme.label()),
+                Span::styled(c.hash.clone(), theme.commit_hash()),
+                Span::raw(" "),
+                Span::raw(c.subject.clone()),
+                Span::raw(" "),
+                Span::styled(format!("({rel})"), theme.time()),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("vs base: ", theme.label()),
+            Span::styled("…", theme.spinner()),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    if force {
+        lines.push(Line::from(Span::styled(
+            "(branch is not fully merged — deleting may discard commits)",
+            theme.error(),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("Force-delete this branch? ["),
+            Span::styled("y", theme.warning()),
+            Span::raw("/N]"),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("Delete this branch? ["),
+            Span::styled("y", theme.warning()),
+            Span::raw("/N]"),
+        ]));
+    }
+
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
+    let title = if force {
+        "force-delete branch"
+    } else {
+        "delete branch"
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled(title, theme.error())))
             .wrap(Wrap { trim: false }),
         rect,
     );

@@ -37,6 +37,16 @@ pub enum Mode {
     /// Confirm creating a worktree for the worktree-less branch row at the given
     /// index, then switching into it (issue #47).
     ConfirmCreate(usize),
+    /// Confirm-delete dialog for the worktree-less branch row at `index` (issue
+    /// #53). A branch row has no worktree to remove, so Remove deletes its local
+    /// branch instead. `force` is set on the second prompt, after a safe
+    /// `git branch -d` refused an unmerged branch, to offer a `git branch -D`.
+    ConfirmDeleteBranch {
+        /// Index into [`App::worktrees`] of the branch row to delete.
+        index: usize,
+        /// Whether this is the force-delete (`-D`) re-prompt for an unmerged branch.
+        force: bool,
+    },
     /// Help overlay.
     Help,
 }
