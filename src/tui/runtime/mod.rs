@@ -225,7 +225,8 @@ fn dispatch_effect(
         | Effect::DeleteBranch { .. }
         | Effect::MaterializeBranch { .. }
         | Effect::CheckoutPr(_)
-        | Effect::CheckoutBranch { .. } => Ok(false),
+        | Effect::CheckoutBranch { .. }
+        | Effect::Sync { .. } => Ok(false),
         // Compose-only effects are driven by the dedicated compose loop
         // ([`run_pr_compose`]) and never reach the main loop.
         Effect::DraftPrAi | Effect::SubmitPr { .. } => Ok(false),
@@ -243,6 +244,7 @@ fn is_background_action(effect: &Effect) -> bool {
             | Effect::MaterializeBranch { .. }
             | Effect::CheckoutPr(_)
             | Effect::CheckoutBranch { .. }
+            | Effect::Sync { .. }
     )
 }
 
@@ -334,6 +336,13 @@ enum Job {
         /// The branch to check out.
         branch: String,
     },
+    /// Sync (pull then push) the branch in the worktree at `worktree_dir`.
+    Sync {
+        /// The target worktree directory.
+        worktree_dir: PathBuf,
+        /// The branch label for the status text, resolved on the foreground.
+        label: String,
+    },
 }
 
 /// The result of a background [`Job`], carrying the minimum its `apply_*` needs.
@@ -386,6 +395,13 @@ enum JobOutcome {
         branch: String,
         /// The sync outcome, or the error message.
         result: std::result::Result<commands::checkout::SyncOutcome, String>,
+    },
+    /// A finished sync (issue #63).
+    Sync {
+        /// The branch label for the status text.
+        label: String,
+        /// The sync outcome, or the error message.
+        result: std::result::Result<commands::sync::SyncOutcome, String>,
     },
 }
 
@@ -473,6 +489,22 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
                 label,
             )
         }
+        Effect::Sync { worktree_index } => {
+            let worktree = app.worktrees.get(worktree_index)?;
+            let worktree_dir = worktree.path.clone();
+            let label = worktree
+                .branch
+                .clone()
+                .unwrap_or_else(|| "worktree".to_string());
+            let busy = format!("Syncing {label}");
+            (
+                Job::Sync {
+                    worktree_dir,
+                    label,
+                },
+                busy,
+            )
+        }
         _ => return None,
     };
     app.begin_busy(label);
@@ -537,6 +569,13 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
             let result = run_checkout_branch_command(&mut cx, &worktree_dir, &branch);
             JobOutcome::CheckoutBranch { branch, result }
         }
+        Job::Sync {
+            worktree_dir,
+            label,
+        } => {
+            let result = run_sync_command(&mut cx, &worktree_dir);
+            JobOutcome::Sync { label, result }
+        }
     }
 }
 
@@ -565,6 +604,7 @@ fn apply_outcome(cx: &Cx, session: &Session, app: &mut App, outcome: JobOutcome)
         JobOutcome::CheckoutBranch { branch, result } => {
             apply_checkout_branch(cx, app, &branch, result, root)
         }
+        JobOutcome::Sync { label, result } => apply_sync(cx, app, &label, result, root),
     }
 }
 
@@ -1161,6 +1201,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn do_sync_fast_forwards_and_refreshes() {
+        // The primary worktree's `main` is behind `origin/main` (no fetchable
+        // remote, so the fetch is skipped): sync fast-forwards it in place.
+        let repo = TestRepo::init();
+        let c2 = main_behind_origin(&repo);
+        let (mut t, session, mut app) = setup(&repo);
+        do_sync(&mut t.cx, &session, &mut app, 0);
+        assert_eq!(app.mode, Mode::List);
+        assert_eq!(app.status_kind, StatusKind::Success);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("fast-forwarded")
+        );
+        assert_eq!(repo.git(&["rev-parse", "main"]).trim(), c2);
+    }
+
+    #[test]
+    fn do_sync_no_upstream_shows_status() {
+        let repo = TestRepo::init();
+        let (mut t, session, mut app) = setup(&repo);
+        do_sync(&mut t.cx, &session, &mut app, 0); // `main`, no upstream
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("no upstream")
+        );
+    }
+
+    #[test]
+    fn do_sync_dirty_shows_error_status() {
+        let repo = TestRepo::init();
+        main_behind_origin(&repo);
+        repo.write("README.md", "dirty\n"); // blocks the fast-forward
+        let (mut t, session, mut app) = setup(&repo);
+        do_sync(&mut t.cx, &session, &mut app, 0);
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert!(app.status_message.as_deref().unwrap().contains("dirty"));
+    }
+
+    #[test]
+    fn do_sync_error_shows_in_status() {
+        // A worktree whose directory is gone makes the sync core error out; the
+        // message surfaces in the status bar.
+        let repo = TestRepo::init();
+        repo.add_worktree("feat", "../wt-feat");
+        let (mut t, session, mut app) = setup(&repo);
+        let index = app
+            .worktrees
+            .iter()
+            .position(|w| w.branch.as_deref() == Some("feat"))
+            .unwrap();
+        std::fs::remove_dir_all(repo.root().parent().unwrap().join("wt-feat")).unwrap();
+        do_sync(&mut t.cx, &session, &mut app, index);
+        assert_eq!(app.status_kind, StatusKind::Error);
+        assert!(app.status_message.is_some());
+    }
+
     fn sendit_ctx(branch: &str, trunk: &str, has_upstream: bool) -> sendit::PrContext {
         sendit::PrContext {
             branch: branch.into(),
@@ -1347,6 +1449,7 @@ mod tests {
             worktree_index: 0,
             branch: "x".into()
         }));
+        assert!(is_background_action(&Effect::Sync { worktree_index: 0 }));
         // Non-mutating effects run inline, not on a background task.
         assert!(!is_background_action(&Effect::Refresh));
         assert!(!is_background_action(&Effect::FetchPrs));
@@ -1388,6 +1491,11 @@ mod tests {
         assert!(matches!(job, Job::CheckoutBranch { .. }));
         assert_eq!(a.busy.as_ref().unwrap().label, "Checking out feat/x");
 
+        // Sync resolves the worktree directory and labels with the branch.
+        let job = begin_job(&mut a, Effect::Sync { worktree_index: 1 }).unwrap();
+        assert!(matches!(job, Job::Sync { .. }));
+        assert_eq!(a.busy.as_ref().unwrap().label, "Syncing feat/x");
+
         let job = begin_job(&mut a, Effect::CheckoutPr(7)).unwrap();
         assert!(matches!(job, Job::CheckoutPr { number } if number == 7));
         assert_eq!(a.busy.as_ref().unwrap().label, "Checking out PR #7");
@@ -1408,6 +1516,7 @@ mod tests {
             )
             .is_none()
         );
+        assert!(begin_job(&mut a, Effect::Sync { worktree_index: 99 }).is_none());
         // A non-background effect also yields no job.
         assert!(begin_job(&mut a, Effect::Refresh).is_none());
         // None of those marked the app busy.

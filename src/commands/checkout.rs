@@ -148,7 +148,8 @@ fn ensure_branch_available(
 /// latest. Returns whether the fetch was skipped — `true` when no remote is
 /// configured or it failed (a non-fatal warning is written to stderr), which the
 /// upstream sync uses to tell "nothing to sync with" from "already up to date".
-fn fetch_remote_best_effort(
+/// Shared with `wt sync` (issue #63).
+pub(crate) fn fetch_remote_best_effort(
     cx: &mut Cx,
     git: &dyn GitCli,
     worktree_dir: &Path,

@@ -79,6 +79,11 @@ pub enum Effect {
         /// The branch to check out.
         branch: String,
     },
+    /// Sync (pull then push) the worktree at `worktree_index` in place (issue #63).
+    Sync {
+        /// Index into `App::worktrees` of the target worktree.
+        worktree_index: usize,
+    },
     /// Open the given path in the editor.
     OpenEditor(PathBuf),
     /// Force a full async refresh.
@@ -301,6 +306,17 @@ impl App {
                         options,
                         ..Default::default()
                     });
+                }
+            }
+            KeyAction::Sync => {
+                // Sync acts in place on a real worktree (fetch + ff/push), so it is
+                // a no-op on a worktree-less branch row (issue #47/#63).
+                if let Some(&index) = self.visible.get(self.selected)
+                    && self.worktrees[index].has_worktree
+                {
+                    return Effect::Sync {
+                        worktree_index: index,
+                    };
                 }
             }
             KeyAction::OpenEditor => {
@@ -782,6 +798,24 @@ mod tests {
         assert_eq!(a.handle_event(press(KeyCode::Char('c'))), Effect::None);
         assert_eq!(a.mode, Mode::List);
         assert_eq!(a.handle_event(press(KeyCode::Char('o'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn sync_acts_on_worktree_rows_and_is_noop_on_branch_rows() {
+        use crate::tui::app::testutil::branch_row;
+        let mut a = app(&[("main", true), ("feat", false)]);
+        // On a real worktree row, `y` yields a Sync effect for that row's index.
+        a.selected = 1;
+        assert_eq!(
+            a.handle_event(press(KeyCode::Char('y'))),
+            Effect::Sync { worktree_index: 1 }
+        );
+        // On a worktree-less branch row, `y` does nothing (issue #63).
+        a.worktrees.push(branch_row("topic"));
+        a.apply_filter(String::new());
+        a.selected = a.visible.len() - 1;
+        assert_eq!(a.handle_event(press(KeyCode::Char('y'))), Effect::None);
         assert_eq!(a.mode, Mode::List);
     }
 
