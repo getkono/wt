@@ -13,8 +13,8 @@ use crate::error::Result;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch, enumerate,
-    is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
+    CommitInfo, Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch,
+    enumerate, is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
 };
 use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
@@ -70,14 +70,7 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         let upstream = upstream_of(repo.gix(), &branch);
         if let Some(up) = &upstream {
             wt.upstream = Some(up.display.clone());
-            if !wt.is_missing
-                && !up.is_gone
-                && let Ok((ahead, behind)) =
-                    ahead_behind(git, &wt.path, &up.tracking_ref, &branch_ref(&branch))
-            {
-                wt.ahead = Some(ahead);
-                wt.behind = Some(behind);
-            }
+            fill_ahead_behind(git, wt, &branch, up);
         }
         // Offline merge-state for delete-safety messaging; unknowable for a
         // missing worktree (no checkout to query), left `None` there.
@@ -96,25 +89,47 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         wt.has_untracked = Some(status.has_untracked);
     }
 
-    if let Some(oid) = tip_oid(repo, git, wt) {
-        if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
-            wt.commit = Some(Commit {
-                hash: info.hash,
-                subject: info.subject,
-                author: info.author,
-                timestamp: iso8601(info.timestamp_unix),
-            });
-        }
-        // The last few commits power the TUI detail pane (spec §10).
-        wt.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
-            .into_iter()
-            .map(|info| Commit {
-                hash: info.hash,
-                subject: info.subject,
-                author: info.author,
-                timestamp: iso8601(info.timestamp_unix),
-            })
-            .collect();
+    fill_commits(repo, git, abbrev, wt);
+}
+
+/// Fills `wt.ahead`/`wt.behind` against a present `upstream`. Skipped for a
+/// missing worktree (no checkout to count against) or a gone upstream; a failed
+/// count leaves the fields unset.
+fn fill_ahead_behind(git: &dyn GitCli, wt: &mut Worktree, branch: &str, upstream: &Upstream) {
+    if !wt.is_missing
+        && !upstream.is_gone
+        && let Ok((ahead, behind)) =
+            ahead_behind(git, &wt.path, &upstream.tracking_ref, &branch_ref(branch))
+    {
+        wt.ahead = Some(ahead);
+        wt.behind = Some(behind);
+    }
+}
+
+/// Fills the tip commit and the recent-commit list that powers the TUI detail
+/// pane (spec §10), resolved from the worktree's tip OID. A worktree with no
+/// resolvable tip keeps both unset.
+fn fill_commits(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
+    let Some(oid) = tip_oid(repo, git, wt) else {
+        return;
+    };
+    if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
+        wt.commit = Some(to_commit(info));
+    }
+    wt.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
+        .into_iter()
+        .map(to_commit)
+        .collect();
+}
+
+/// Maps a git [`CommitInfo`] to the model [`Commit`], formatting its timestamp as
+/// ISO-8601.
+fn to_commit(info: CommitInfo) -> Commit {
+    Commit {
+        hash: info.hash,
+        subject: info.subject,
+        author: info.author,
+        timestamp: iso8601(info.timestamp_unix),
     }
 }
 
