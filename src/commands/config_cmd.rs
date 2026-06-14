@@ -166,8 +166,14 @@ fn edit(cx: &mut Cx, config: &Config, file: &Path) -> Result<u8> {
 
 /// Sets a dotted `key` in the document, creating intermediate tables.
 fn set_dotted(doc: &mut DocumentMut, key: &str, item: Item) -> Result<()> {
-    let parts: Vec<&str> = key.split('.').collect();
-    let (last, prefix) = parts.split_last().expect("non-empty key");
+    // The leaf is the final dotted component; anything before it names the
+    // intermediate tables. `rsplit_once` keeps this total — an undotted key is
+    // its own leaf with no parent tables — so there is no empty-key edge case
+    // (and thus no panic where `split_last` previously could not fail).
+    let (prefix, last) = match key.rsplit_once('.') {
+        Some((parents, leaf)) => (parents.split('.').collect::<Vec<&str>>(), leaf),
+        None => (Vec::new(), key),
+    };
     let mut table = doc.as_table_mut();
     for part in prefix {
         let entry = table
@@ -644,5 +650,17 @@ mod tests {
         let (_, out, _) = run(&repo, &[], ConfigAction::List, false, false);
         assert!(out.contains("ui.theme.preset = one-dark"));
         assert!(out.contains("ui.theme.accent = "));
+    }
+
+    #[test]
+    fn set_dotted_writes_nested_and_top_level_keys() {
+        use toml_edit::{DocumentMut, value};
+        let mut doc = DocumentMut::new();
+        // A dotted key creates the intermediate table; an undotted key is written
+        // at the top level.
+        super::set_dotted(&mut doc, "hooks.post_create", value("echo hi")).unwrap();
+        super::set_dotted(&mut doc, "editor", value("vim")).unwrap();
+        assert_eq!(doc["hooks"]["post_create"].as_str(), Some("echo hi"));
+        assert_eq!(doc["editor"].as_str(), Some("vim"));
     }
 }

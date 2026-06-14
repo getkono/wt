@@ -1,0 +1,20 @@
+# Configuration for cargo-mutants (https://mutants.rs/).
+#
+# Mutation testing finds code the test suite does not actually pin down:
+# cargo-mutants applies a small semantic change (a flipped comparison, a removed
+# statement, a swapped return value) and reports any "mutant" that survives —
+# i.e. one that no test caught. A survivor marks logic a refactor could silently
+# break without a single test going red.
+#
+# Run a full sweep with `just mutants`, or restrict it to the code a branch
+# changed with `just mutants-diff`.
+
+# `main.rs` is a deliberately thin entry point: it is excluded from coverage and
+# has no unit tests, so every mutant there would survive and add only noise.
+exclude_globs = ["src/main.rs"]
+
+# A mutant can introduce an infinite loop; without a ceiling the sweep would
+# stall on it. The suite runs in well under a second, so these bounds cap a
+# runaway mutant quickly while staying generous for an honest slow test.
+minimum_test_timeout = 60
+timeout_multiplier = 5.0

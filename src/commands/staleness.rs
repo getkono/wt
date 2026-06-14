@@ -12,7 +12,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{ahead_behind, is_ancestor, resolve_hex, upstream_of};
+use crate::git::{ahead_behind, branch_ref, is_ancestor, resolve_hex, upstream_of};
 use crate::worktree_service::enumerate_worktrees;
 
 /// A base branch found to be behind its upstream (issue #56).
@@ -44,7 +44,7 @@ pub fn check_base_behind(
 ) -> Result<Option<StaleBase>> {
     // Only a local branch has a base to fall behind; a raw ref like `origin/main`
     // or `HEAD` is not something this tracks or updates.
-    if resolve_hex(repo.gix(), &format!("refs/heads/{base}")).is_none() {
+    if resolve_hex(repo.gix(), &branch_ref(base)).is_none() {
         return Ok(None);
     }
     let Some(up) = upstream_of(repo.gix(), base) else {
@@ -64,7 +64,7 @@ pub fn check_base_behind(
             .err
             .line(&format!("warning: failed to fetch {remote}: {e}"));
     }
-    let (ahead, behind) = ahead_behind(git, dir, &up.tracking_ref, &format!("refs/heads/{base}"))?;
+    let (ahead, behind) = ahead_behind(git, dir, &up.tracking_ref, &branch_ref(base))?;
     if behind == 0 {
         return Ok(None);
     }
@@ -88,12 +88,7 @@ pub fn fast_forward_base(
     base: &str,
     stale: &StaleBase,
 ) -> Result<()> {
-    if !is_ancestor(
-        git,
-        root,
-        &format!("refs/heads/{base}"),
-        &stale.tracking_ref,
-    ) {
+    if !is_ancestor(git, root, &branch_ref(base), &stale.tracking_ref) {
         return Err(Error::operation(format!(
             "base {base:?} has diverged from {}; cannot fast-forward",
             stale.upstream_display

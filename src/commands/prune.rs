@@ -5,13 +5,15 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::cli::PruneArgs;
-use crate::commands::{Session, candidate_label, confirm, open_session};
+use crate::commands::{Session, candidate_label, confirm, open_session, run_best_effort};
 use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{current_branch, default_branch, is_ancestor, local_branches, upstream_of};
+use crate::git::{
+    branch_ref, current_branch, default_branch, is_ancestor, local_branches, upstream_of,
+};
 use crate::model::Worktree;
 use crate::worktree_service::{build_worktrees, guard_status};
 
@@ -154,7 +156,7 @@ fn branch_candidates(
         }
         let merged = default
             .as_deref()
-            .is_some_and(|d| is_ancestor(git, root, &format!("refs/heads/{branch}"), d));
+            .is_some_and(|d| is_ancestor(git, root, &branch_ref(&branch), d));
         let gone = upstream_of(repo.gix(), &branch).is_some_and(|u| u.is_gone);
         tracing::trace!(branch = %branch, merged, gone, "prune: branch classified");
         if (args.merged && merged) || (args.gone && gone) {
@@ -189,7 +191,12 @@ fn remove_worktree(
     }
     if !worktree.is_missing {
         let path = worktree.path.to_string_lossy();
-        let _ = git.run_raw(root, &["worktree", "remove", "--force", &path]);
+        run_best_effort(
+            git,
+            root,
+            &["worktree", "remove", "--force", &path],
+            "prune: worktree remove",
+        );
     }
     delete_merged_branch(git, &session.repo, root, worktree, &session.config, default);
     if let Some(branch) = &worktree.branch {
@@ -277,7 +284,7 @@ fn is_candidate(
         // The default branch is an ancestor of itself; never prune a worktree
         // that is checked out on the default branch.
         && branch != default
-        && is_ancestor(git, root, &format!("refs/heads/{branch}"), default)
+        && is_ancestor(git, root, &branch_ref(branch), default)
     {
         return true;
     }
@@ -317,9 +324,14 @@ fn delete_merged_branch(
     }
     let merged = default
         .as_deref()
-        .is_some_and(|d| is_ancestor(git, root, &format!("refs/heads/{branch}"), d));
+        .is_some_and(|d| is_ancestor(git, root, &branch_ref(branch), d));
     if merged {
-        let _ = git.run_raw(root, &["branch", "-D", branch]);
+        run_best_effort(
+            git,
+            root,
+            &["branch", "-D", branch],
+            "prune: delete merged branch",
+        );
     }
 }
 
@@ -383,6 +395,25 @@ mod tests {
             &format!("branch.{name}.merge"),
             &format!("refs/heads/{name}"),
         ]);
+    }
+
+    fn wt_dir(repo: &TestRepo, branch: &str) -> std::path::PathBuf {
+        let repo_name = repo.root().file_name().unwrap().to_string_lossy();
+        repo.root()
+            .parent()
+            .unwrap()
+            .join(format!("{repo_name}.worktrees/{repo_name}-{branch}"))
+    }
+
+    /// Creates a worktree on `branch` and commits in it so the branch diverges
+    /// from main — i.e. it is not merged.
+    fn make_unmerged_wt(repo: &TestRepo, branch: &str) {
+        make_wt(repo, branch);
+        let wt = wt_dir(repo, branch);
+        std::fs::write(wt.join("change.txt"), "x\n").unwrap();
+        let dir = wt.to_string_lossy().into_owned();
+        repo.git(&["-C", &dir, "add", "-A"]);
+        repo.git(&["-C", &dir, "commit", "-q", "-m", "unmerged change"]);
     }
 
     #[test]
@@ -526,6 +557,17 @@ mod tests {
         super::run(&mut t.cx, &prune_args(true, true, false, true), false).unwrap();
         assert!(t.err.contents().contains("nothing to prune"));
         assert!(repo.git(&["branch", "--list", "main"]).contains("main"));
+    }
+
+    #[test]
+    fn merged_only_skips_unmerged_worktree() {
+        // A worktree whose branch is not merged into main must never be a
+        // `--merged` prune candidate — a guard against pruning live work.
+        let repo = TestRepo::init();
+        make_unmerged_wt(&repo, "wip");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &prune_args(true, false, true, false), false).unwrap();
+        assert!(t.err.contents().contains("nothing to prune"));
     }
 
     #[test]

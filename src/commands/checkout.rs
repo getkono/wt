@@ -17,7 +17,8 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    is_ancestor, remote_branches, resolve_hex, status_of, upstream_of, validate_branch_name,
+    branch_ref, is_ancestor, remote_branches, resolve_hex, status_of, upstream_of,
+    validate_branch_name,
 };
 use crate::worktree_service::enumerate_worktrees;
 
@@ -125,7 +126,7 @@ pub(crate) fn checkout_branch_in_worktree(
     }
 
     // The branch must exist locally or as a remote-tracking ref (after the fetch).
-    let local_exists = resolve_hex(repo.gix(), &format!("refs/heads/{branch}")).is_some();
+    let local_exists = resolve_hex(repo.gix(), &branch_ref(branch)).is_some();
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
     let remote_exists = git
         .run_raw(
@@ -183,9 +184,9 @@ fn sync_with_upstream(
     if upstream.is_gone {
         return Ok(SyncOutcome::FetchSkipped);
     }
-    let branch_ref = format!("refs/heads/{branch}");
-    let behind = is_ancestor(git, worktree_dir, &branch_ref, &upstream.tracking_ref);
-    let ahead = is_ancestor(git, worktree_dir, &upstream.tracking_ref, &branch_ref);
+    let full_ref = branch_ref(branch);
+    let behind = is_ancestor(git, worktree_dir, &full_ref, &upstream.tracking_ref);
+    let ahead = is_ancestor(git, worktree_dir, &upstream.tracking_ref, &full_ref);
     match (ahead, behind) {
         // Strictly behind: a proven-clean fast-forward (the tree is clean here).
         (false, true) => {
@@ -213,7 +214,7 @@ fn sync_with_upstream(
 /// local tracking branch. Otherwise returns `branch` unchanged.
 fn normalize_remote_branch(repo: &Repo, branch: &str) -> String {
     // A local branch of this exact (possibly slashed) name always wins.
-    if resolve_hex(repo.gix(), &format!("refs/heads/{branch}")).is_some() {
+    if resolve_hex(repo.gix(), &branch_ref(branch)).is_some() {
         return branch.to_string();
     }
     // Strip a remote prefix only when `branch` names an actual remote-tracking

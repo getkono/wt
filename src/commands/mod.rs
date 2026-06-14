@@ -283,6 +283,22 @@ pub fn resolve_target(
     Ok(alt)
 }
 
+/// Runs a best-effort cleanup git command: on failure it logs a breadcrumb and
+/// continues rather than aborting the caller. Used by the rollback and prune
+/// cleanup paths, where a failed step must not stop the wider operation. `step`
+/// is a short label identifying the command in the log.
+pub(crate) fn run_best_effort(git: &dyn GitCli, root: &Path, args: &[&str], step: &str) {
+    match git.run_raw(root, args) {
+        Ok(out) if out.success => {}
+        Ok(out) => {
+            tracing::debug!(step, stderr = %out.stderr.trim(), "best-effort cleanup step failed");
+        }
+        Err(error) => {
+            tracing::debug!(step, %error, "best-effort cleanup step could not run");
+        }
+    }
+}
+
 /// Rolls back a partially-created worktree (spec §13): removes the worktree and
 /// prunes, optionally deletes the branch (only when it was created here), and
 /// optionally clears the `wt.*` metadata written during the operation, so
@@ -298,10 +314,25 @@ pub fn rollback_worktree(
     clear_metadata: bool,
 ) {
     let target_str = target.to_string_lossy();
-    let _ = git.run_raw(root, &["worktree", "remove", "--force", &target_str]);
-    let _ = git.run_raw(root, &["worktree", "prune"]);
+    run_best_effort(
+        git,
+        root,
+        &["worktree", "remove", "--force", &target_str],
+        "rollback: worktree remove",
+    );
+    run_best_effort(
+        git,
+        root,
+        &["worktree", "prune"],
+        "rollback: worktree prune",
+    );
     if delete_branch {
-        let _ = git.run_raw(root, &["branch", "-D", branch]);
+        run_best_effort(
+            git,
+            root,
+            &["branch", "-D", branch],
+            "rollback: branch delete",
+        );
     }
     if clear_metadata {
         // Remove the metadata written before the failure (else a later worktree

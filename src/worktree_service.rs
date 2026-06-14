@@ -13,8 +13,8 @@ use crate::error::Result;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    Upstream, abbrev_len, ahead_behind, commit_info, default_branch, enumerate, is_ancestor,
-    local_branches, recent_commits, resolve_hex, status_of, upstream_of,
+    Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch, enumerate,
+    is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
 };
 use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
@@ -72,12 +72,8 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
             wt.upstream = Some(up.display.clone());
             if !wt.is_missing
                 && !up.is_gone
-                && let Ok((ahead, behind)) = ahead_behind(
-                    git,
-                    &wt.path,
-                    &up.tracking_ref,
-                    &format!("refs/heads/{branch}"),
-                )
+                && let Ok((ahead, behind)) =
+                    ahead_behind(git, &wt.path, &up.tracking_ref, &branch_ref(&branch))
             {
                 wt.ahead = Some(ahead);
                 wt.behind = Some(behind);
@@ -126,7 +122,7 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
 /// worktree, or `git rev-parse HEAD` for a detached one.
 fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
     match &wt.branch {
-        Some(branch) => resolve_hex(repo.gix(), &format!("refs/heads/{branch}")),
+        Some(branch) => resolve_hex(repo.gix(), &branch_ref(branch)),
         None => git
             .run(&wt.path, &["rev-parse", "HEAD"])
             .ok()
@@ -161,10 +157,10 @@ fn compute_merge_state(
     {
         return Some(MergeState::Tracked);
     }
-    let branch_ref = format!("refs/heads/{branch}");
+    let full_ref = branch_ref(branch);
     // Ancestry needs a resolvable tip; without one, fall through to the
     // upstream/no-upstream signals below.
-    if resolve_hex(repo.gix(), &branch_ref).is_some() {
+    if resolve_hex(repo.gix(), &full_ref).is_some() {
         let mut tried: Vec<String> = Vec::new();
         for target in [wt.base_ref.clone(), default_branch(repo.gix())]
             .into_iter()
@@ -174,7 +170,7 @@ fn compute_merge_state(
             if target == branch || tried.contains(&target) {
                 continue;
             }
-            if is_ancestor(git, &wt.path, &branch_ref, &target) {
+            if is_ancestor(git, &wt.path, &full_ref, &target) {
                 return Some(MergeState::Merged { into: Some(target) });
             }
             tried.push(target);
@@ -274,18 +270,18 @@ fn enrich_branch_row(repo: &Repo, git: &dyn GitCli, abbrev: usize, row: &mut Wor
 
     // Ahead/behind relative to the base (recorded base, else the default
     // branch); refs resolve repo-globally, so it runs from any worktree dir.
-    let branch_ref = format!("refs/heads/{branch}");
+    let full_ref = branch_ref(&branch);
     let dir = repo.current_workdir().unwrap_or_else(|| repo.git_dir());
     if let Some(base) = row.base_ref.clone().or_else(|| default_branch(repo.gix()))
         && base != branch
         && resolve_hex(repo.gix(), &base).is_some()
-        && let Ok((ahead, behind)) = ahead_behind(git, &dir, &base, &branch_ref)
+        && let Ok((ahead, behind)) = ahead_behind(git, &dir, &base, &full_ref)
     {
         row.ahead = Some(ahead);
         row.behind = Some(behind);
     }
 
-    if let Some(oid) = resolve_hex(repo.gix(), &branch_ref) {
+    if let Some(oid) = resolve_hex(repo.gix(), &full_ref) {
         if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
             row.commit = Some(Commit {
                 hash: info.hash,
@@ -653,6 +649,20 @@ mod tests {
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
             compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            Some(MergeState::NoUpstreamLocal)
+        );
+    }
+
+    #[test]
+    fn merge_state_never_reports_branch_merged_into_itself() {
+        let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        // A worktree on the default branch: its only candidate merge target is
+        // itself, and a branch is trivially its own ancestor. That self-target
+        // must be skipped — otherwise it would wrongly report "merged into main".
+        let wt = merge_wt(&repo, "main", None, None);
+        assert_eq!(
+            compute_merge_state(&r, &RealGit, &wt, "main", None),
             Some(MergeState::NoUpstreamLocal)
         );
     }
