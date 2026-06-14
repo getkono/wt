@@ -18,7 +18,7 @@ const DEFAULT_WIDTH: usize = 100;
 
 /// Lists worktrees, applying `--sort` and `--filter`, then renders a table (or
 /// JSON with `--json`).
-pub fn run(cx: &mut Cx, args: &ListArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &ListArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     let mut worktrees = build_worktrees(&session.repo, git.as_ref())?;

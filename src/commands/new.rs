@@ -25,7 +25,7 @@ use crate::worktree_service::enumerate_worktrees;
 /// base, proceed off the stale base, or cancel. The check is skipped offline, for
 /// an existing branch, or when the base has no upstream. Delegates to [`run_core`]
 /// for the actual creation.
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     // Pre-flight staleness check in its own scope so the session is dropped before

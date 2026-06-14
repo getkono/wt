@@ -38,7 +38,7 @@ pub(crate) enum SyncOutcome {
 /// Switches the current worktree to `branch`, syncing it with origin, then emits
 /// the worktree path so the shell wrapper `cd`s into it (a no-op for the common
 /// current-worktree case; the right behavior when `-C` targeted another).
-pub fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;

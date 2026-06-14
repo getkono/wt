@@ -10,7 +10,7 @@ use crate::error::Result;
 
 /// Writes a `.wt.toml` at the repo root (if absent) and, for a subdir store
 /// layout, offers to add the store directory to `.gitignore`.
-pub fn run(cx: &mut Cx, args: &InitArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &InitArgs) -> Result<u8> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     let config_path = repo_config_path(&session.primary_root);

@@ -29,7 +29,7 @@ enum Candidate {
 }
 
 /// Selects and removes prune candidates after confirmation (spec §7/§12).
-pub fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     if !args.merged && !args.gone {
         return Err(Error::usage("prune requires --merged and/or --gone"));
     }

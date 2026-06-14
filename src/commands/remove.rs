@@ -34,7 +34,7 @@ pub struct RemoveOptions {
 impl RemoveOptions {
     /// Builds options from the CLI flags, where `--force` forces both removal
     /// and unmerged-branch deletion.
-    pub fn from_args(args: &RemoveArgs) -> Self {
+    pub(crate) fn from_args(args: &RemoveArgs) -> Self {
         RemoveOptions {
             force_remove: args.force,
             force_branch: args.force,
@@ -47,7 +47,12 @@ impl RemoveOptions {
 /// Removes the worktree matching `args.query`, applying the safety guards,
 /// running the pre-remove hook, and optionally deleting a fully-merged
 /// wt-created branch.
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(
+    cx: &mut Cx,
+    hooks: &dyn HookRunner,
+    args: &RemoveArgs,
+    json: bool,
+) -> Result<u8> {
     remove_query(
         cx,
         hooks,

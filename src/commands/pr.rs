@@ -20,7 +20,7 @@ use crate::time::{now_unix, parse_iso8601, relative};
 use crate::worktree_service::enumerate_worktrees;
 
 /// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
     // `wt pr` with no target and no sub: open the interactive PR picker (§7).
     // The picker opens its own session, so return before opening one here.
     if args.sub.is_none() && args.target.is_none() {

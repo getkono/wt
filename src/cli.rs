@@ -25,38 +25,38 @@ use crate::output::color::ColorChoice;
     propagate_version = true,
     disable_help_subcommand = true
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Flags accepted by every subcommand.
     #[command(flatten)]
-    pub global: GlobalFlags,
+    pub(crate) global: GlobalFlags,
     /// The subcommand to run; `None` launches the TUI.
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub(crate) command: Option<Command>,
 }
 
 /// Flags accepted by every subcommand (spec §7 "Global flags").
 #[derive(Debug, Args)]
-pub struct GlobalFlags {
+pub(crate) struct GlobalFlags {
     /// Emit machine-readable JSON (only where the command supports it).
     #[arg(long, global = true)]
-    pub json: bool,
+    pub(crate) json: bool,
     /// Control ANSI color: `auto` (default), `always`, or `never`.
     #[arg(long, global = true, value_name = "WHEN")]
-    pub color: Option<ColorChoice>,
+    pub(crate) color: Option<ColorChoice>,
     /// Never page output (useful for scripting).
     #[arg(long = "no-pager", global = true)]
-    pub no_pager: bool,
+    pub(crate) no_pager: bool,
     /// Run as if invoked from `<PATH>` (mirrors `git -C`).
     #[arg(short = 'C', long = "directory", global = true, value_name = "PATH")]
-    pub directory: Option<PathBuf>,
+    pub(crate) directory: Option<PathBuf>,
     /// Emit additional diagnostics to stderr (stackable, e.g. `-vv`).
     #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
-    pub verbose: u8,
+    pub(crate) verbose: u8,
 }
 
 /// The `wt` subcommands (spec §7).
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Create a linked worktree from a branch or base ref.
     New(NewArgs),
     /// Switch the branch checked out in the current worktree (syncs with origin).
@@ -101,67 +101,67 @@ pub enum Command {
 
 /// Arguments for `wt new`.
 #[derive(Debug, Args)]
-pub struct NewArgs {
+pub(crate) struct NewArgs {
     /// Branch to create or check out into a new worktree.
-    pub branch: String,
+    pub(crate) branch: String,
     /// Base ref for a newly created branch (default: the repo's default branch).
     #[arg(long, value_name = "REF")]
-    pub from: Option<String>,
+    pub(crate) from: Option<String>,
     /// Set the new branch's upstream tracking ref (default: none; never the base).
     #[arg(long, value_name = "REF", conflicts_with = "no_track")]
-    pub track: Option<String>,
+    pub(crate) track: Option<String>,
     /// Do not set an upstream for the new branch (the default).
     #[arg(long = "no-track")]
-    pub no_track: bool,
+    pub(crate) no_track: bool,
     /// Do not switch into the new worktree.
     #[arg(long = "no-switch")]
-    pub no_switch: bool,
+    pub(crate) no_switch: bool,
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
-    pub no_hooks: bool,
+    pub(crate) no_hooks: bool,
     /// Override the source worktree for the copy step.
     #[arg(long = "copy-from", value_name = "QUERY")]
-    pub copy_from: Option<String>,
+    pub(crate) copy_from: Option<String>,
     /// Initialize git submodules after creating the worktree (overrides config).
     #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
-    pub init_submodules: bool,
+    pub(crate) init_submodules: bool,
     /// Do not initialize git submodules (overrides `[submodules] init`).
     #[arg(long = "no-init-submodules")]
-    pub no_init_submodules: bool,
+    pub(crate) no_init_submodules: bool,
 }
 
 impl NewArgs {
     /// Resolves the submodule-init flags to an override for the config policy:
     /// `Some(true)` for `--init-submodules`, `Some(false)` for
     /// `--no-init-submodules`, `None` when neither is given (config decides).
-    pub fn submodule_override(&self) -> Option<bool> {
+    pub(crate) fn submodule_override(&self) -> Option<bool> {
         submodule_override(self.init_submodules, self.no_init_submodules)
     }
 }
 
 /// Arguments for `wt checkout`.
 #[derive(Debug, Args)]
-pub struct CheckoutArgs {
+pub(crate) struct CheckoutArgs {
     /// Branch to check out in this worktree (local, or remote-only via DWIM).
-    pub branch: String,
+    pub(crate) branch: String,
     /// Do not print the worktree path (no `cd`); print a note to stderr.
     #[arg(long = "no-switch")]
-    pub no_switch: bool,
+    pub(crate) no_switch: bool,
     /// Discard uncommitted changes and switch anyway.
     #[arg(long)]
-    pub force: bool,
+    pub(crate) force: bool,
     /// Initialize git submodules after checking out (overrides config).
     #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
-    pub init_submodules: bool,
+    pub(crate) init_submodules: bool,
     /// Do not initialize git submodules (overrides `[submodules] init`).
     #[arg(long = "no-init-submodules")]
-    pub no_init_submodules: bool,
+    pub(crate) no_init_submodules: bool,
 }
 
 impl CheckoutArgs {
     /// Resolves the submodule-init flags to an override for the config policy
     /// (see [`NewArgs::submodule_override`]).
-    pub fn submodule_override(&self) -> Option<bool> {
+    pub(crate) fn submodule_override(&self) -> Option<bool> {
         submodule_override(self.init_submodules, self.no_init_submodules)
     }
 }
@@ -178,77 +178,77 @@ fn submodule_override(init: bool, no_init: bool) -> Option<bool> {
 
 /// Arguments for `wt list`.
 #[derive(Debug, Args)]
-pub struct ListArgs {
+pub(crate) struct ListArgs {
     /// Sort field; prefix with `-` for descending (e.g. `-ahead`).
     #[arg(long, value_name = "FIELD")]
-    pub sort: Option<String>,
+    pub(crate) sort: Option<String>,
     /// Non-interactive fuzzy filter by branch/slug/path.
     #[arg(long, value_name = "QUERY")]
-    pub filter: Option<String>,
+    pub(crate) filter: Option<String>,
 }
 
 /// Arguments for `wt switch`.
 #[derive(Debug, Args)]
-pub struct SwitchArgs {
+pub(crate) struct SwitchArgs {
     /// Worktree query; omit to open the TUI picker.
-    pub query: Option<String>,
+    pub(crate) query: Option<String>,
     /// Force print-only behavior even inside the shell wrapper.
     #[arg(long = "print-path")]
-    pub print_path: bool,
+    pub(crate) print_path: bool,
 }
 
 /// Arguments for `wt remove`.
 #[derive(Debug, Args)]
-pub struct RemoveArgs {
+pub(crate) struct RemoveArgs {
     /// Worktree query to remove.
-    pub query: String,
+    pub(crate) query: String,
     /// Remove even when dirty or with unpushed work (work may be lost).
     #[arg(long)]
-    pub force: bool,
+    pub(crate) force: bool,
     /// Always keep the local branch.
     #[arg(long = "keep-branch")]
-    pub keep_branch: bool,
+    pub(crate) keep_branch: bool,
     /// Skip the pre-remove hook.
     #[arg(long = "no-hooks")]
-    pub no_hooks: bool,
+    pub(crate) no_hooks: bool,
 }
 
 /// Arguments for `wt prune`.
 #[derive(Debug, Args)]
-pub struct PruneArgs {
+pub(crate) struct PruneArgs {
     /// Include worktrees whose branch is merged into the default branch.
     #[arg(long)]
-    pub merged: bool,
+    pub(crate) merged: bool,
     /// Include worktrees whose upstream is gone, and missing worktrees.
     #[arg(long)]
-    pub gone: bool,
+    pub(crate) gone: bool,
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
-    pub dry_run: bool,
+    pub(crate) dry_run: bool,
     /// Remove without confirmation and include dirty worktrees.
     #[arg(long)]
-    pub force: bool,
+    pub(crate) force: bool,
 }
 
 /// Arguments for `wt pr`.
 #[derive(Debug, Args)]
-pub struct PrArgs {
+pub(crate) struct PrArgs {
     /// PR number, URL, or head branch; omit to open the picker.
-    pub target: Option<String>,
+    pub(crate) target: Option<String>,
     /// Do not switch into the new worktree.
     #[arg(long = "no-switch")]
-    pub no_switch: bool,
+    pub(crate) no_switch: bool,
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
-    pub no_hooks: bool,
+    pub(crate) no_hooks: bool,
     /// The `list` sub-form: print open PRs without checking any out.
     #[command(subcommand)]
-    pub sub: Option<PrSub>,
+    pub(crate) sub: Option<PrSub>,
 }
 
 /// The `pr` sub-forms (`list`, `open`).
 #[derive(Debug, Subcommand)]
-pub enum PrSub {
+pub(crate) enum PrSub {
     /// List open PRs without checking any out.
     List,
     /// Compose and open (create or update) a PR for the current branch.
@@ -257,84 +257,84 @@ pub enum PrSub {
 
 /// Arguments for `wt pr open`.
 #[derive(Debug, Args)]
-pub struct PrOpenArgs {
+pub(crate) struct PrOpenArgs {
     /// PR title. On an interactive terminal it seeds the compose form;
     /// non-interactively (or with `-y`) it is used directly.
     #[arg(long)]
-    pub title: Option<String>,
+    pub(crate) title: Option<String>,
     /// PR body text.
     #[arg(long, conflicts_with = "body_file")]
-    pub body: Option<String>,
+    pub(crate) body: Option<String>,
     /// Read the PR body from a file (use `-` for stdin).
     #[arg(long = "body-file", conflicts_with = "body")]
-    pub body_file: Option<String>,
+    pub(crate) body_file: Option<String>,
     /// Open the PR as a draft (create only).
     #[arg(long)]
-    pub draft: bool,
+    pub(crate) draft: bool,
     /// Draft the title/body with a code agent (Claude), then review before sending.
     #[arg(long)]
-    pub ai: bool,
+    pub(crate) ai: bool,
     /// Model for `--ai` drafting: `opus`, `sonnet`, or `haiku` (overrides
     /// `agent.model`; default `sonnet`).
     #[arg(long, value_name = "MODEL")]
-    pub model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Effort for `--ai` drafting: `low`, `medium`, or `high` (overrides
     /// `agent.effort`; default `medium`).
     #[arg(long, value_name = "LEVEL")]
-    pub effort: Option<String>,
+    pub(crate) effort: Option<String>,
     /// Skip the compose form and submit non-interactively.
     #[arg(short = 'y', long)]
-    pub yes: bool,
+    pub(crate) yes: bool,
     /// Override the base/trunk branch to target.
     #[arg(long, value_name = "REF")]
-    pub base: Option<String>,
+    pub(crate) base: Option<String>,
     /// When a PR already exists for this branch, update it.
     #[arg(long, conflicts_with = "new")]
-    pub update: bool,
+    pub(crate) update: bool,
     /// When a PR already exists for this branch, create a new one anyway.
     #[arg(long = "new", conflicts_with = "update")]
-    pub new: bool,
+    pub(crate) new: bool,
 }
 
 /// Arguments for `wt status`.
 #[derive(Debug, Args)]
-pub struct StatusArgs {
+pub(crate) struct StatusArgs {
     /// Worktree query (default: the current worktree).
-    pub query: Option<String>,
+    pub(crate) query: Option<String>,
     /// Report every worktree.
     #[arg(long)]
-    pub all: bool,
+    pub(crate) all: bool,
 }
 
 /// Arguments for `wt path`.
 #[derive(Debug, Args)]
-pub struct PathArgs {
+pub(crate) struct PathArgs {
     /// Worktree query.
-    pub query: String,
+    pub(crate) query: String,
 }
 
 /// Arguments for `wt init`.
 #[derive(Debug, Args)]
-pub struct InitArgs {
+pub(crate) struct InitArgs {
     /// Override the worktree store path template.
     #[arg(long = "path-template", value_name = "TMPL")]
-    pub path_template: Option<String>,
+    pub(crate) path_template: Option<String>,
 }
 
 /// Arguments for `wt config`.
 #[derive(Debug, Args)]
-pub struct ConfigArgs {
+pub(crate) struct ConfigArgs {
     /// The configuration action to perform.
     #[command(subcommand)]
-    pub action: ConfigAction,
+    pub(crate) action: ConfigAction,
     /// Target the global user config instead of the per-repo file.
     #[arg(long, global = true)]
-    pub global: bool,
+    pub(crate) global: bool,
 }
 
 /// The `wt config` actions.
 #[derive(Debug, Subcommand)]
-pub enum ConfigAction {
+pub(crate) enum ConfigAction {
     /// Print the value of a key.
     Get {
         /// The configuration key.
@@ -355,26 +355,26 @@ pub enum ConfigAction {
 
 /// Arguments for `wt completions`.
 #[derive(Debug, Args)]
-pub struct CompletionsArgs {
+pub(crate) struct CompletionsArgs {
     /// The shell to emit a completion script for.
-    pub shell: Shell,
+    pub(crate) shell: Shell,
 }
 
 /// Arguments for `wt shell-init`.
 #[derive(Debug, Args)]
-pub struct ShellInitArgs {
+pub(crate) struct ShellInitArgs {
     /// The shell to emit the integration snippet for.
-    pub shell: Shell,
+    pub(crate) shell: Shell,
 }
 
 /// Arguments for the hidden `wt __complete` helper.
 #[derive(Debug, Args)]
-pub struct CompleteArgs {
+pub(crate) struct CompleteArgs {
     /// The kind of candidate to list (`worktrees`, `branches`, `all-branches`,
     /// `pr-numbers`).
-    pub kind: String,
+    pub(crate) kind: String,
     /// The partial token to complete.
-    pub partial: Option<String>,
+    pub(crate) partial: Option<String>,
 }
 
 impl Cli {
@@ -420,7 +420,7 @@ impl Cli {
 
 /// Parses `args` (excluding `argv[0]`) and routes to the command handler,
 /// returning the process exit code.
-pub fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
+pub(crate) fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
     let mut argv: Vec<OsString> = Vec::with_capacity(args.len() + 1);
     argv.push(OsString::from("wt"));
     argv.extend(args.into_iter().map(OsString::from));
