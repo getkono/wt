@@ -51,7 +51,7 @@ enum KeyType {
 }
 
 /// Dispatches the config action.
-pub fn run(cx: &mut Cx, args: &ConfigArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &ConfigArgs, json: bool) -> Result<u8> {
     // Determine the config to read and the file to write.
     let (config, file) = if args.global {
         let file = config::global_config_path(&cx.env)

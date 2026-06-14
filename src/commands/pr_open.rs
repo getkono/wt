@@ -30,7 +30,7 @@ use crate::tui::ComposeSeed;
 /// (interactive) or submit directly (non-interactive / `--yes`), and emit the
 /// result. Spec §5: the human summary goes to stderr, the bare URL (or JSON) to
 /// stdout.
-pub fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let gh = cx.gh.clone();
     let session = open_session(cx, git.as_ref())?;

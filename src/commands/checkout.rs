@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    branch_ref, is_ancestor, remote_branches, resolve_hex, status_of, upstream_of,
+    branch_ref, is_ancestor, ops, remote_branches, resolve_hex, status_of, upstream_of,
     validate_branch_name,
 };
 use crate::worktree_service::enumerate_worktrees;
@@ -38,7 +38,7 @@ pub(crate) enum SyncOutcome {
 /// Switches the current worktree to `branch`, syncing it with origin, then emits
 /// the worktree path so the shell wrapper `cd`s into it (a no-op for the common
 /// current-worktree case; the right behavior when `-C` targeted another).
-pub fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
@@ -90,56 +90,9 @@ pub(crate) fn checkout_branch_in_worktree(
     let branch_owned = normalize_remote_branch(repo, branch);
     let branch = branch_owned.as_str();
 
-    // Guard: refuse if the branch is already checked out in *another* worktree
-    // (git forbids it). The target worktree's own branch is fine — re-checking
-    // out the current branch is allowed and still syncs (like a pull).
-    let worktrees = enumerate_worktrees(repo, git)?;
-    if let Some(other) = worktrees
-        .iter()
-        .find(|w| w.branch.as_deref() == Some(branch) && !same_path(&w.path, worktree_dir))
-    {
-        return Err(Error::operation(format!(
-            "branch {branch:?} is already checked out at {}",
-            other.path.display()
-        )));
-    }
-
-    // Refuse a dirty worktree unless --force (which discards tracked changes).
-    if status_of(git, worktree_dir)?.dirty && !force {
-        return Err(Error::operation(
-            "worktree has uncommitted changes; commit/stash, or use --force",
-        ));
-    }
-
-    // Fetch the remote (best-effort) so origin/<branch> and the fast-forward see
-    // the latest. Skipped when no remote is configured; a failure is non-fatal.
-    let mut fetch_skipped = true;
-    if remote_configured(git, worktree_dir, &remote) {
-        match git.run_raw(worktree_dir, &["fetch", &remote]) {
-            Ok(out) if out.success => fetch_skipped = false,
-            _ => {
-                let _ = cx.err.line(&format!(
-                    "warning: failed to fetch {remote}; checking out offline"
-                ));
-            }
-        }
-    }
-
-    // The branch must exist locally or as a remote-tracking ref (after the fetch).
-    let local_exists = resolve_hex(repo.gix(), &branch_ref(branch)).is_some();
-    let remote_ref = format!("refs/remotes/{remote}/{branch}");
-    let remote_exists = git
-        .run_raw(
-            worktree_dir,
-            &["rev-parse", "--verify", "--quiet", &remote_ref],
-        )
-        .map(|o| o.success)
-        .unwrap_or(false);
-    if !local_exists && !remote_exists {
-        return Err(Error::operation(format!(
-            "branch {branch:?} not found locally or on {remote}"
-        )));
-    }
+    ensure_branch_available(git, repo, worktree_dir, branch, force)?;
+    let fetch_skipped = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
+    ensure_branch_exists(git, repo, worktree_dir, branch, &remote)?;
 
     // Check out the branch (DWIM creates a local tracking branch when remote-only).
     let mut argv: Vec<&str> = vec!["checkout"];
@@ -160,6 +113,85 @@ pub(crate) fn checkout_branch_in_worktree(
         submodule_override,
     )?;
     Ok(outcome)
+}
+
+/// Pre-checkout safety guards: refuse if `branch` is already checked out in
+/// *another* worktree (git forbids it; the target worktree's own branch is fine —
+/// re-checking it out still syncs, like a pull), or if the target worktree is
+/// dirty and `--force` was not given (force discards tracked changes).
+fn ensure_branch_available(
+    git: &dyn GitCli,
+    repo: &Repo,
+    worktree_dir: &Path,
+    branch: &str,
+    force: bool,
+) -> Result<()> {
+    let worktrees = enumerate_worktrees(repo, git)?;
+    if let Some(other) = worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(branch) && !same_path(&w.path, worktree_dir))
+    {
+        return Err(Error::operation(format!(
+            "branch {branch:?} is already checked out at {}",
+            other.path.display()
+        )));
+    }
+    if status_of(git, worktree_dir)?.dirty && !force {
+        return Err(Error::operation(
+            "worktree has uncommitted changes; commit/stash, or use --force",
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort fetch of `remote` so `origin/<branch>` and the fast-forward see the
+/// latest. Returns whether the fetch was skipped — `true` when no remote is
+/// configured or it failed (a non-fatal warning is written to stderr), which the
+/// upstream sync uses to tell "nothing to sync with" from "already up to date".
+fn fetch_remote_best_effort(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    worktree_dir: &Path,
+    remote: &str,
+) -> bool {
+    if !remote_configured(git, worktree_dir, remote) {
+        return true;
+    }
+    match ops::fetch(git, worktree_dir, remote) {
+        Ok(out) if out.success => false,
+        _ => {
+            let _ = cx.err.line(&format!(
+                "warning: failed to fetch {remote}; checking out offline"
+            ));
+            true
+        }
+    }
+}
+
+/// Confirms `branch` exists locally or as a remote-tracking ref on `remote` (after
+/// the fetch), erroring otherwise.
+fn ensure_branch_exists(
+    git: &dyn GitCli,
+    repo: &Repo,
+    worktree_dir: &Path,
+    branch: &str,
+    remote: &str,
+) -> Result<()> {
+    let local_exists = resolve_hex(repo.gix(), &branch_ref(branch)).is_some();
+    let remote_ref = format!("refs/remotes/{remote}/{branch}");
+    let remote_exists = git
+        .run_raw(
+            worktree_dir,
+            &["rev-parse", "--verify", "--quiet", &remote_ref],
+        )
+        .map(|o| o.success)
+        .unwrap_or(false);
+    if !local_exists && !remote_exists {
+        return Err(Error::operation(format!(
+            "branch {branch:?} not found locally or on {remote}"
+        )));
+    }
+    Ok(())
 }
 
 /// After a checkout, fast-forwards `branch` to its upstream when strictly behind;
@@ -190,10 +222,7 @@ fn sync_with_upstream(
     match (ahead, behind) {
         // Strictly behind: a proven-clean fast-forward (the tree is clean here).
         (false, true) => {
-            git.run(
-                worktree_dir,
-                &["merge", "--ff-only", &upstream.tracking_ref],
-            )?;
+            ops::merge_ff_only(git, worktree_dir, &upstream.tracking_ref)?;
             Ok(SyncOutcome::FastForwarded)
         }
         // Diverged: never rewrite history — warn and leave the branch as-is.

@@ -11,7 +11,7 @@ use crate::worktree_service::enumerate_worktrees;
 
 /// Prints completion candidates for the requested kind, filtered by the partial
 /// token. Any failure results in no output (silent degradation).
-pub fn run(cx: &mut Cx, args: &CompleteArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &CompleteArgs) -> Result<u8> {
     let partial = args.partial.as_deref().unwrap_or("");
     let candidates = candidates(cx, &args.kind).unwrap_or_default();
     for candidate in candidates {

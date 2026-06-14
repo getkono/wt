@@ -8,7 +8,7 @@ use crate::worktree_service::build_worktrees;
 
 /// Resolves the query and prints the worktree's absolute path to stdout. An
 /// ambiguous query lists candidates on stderr and exits `3`; no match exits `1`.
-pub fn run(cx: &mut Cx, args: &PathArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &PathArgs) -> Result<u8> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     let worktrees = build_worktrees(&session.repo, git.as_ref())?;

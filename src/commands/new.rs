@@ -13,7 +13,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{branch_ref, default_branch, resolve_hex};
+use crate::git::{branch_ref, default_branch, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
@@ -25,7 +25,7 @@ use crate::worktree_service::enumerate_worktrees;
 /// base, proceed off the stale base, or cancel. The check is skipped offline, for
 /// an existing branch, or when the base has no upstream. Delegates to [`run_core`]
 /// for the actual creation.
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     // Pre-flight staleness check in its own scope so the session is dropped before
@@ -146,20 +146,9 @@ pub(crate) fn run_core(
         // `--no-track` keeps the new branch from inheriting the base as its
         // upstream (issue #43): git's `branch.autoSetupMerge` would otherwise make
         // a remote-tracking base the upstream. `--track` opts into an explicit one.
-        git.run(
-            &root,
-            &[
-                "worktree",
-                "add",
-                "--no-track",
-                "-b",
-                &branch,
-                &target_str,
-                base,
-            ],
-        )?;
+        ops::worktree_add_branch(git, &root, &branch, &target_str, base, true)?;
     } else {
-        git.run(&root, &["worktree", "add", &target_str, &branch])?;
+        ops::worktree_add(git, &root, &target_str, &branch)?;
     }
 
     // Steps after creation but before the hook are rolled back on failure (§13).
@@ -238,7 +227,7 @@ fn post_create_steps(
     // `--track <REF>` sets an explicit upstream (issue #43); a bad ref fails here,
     // inside the rolled-back region, so the half-created worktree is torn down.
     if let Some(upstream) = track {
-        git.run(root, &["branch", "-u", upstream, branch])?;
+        ops::set_upstream(git, root, branch, upstream)?;
     }
     let source = copy_source(repo, worktrees, copy_from, root)?;
     copy_ignored_files(git, &source, target, &config.copy)

@@ -1077,7 +1077,7 @@ pub struct ComposeSeed {
 /// or `None` if the user cancels (Esc/quit). The compose form uses its own event
 /// loop so it can carry the gathered `ctx`, the resolved `action`, and the
 /// resulting outcome.
-pub fn run_pr_compose(
+pub(crate) fn run_pr_compose(
     cx: &mut Cx,
     session: &Session,
     ctx: sendit::PrContext,

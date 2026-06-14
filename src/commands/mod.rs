@@ -33,18 +33,18 @@ use crate::worktree_service::build_worktrees;
 
 /// A discovered repository plus its resolved configuration, set up once per
 /// repo-scoped command.
-pub struct Session {
+pub(crate) struct Session {
     /// The discovered repository (gix handle).
-    pub repo: Repo,
+    pub(crate) repo: Repo,
     /// The primary worktree root (or bare repo path).
-    pub primary_root: PathBuf,
+    pub(crate) primary_root: PathBuf,
     /// The merged configuration.
-    pub config: Config,
+    pub(crate) config: Config,
 }
 
 /// Discovers the repository from the context's working directory, resolves the
 /// primary root via `git rev-parse`, and loads the merged configuration.
-pub fn open_session(cx: &Cx, git: &dyn GitCli) -> Result<Session> {
+pub(crate) fn open_session(cx: &Cx, git: &dyn GitCli) -> Result<Session> {
     let repo = Repo::discover(&cx.cwd)?;
     let dir = repo.current_workdir().unwrap_or_else(|| repo.git_dir());
     let common = git.run(
@@ -66,7 +66,7 @@ pub fn open_session(cx: &Cx, git: &dyn GitCli) -> Result<Session> {
 }
 
 /// The outcome of resolving a query in a command handler.
-pub enum Resolution {
+pub(crate) enum Resolution {
     /// A unique worktree (its index).
     Found(usize),
     /// Ambiguous; candidates were listed to stderr (exit code `3`).
@@ -79,7 +79,7 @@ pub enum Resolution {
 /// the TUI picker opens, pre-filtered to the query, and the chosen worktree is
 /// returned; otherwise the candidate list is printed to stderr (exit code `3`).
 /// Spec §7.
-pub fn resolve_query(cx: &mut Cx, worktrees: &[Worktree], query: &str) -> Resolution {
+pub(crate) fn resolve_query(cx: &mut Cx, worktrees: &[Worktree], query: &str) -> Resolution {
     resolve_query_with(cx, worktrees, query, |cx, q| {
         crate::tui::run_tui(cx, Some(q))
     })
@@ -137,7 +137,7 @@ fn list_candidates(
 }
 
 /// A human label for a worktree in candidate/diagnostic lists.
-pub fn candidate_label(worktree: &Worktree) -> String {
+pub(crate) fn candidate_label(worktree: &Worktree) -> String {
     match &worktree.branch {
         Some(branch) => branch.clone(),
         None => worktree.path.display().to_string(),
@@ -146,13 +146,13 @@ pub fn candidate_label(worktree: &Worktree) -> String {
 
 /// Whether two paths refer to the same location, comparing canonicalized forms
 /// when possible (handles `/private` symlinks on macOS).
-pub fn same_path(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     canon(a) == canon(b)
 }
 
 /// Prompts on stderr and reads a yes/no confirmation (default no).
-pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
+pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -163,7 +163,7 @@ pub fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
 /// A three-way answer to the stale-base prompt (issue #56): update the base,
 /// proceed off it as-is, or cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Choice {
+pub(crate) enum Choice {
     /// Update the base (fast-forward it to its upstream) before proceeding.
     Update,
     /// Proceed off the base as-is.
@@ -175,7 +175,7 @@ pub enum Choice {
 /// Prompts on stderr for an update/proceed/cancel choice (issue #56). Anything
 /// other than an explicit update/proceed — including an empty line or EOF — is
 /// `Cancel`, so a non-interactive run defaults to the safe choice.
-pub fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
+pub(crate) fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -221,7 +221,7 @@ pub(crate) fn maybe_init_submodules(
 }
 
 /// The git directory used for the `.git`-containment check (spec §6).
-pub fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
+pub(crate) fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
     if is_bare {
         root.to_path_buf()
     } else {
@@ -230,7 +230,7 @@ pub fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
 }
 
 /// Renders the worktree store path for a branch with the given slug (spec §6).
-pub fn render_target(
+pub(crate) fn render_target(
     config: &Config,
     root: &Path,
     branch: &str,
@@ -259,7 +259,7 @@ pub fn render_target(
 /// Resolves the final target path: renders it, rejects the `.git` directory, and
 /// on collision with an unrelated path appends `-<short_hash>` (erroring if both
 /// are occupied). Spec §6.
-pub fn resolve_target(
+pub(crate) fn resolve_target(
     config: &Config,
     root: &Path,
     branch: &str,
@@ -305,7 +305,7 @@ pub(crate) fn run_best_effort(git: &dyn GitCli, root: &Path, args: &[&str], step
 /// nothing half-created is left behind. The two flags are independent: `wt pr`
 /// on a *pre-existing* branch keeps the branch but still clears the metadata it
 /// wrote. Best-effort.
-pub fn rollback_worktree(
+pub(crate) fn rollback_worktree(
     git: &dyn GitCli,
     root: &Path,
     target: &Path,
@@ -343,7 +343,7 @@ pub fn rollback_worktree(
 }
 
 /// Builds the [`Worktree`] row for `target` (for `--json` results).
-pub fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
+pub(crate) fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
     let git = cx.git.clone();
     let repo = Repo::discover(&cx.cwd)?;
     let worktrees = build_worktrees(&repo, git.as_ref())?;
@@ -356,7 +356,7 @@ pub fn build_target_row(cx: &Cx, target: &Path) -> Result<Worktree> {
 /// Logs the copy step's outcome to stderr at `-v` (spec §8: copied files and
 /// files skipped because the target already exists are silent by default and
 /// logged at verbose).
-pub fn log_copy_outcome(cx: &mut Cx, outcome: &crate::copy::CopyOutcome) {
+pub(crate) fn log_copy_outcome(cx: &mut Cx, outcome: &crate::copy::CopyOutcome) {
     if cx.verbose == 0 {
         return;
     }
@@ -372,7 +372,7 @@ pub fn log_copy_outcome(cx: &mut Cx, outcome: &crate::copy::CopyOutcome) {
 
 /// Emits a navigation result: JSON object, the bare path (for `cd`), or a stderr
 /// note when `--no-switch` (spec §5/§7).
-pub fn emit_worktree(
+pub(crate) fn emit_worktree(
     cx: &mut Cx,
     target: &Path,
     json: bool,

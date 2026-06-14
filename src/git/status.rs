@@ -11,28 +11,28 @@ use crate::git::cli::GitCli;
 
 /// A single changed path, collapsed to a display marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusEntry {
+pub(crate) struct StatusEntry {
     /// `M` for a tracked modification/staging, `?` for an untracked file.
-    pub marker: char,
+    pub(crate) marker: char,
     /// The file path relative to the worktree.
-    pub path: String,
+    pub(crate) path: String,
 }
 
 /// A worktree's status summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StatusSummary {
+pub(crate) struct StatusSummary {
     /// Whether any tracked files are modified or staged.
-    pub dirty: bool,
+    pub(crate) dirty: bool,
     /// Whether any untracked files are present.
-    pub has_untracked: bool,
+    pub(crate) has_untracked: bool,
     /// The changed entries, in `git`'s order.
-    pub entries: Vec<StatusEntry>,
+    pub(crate) entries: Vec<StatusEntry>,
 }
 
 /// Parses `git status --porcelain=v1 -z` output. Each record is `XY<space>path`
 /// terminated by NUL; rename/copy records carry an extra source path that is
 /// consumed and ignored.
-pub fn parse_status_porcelain(z: &str) -> StatusSummary {
+pub(crate) fn parse_status_porcelain(z: &str) -> StatusSummary {
     let mut summary = StatusSummary::default();
     let mut fields = z.split('\0');
     while let Some(field) = fields.next() {
@@ -65,7 +65,7 @@ pub fn parse_status_porcelain(z: &str) -> StatusSummary {
 }
 
 /// Runs `git status` in the worktree directory and parses the result.
-pub fn status_of(git: &dyn GitCli, worktree_dir: &Path) -> Result<StatusSummary> {
+pub(crate) fn status_of(git: &dyn GitCli, worktree_dir: &Path) -> Result<StatusSummary> {
     let output = git.run(worktree_dir, &["status", "--porcelain=v1", "-z"])?;
     Ok(parse_status_porcelain(&output))
 }

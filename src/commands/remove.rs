@@ -9,7 +9,7 @@ use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{branch_ref, default_branch, is_ancestor, resolve_hex};
+use crate::git::{branch_ref, default_branch, is_ancestor, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_pre_remove};
 use crate::model::{RemovedResult, Worktree};
 use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status};
@@ -20,21 +20,21 @@ use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status
 /// confirm dialog sets only `force_remove` — the dialog is itself the guard, so
 /// `y` may remove a dirty/unpushed worktree, but it must never silently
 /// force-delete an unmerged branch (spec §10/§12).
-pub struct RemoveOptions {
+pub(crate) struct RemoveOptions {
     /// Skip the dirty/unpushed guards and pass `--force` to `git worktree remove`.
-    pub force_remove: bool,
+    pub(crate) force_remove: bool,
     /// Permit deleting a branch that is not fully merged into its base.
-    pub force_branch: bool,
+    pub(crate) force_branch: bool,
     /// Always keep the local branch.
-    pub keep_branch: bool,
+    pub(crate) keep_branch: bool,
     /// Skip the pre-remove hook.
-    pub no_hooks: bool,
+    pub(crate) no_hooks: bool,
 }
 
 impl RemoveOptions {
     /// Builds options from the CLI flags, where `--force` forces both removal
     /// and unmerged-branch deletion.
-    pub fn from_args(args: &RemoveArgs) -> Self {
+    pub(crate) fn from_args(args: &RemoveArgs) -> Self {
         RemoveOptions {
             force_remove: args.force,
             force_branch: args.force,
@@ -47,7 +47,12 @@ impl RemoveOptions {
 /// Removes the worktree matching `args.query`, applying the safety guards,
 /// running the pre-remove hook, and optionally deleting a fully-merged
 /// wt-created branch.
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(
+    cx: &mut Cx,
+    hooks: &dyn HookRunner,
+    args: &RemoveArgs,
+    json: bool,
+) -> Result<u8> {
     remove_query(
         cx,
         hooks,
@@ -60,7 +65,7 @@ pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &RemoveArgs, json: bool) -
 /// Resolves `query` to a worktree and removes it under the given options.
 /// Shared by the CLI (`run`) and the TUI confirm-remove dialog, which differ
 /// only in their [`RemoveOptions`].
-pub fn remove_query(
+pub(crate) fn remove_query(
     cx: &mut Cx,
     hooks: &dyn HookRunner,
     query: &str,
@@ -97,7 +102,7 @@ pub fn remove_query(
 
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
-        git.run(&root, &["worktree", "prune"])?;
+        ops::worktree_prune(git, &root)?;
         let deleted = maybe_delete_branch(
             git,
             &root,
@@ -150,11 +155,7 @@ pub fn remove_query(
 
     // Remove the worktree.
     let path = worktree.path.to_string_lossy().into_owned();
-    if opts.force_remove {
-        git.run(&root, &["worktree", "remove", "--force", &path])?;
-    } else {
-        git.run(&root, &["worktree", "remove", &path])?;
-    }
+    ops::worktree_remove(git, &root, &path, opts.force_remove)?;
 
     let deleted = maybe_delete_branch(
         git,
@@ -177,7 +178,12 @@ pub fn remove_query(
 /// safe delete is refused because the branch is unmerged, the returned error
 /// message contains the stable substring "not fully merged", which the TUI keys on
 /// to offer a force-delete.
-pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -> Result<u8> {
+pub(crate) fn delete_branch_query(
+    cx: &mut Cx,
+    branch: &str,
+    force: bool,
+    json: bool,
+) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
@@ -202,8 +208,7 @@ pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -
         )));
     }
 
-    let flag = if force { "-D" } else { "-d" };
-    let out = git.run_raw(&root, &["branch", flag, branch])?;
+    let out = ops::delete_branch(git, &root, branch, force)?;
     if !out.success {
         // `git branch -d` refuses an unmerged branch; preserve the "not fully
         // merged" sentinel so the TUI can re-prompt to force-delete (issue #53).
@@ -261,7 +266,7 @@ fn maybe_delete_branch(
     if !should_delete {
         return false;
     }
-    git.run_raw(root, &["branch", "-D", branch]).is_ok()
+    ops::delete_branch(git, root, branch, true).is_ok()
 }
 
 /// Clears the worktree's `wt.*` metadata, best-effort.

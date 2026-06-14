@@ -21,7 +21,7 @@ use crate::cx::Cx;
 use crate::error::Result;
 
 /// Prints the integration snippet for the requested shell.
-pub fn run(cx: &mut Cx, args: &ShellInitArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &ShellInitArgs) -> Result<u8> {
     let snippet = match args.shell {
         Shell::Bash => BASH,
         Shell::Zsh => ZSH,

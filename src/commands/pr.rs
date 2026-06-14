@@ -13,14 +13,14 @@ use crate::cx::Cx;
 use crate::error::Result;
 use crate::gh::GhClient;
 use crate::git::cli::GitCli;
-use crate::git::{branch_ref, resolve_hex};
+use crate::git::{branch_ref, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::slug::slugify_with_fallback;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::worktree_service::enumerate_worktrees;
 
 /// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
-pub fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
     // `wt pr` with no target and no sub: open the interactive PR picker (§7).
     // The picker opens its own session, so return before opening one here.
     if args.sub.is_none() && args.target.is_none() {
@@ -168,13 +168,11 @@ pub(crate) fn checkout_pr_worktree(
     }
 
     // Fetch the PR head (works for fork PRs too via the pull/<n>/head ref).
-    git.run(
+    ops::fetch_refspec(
+        git,
         &root,
-        &[
-            "fetch",
-            &session.config.pr_default_remote,
-            &format!("pull/{number}/head"),
-        ],
+        &session.config.pr_default_remote,
+        &format!("pull/{number}/head"),
     )?;
     let head_oid = git
         .run(&root, &["rev-parse", "FETCH_HEAD"])?
@@ -200,12 +198,9 @@ pub(crate) fn checkout_pr_worktree(
     }
     let target_str = worktree_path.to_string_lossy().into_owned();
     if branch_exists {
-        git.run(&root, &["worktree", "add", &target_str, &branch])?;
+        ops::worktree_add(git, &root, &target_str, &branch)?;
     } else {
-        git.run(
-            &root,
-            &["worktree", "add", "-b", &branch, &target_str, "FETCH_HEAD"],
-        )?;
+        ops::worktree_add_branch(git, &root, &branch, &target_str, "FETCH_HEAD", false)?;
     }
 
     // Record metadata + copy, rolling back on failure (§13).

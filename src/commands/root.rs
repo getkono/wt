@@ -5,7 +5,7 @@ use crate::cx::Cx;
 use crate::error::Result;
 
 /// Prints the primary worktree (or bare repo) root to stdout.
-pub fn run(cx: &mut Cx) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx) -> Result<u8> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     cx.out.line(&session.primary_root.to_string_lossy())?;

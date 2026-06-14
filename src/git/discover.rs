@@ -1,24 +1,24 @@
 //! Repository discovery and identity via `gix` (spec §4 read operations):
 //! discovery from a directory upward, bare detection, and the current worktree.
 //!
-//! Resolving the *primary* worktree root is done from `git worktree list`
-//! output (see [`crate::git::worktrees::primary_root`]) rather than from `gix`,
-//! because `gix`'s `common_dir()` does not resolve the linked-worktree
-//! indirection reliably — a fallback the spec §4 explicitly sanctions.
+//! Resolving the *primary* worktree root is done from `git rev-parse
+//! --git-common-dir` (in `open_session`) rather than from `gix`, because `gix`'s
+//! `common_dir()` does not resolve the linked-worktree indirection reliably — a
+//! fallback the spec §4 explicitly sanctions.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
 /// A discovered Git repository, wrapping the `gix` handle.
-pub struct Repo {
+pub(crate) struct Repo {
     inner: gix::Repository,
 }
 
 impl Repo {
     /// Discovers the repository containing `start`, searching upward. Returns
     /// [`Error::NotInRepo`] when `start` is not inside a repository.
-    pub fn discover(start: &Path) -> Result<Repo> {
+    pub(crate) fn discover(start: &Path) -> Result<Repo> {
         match gix::discover(start) {
             Ok(inner) => Ok(Repo { inner }),
             Err(_) => Err(Error::NotInRepo),
@@ -26,24 +26,24 @@ impl Repo {
     }
 
     /// Borrows the underlying `gix` repository for other read modules.
-    pub fn gix(&self) -> &gix::Repository {
+    pub(crate) fn gix(&self) -> &gix::Repository {
         &self.inner
     }
 
     /// Whether this is a bare repository (no working tree).
-    pub fn is_bare(&self) -> bool {
+    pub(crate) fn is_bare(&self) -> bool {
         self.inner.workdir().is_none()
     }
 
     /// The working directory of the worktree `wt` was invoked from, or `None`
     /// for a bare repository.
-    pub fn current_workdir(&self) -> Option<PathBuf> {
+    pub(crate) fn current_workdir(&self) -> Option<PathBuf> {
         self.inner.workdir().map(Path::to_path_buf)
     }
 
     /// The git directory for the current worktree (`.git`, or
     /// `.git/worktrees/<name>` for a linked worktree).
-    pub fn git_dir(&self) -> PathBuf {
+    pub(crate) fn git_dir(&self) -> PathBuf {
         self.inner.git_dir().to_path_buf()
     }
 }

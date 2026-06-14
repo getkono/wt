@@ -10,7 +10,7 @@ use crate::worktree_service::build_worktrees;
 
 /// Renders the status block(s) to stdout, or newline-delimited JSON with
 /// `--json`. Default target is the current worktree; `--all` reports every one.
-pub fn run(cx: &mut Cx, args: &StatusArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &StatusArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref())?;
     let worktrees = build_worktrees(&session.repo, git.as_ref())?;

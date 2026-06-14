@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::worktree_service::build_worktrees;
 
 /// Resolves the query (or opens the picker) and prints the chosen path.
-pub fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {
     if let Some(query) = &args.query {
         let git = cx.git.clone();
         let session = open_session(cx, git.as_ref())?;
@@ -30,7 +30,7 @@ pub fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {
 
 /// Launches the TUI picker; on a switch, prints the chosen path (so the wrapper
 /// `cd`s). A cancelled picker prints nothing and exits `0` (no `cd`).
-pub fn launch_picker(cx: &mut Cx) -> Result<u8> {
+pub(crate) fn launch_picker(cx: &mut Cx) -> Result<u8> {
     match crate::tui::run_tui(cx, None)? {
         Some(path) => {
             cx.out.line(&path.to_string_lossy())?;

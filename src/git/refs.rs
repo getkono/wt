@@ -8,17 +8,17 @@ use crate::git::cli::GitCli;
 
 /// The configured upstream of a local branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Upstream {
+pub(crate) struct Upstream {
     /// Display form, e.g. `origin/feature/x`.
-    pub display: String,
+    pub(crate) display: String,
     /// The remote-tracking ref, e.g. `refs/remotes/origin/feature/x`.
-    pub tracking_ref: String,
+    pub(crate) tracking_ref: String,
     /// Whether the tracking ref is gone (configured but no longer present).
-    pub is_gone: bool,
+    pub(crate) is_gone: bool,
 }
 
 /// Lists local branch names (without the `refs/heads/` prefix).
-pub fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+pub(crate) fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let platform = repo
         .references()
         .map_err(|e| Error::operation(format!("cannot read references: {e}")))?;
@@ -38,7 +38,7 @@ pub fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// Lists remote-tracking branch names (e.g. `origin/main`), skipping the
 /// symbolic `<remote>/HEAD` pointers (which alias a real branch, not a fork
 /// candidate). Names keep their remote prefix so they read unambiguously.
-pub fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+pub(crate) fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let platform = repo
         .references()
         .map_err(|e| Error::operation(format!("cannot read references: {e}")))?;
@@ -63,7 +63,7 @@ pub fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// Lists every branch a new worktree can fork from or check out: local branches
 /// first (sorted), then remote-tracking branches (sorted). Best-effort — used to
 /// populate the TUI create-prompt options dropdown (issue #25).
-pub fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
+pub(crate) fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let mut names = local_branches(repo)?;
     names.extend(remote_branches(repo)?);
     Ok(names)
@@ -74,7 +74,7 @@ pub fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// Centralizes the single spelling of this path that the rest of the crate
 /// builds whenever it needs a branch's full ref — for `gix` rev-parsing,
 /// `git merge-base`, `git branch -f`, and so on.
-pub fn branch_ref(branch: &str) -> String {
+pub(crate) fn branch_ref(branch: &str) -> String {
     format!("refs/heads/{branch}")
 }
 
@@ -84,7 +84,7 @@ pub fn branch_ref(branch: &str) -> String {
 /// so single-component lowercase names like `feature` are accepted while
 /// illegal forms (`feat..x`, `a b`, `*x`, `.hidden`, `x.lock`, `HEAD`, …) are
 /// rejected.
-pub fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
+pub(crate) fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
     use gix::bstr::ByteSlice;
     let full = branch_ref(name);
     gix::validate::reference::branch_name(full.as_bytes().as_bstr())
@@ -93,14 +93,14 @@ pub fn validate_branch_name(name: &str) -> std::result::Result<(), String> {
 }
 
 /// Resolves a revspec to an object id (hex), or `None` if it does not resolve.
-pub fn resolve_hex(repo: &gix::Repository, spec: &str) -> Option<String> {
+pub(crate) fn resolve_hex(repo: &gix::Repository, spec: &str) -> Option<String> {
     repo.rev_parse_single(spec)
         .ok()
         .map(|id| id.detach().to_string())
 }
 
 /// Resolves the configured upstream of `branch`, or `None` if none is set.
-pub fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstream> {
+pub(crate) fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstream> {
     let config = repo.config_snapshot();
     let remote = config.string(format!("branch.{branch}.remote").as_str())?;
     let merge = config.string(format!("branch.{branch}.merge").as_str())?;
@@ -120,7 +120,7 @@ pub fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstream> {
 /// Whether commit-ish `a` is an ancestor of `b` (i.e. `a` is fully merged into
 /// `b`), determined offline via `git merge-base --is-ancestor`. Returns `false`
 /// if a ref is missing or the command errors.
-pub fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
+pub(crate) fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
     git.run_raw(root, &["merge-base", "--is-ancestor", a, b])
         .map(|o| o.success)
         .unwrap_or(false)
@@ -129,12 +129,12 @@ pub fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
 /// Resolves the repository's default branch (spec §7): the `origin/HEAD` target,
 /// falling back to the current branch. (`init.defaultBranch` is deliberately not
 /// consulted — it governs *new* repositories, not an existing repo's default.)
-pub fn default_branch(repo: &gix::Repository) -> Option<String> {
+pub(crate) fn default_branch(repo: &gix::Repository) -> Option<String> {
     origin_head_branch(repo).or_else(|| current_branch(repo))
 }
 
 /// The current branch name, or `None` for a detached HEAD or unborn branch.
-pub fn current_branch(repo: &gix::Repository) -> Option<String> {
+pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
     let head = repo.head().ok()?;
     head.referent_name().map(|name| name.shorten().to_string())
 }

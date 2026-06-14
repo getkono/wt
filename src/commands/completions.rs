@@ -8,7 +8,7 @@ use crate::error::Result;
 
 /// Generates and prints a `clap`-based completion script for the given shell
 /// (subcommands, flags, and enumerated values).
-pub fn run(cx: &mut Cx, args: &CompletionsArgs) -> Result<u8> {
+pub(crate) fn run(cx: &mut Cx, args: &CompletionsArgs) -> Result<u8> {
     let mut command = Cli::command();
     let mut buffer: Vec<u8> = Vec::new();
     clap_complete::generate(args.shell, &mut command, "wt", &mut buffer);

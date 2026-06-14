@@ -2,6 +2,7 @@
 //! network operations. Submodules:
 //!
 //! - [`cli`] — the [`GitCli`](cli::GitCli) subprocess trait + [`RealGit`](cli::RealGit).
+//! - `ops` — verb-named wrappers over [`GitCli`] for shared mutations.
 //! - [`discover`] — repository discovery and identity via `gix`.
 //! - [`porcelain`] — pure parsers for `git` porcelain output.
 //! - [`submodule`] — submodule detection (`status`) and init (`update --init`).
@@ -11,20 +12,19 @@ pub mod aheadbehind;
 pub mod cli;
 pub mod commit;
 pub mod discover;
+pub(crate) mod ops;
 pub mod porcelain;
 pub mod refs;
 pub mod status;
 pub mod submodule;
 pub mod worktrees;
 
-pub use aheadbehind::ahead_behind;
+pub(crate) use aheadbehind::ahead_behind;
 pub use cli::{GitCli, GitOutput, RealGit};
-pub use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
-pub use discover::Repo;
-pub use porcelain::{RawWorktree, SubmoduleStatus, parse_submodule_status, parse_worktree_list};
-pub use refs::{
+pub(crate) use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
+pub(crate) use refs::{
     Upstream, all_branches, branch_ref, current_branch, default_branch, is_ancestor,
     local_branches, remote_branches, resolve_hex, upstream_of, validate_branch_name,
 };
-pub use status::{StatusSummary, status_of};
-pub use worktrees::{enumerate, primary_root};
+pub(crate) use status::status_of;
+pub(crate) use worktrees::enumerate;

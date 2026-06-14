@@ -13,8 +13,8 @@ use crate::error::Result;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{
-    Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch, enumerate,
-    is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
+    CommitInfo, Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch,
+    enumerate, is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
 };
 use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
@@ -31,7 +31,7 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Enumerates the repository's worktrees with their synchronous fields only
 /// (path, branch, slug, current/main/missing/detached markers). The bare-repo
 /// hub entry is excluded (it is not a checkout). Spec §10 "Synchronous".
-pub fn enumerate_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+pub(crate) fn enumerate_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     let dir = repo.current_workdir().unwrap_or_else(|| repo.git_dir());
     let raws = enumerate(git, &dir)?;
     let current = repo.current_workdir();
@@ -58,7 +58,7 @@ pub fn enumerate_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree
 /// from `wt.*` config, upstream + ahead/behind, dirty/untracked, and the tip
 /// commit. Best-effort: a failed read leaves the field unset rather than
 /// erroring. Missing worktrees keep only their admin-derived fields.
-pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
+pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
     if let Some(branch) = wt.branch.clone() {
         let meta = wtconfig::read_meta(repo.gix(), &branch);
         wt.base_ref = meta.base_ref.clone();
@@ -70,14 +70,7 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         let upstream = upstream_of(repo.gix(), &branch);
         if let Some(up) = &upstream {
             wt.upstream = Some(up.display.clone());
-            if !wt.is_missing
-                && !up.is_gone
-                && let Ok((ahead, behind)) =
-                    ahead_behind(git, &wt.path, &up.tracking_ref, &branch_ref(&branch))
-            {
-                wt.ahead = Some(ahead);
-                wt.behind = Some(behind);
-            }
+            fill_ahead_behind(git, wt, &branch, up);
         }
         // Offline merge-state for delete-safety messaging; unknowable for a
         // missing worktree (no checkout to query), left `None` there.
@@ -96,25 +89,47 @@ pub fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Wo
         wt.has_untracked = Some(status.has_untracked);
     }
 
-    if let Some(oid) = tip_oid(repo, git, wt) {
-        if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
-            wt.commit = Some(Commit {
-                hash: info.hash,
-                subject: info.subject,
-                author: info.author,
-                timestamp: iso8601(info.timestamp_unix),
-            });
-        }
-        // The last few commits power the TUI detail pane (spec §10).
-        wt.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
-            .into_iter()
-            .map(|info| Commit {
-                hash: info.hash,
-                subject: info.subject,
-                author: info.author,
-                timestamp: iso8601(info.timestamp_unix),
-            })
-            .collect();
+    fill_commits(repo, git, abbrev, wt);
+}
+
+/// Fills `wt.ahead`/`wt.behind` against a present `upstream`. Skipped for a
+/// missing worktree (no checkout to count against) or a gone upstream; a failed
+/// count leaves the fields unset.
+fn fill_ahead_behind(git: &dyn GitCli, wt: &mut Worktree, branch: &str, upstream: &Upstream) {
+    if !wt.is_missing
+        && !upstream.is_gone
+        && let Ok((ahead, behind)) =
+            ahead_behind(git, &wt.path, &upstream.tracking_ref, &branch_ref(branch))
+    {
+        wt.ahead = Some(ahead);
+        wt.behind = Some(behind);
+    }
+}
+
+/// Fills the tip commit and the recent-commit list that powers the TUI detail
+/// pane (spec §10), resolved from the worktree's tip OID. A worktree with no
+/// resolvable tip keeps both unset.
+fn fill_commits(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
+    let Some(oid) = tip_oid(repo, git, wt) else {
+        return;
+    };
+    if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
+        wt.commit = Some(to_commit(info));
+    }
+    wt.recent_commits = recent_commits(repo.gix(), &oid, abbrev, 5)
+        .into_iter()
+        .map(to_commit)
+        .collect();
+}
+
+/// Maps a git [`CommitInfo`] to the model [`Commit`], formatting its timestamp as
+/// ISO-8601.
+fn to_commit(info: CommitInfo) -> Commit {
+    Commit {
+        hash: info.hash,
+        subject: info.subject,
+        author: info.author,
+        timestamp: iso8601(info.timestamp_unix),
     }
 }
 
@@ -207,7 +222,7 @@ fn build_pr(meta: &WtMeta) -> Option<Pr> {
 
 /// Enumerates and fully enriches all worktrees (used by the CLI, which has no
 /// async loading phase).
-pub fn build_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+pub(crate) fn build_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     let abbrev = abbrev_len(repo.gix());
     let mut worktrees = enumerate_worktrees(repo, git)?;
     for wt in &mut worktrees {
@@ -306,7 +321,7 @@ fn enrich_branch_row(repo: &Repo, git: &dyn GitCli, abbrev: usize, row: &mut Wor
 /// local branch without a worktree (issue #47) — the immediate listing the TUI
 /// paints before async enrichment fills in ahead/behind. Branch rows render with
 /// spinners until [`build_rows`] replaces them.
-pub fn enumerate_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+pub(crate) fn enumerate_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     let mut rows = enumerate_worktrees(repo, git)?;
     let names = branchless_local_branches(repo, &rows);
     rows.extend(names.iter().map(|name| branch_row(name)));
@@ -316,7 +331,7 @@ pub fn enumerate_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
 /// Builds fully-enriched worktrees plus enriched worktree-less branch rows
 /// (issue #47): the TUI's complete listing, loaded off the event loop. The CLI
 /// uses [`build_worktrees`] (worktrees only); branch rows are TUI-only.
-pub fn build_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
+pub(crate) fn build_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     let mut rows = build_worktrees(repo, git)?;
     let abbrev = abbrev_len(repo.gix());
     for name in branchless_local_branches(repo, &rows) {
@@ -373,7 +388,7 @@ fn dirty_rank(worktree: &Worktree) -> Option<i64> {
 
 /// Sorts worktrees in place by the given spec (spec §7). Worktrees with no value
 /// for the sort key sort last regardless of direction.
-pub fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
+pub(crate) fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
     worktrees.sort_by(|a, b| {
         let ka = sort_value(a, spec.key);
         let kb = sort_value(b, spec.key);
@@ -397,7 +412,7 @@ pub fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::SortSpec) 
 /// front so the TUI always shows it first regardless of the active sort
 /// (issue #4). The CLI's `list` calls [`sort_worktrees`] directly and keeps the
 /// pure `--sort` order (it never has branch rows).
-pub fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
+pub(crate) fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
     sort_worktrees(worktrees, spec);
     // Branch rows always sit beneath the real worktrees, each group keeping its
     // sorted order (`sort_by_key` is stable; `false` < `true` ranks worktrees
@@ -412,16 +427,16 @@ pub fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model:
 
 /// The result of evaluating the remove/prune safety guards (spec §10/§12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GuardStatus {
+pub(crate) struct GuardStatus {
     /// Modified/staged tracked files (or untracked when `untracked_blocks`).
-    pub dirty: bool,
+    pub(crate) dirty: bool,
     /// Local commits ahead of upstream, or no upstream configured.
-    pub unpushed: bool,
+    pub(crate) unpushed: bool,
 }
 
 impl GuardStatus {
     /// Whether either guard would block removal without `--force`.
-    pub fn blocks(self) -> bool {
+    pub(crate) fn blocks(self) -> bool {
         self.dirty || self.unpushed
     }
 }
@@ -429,7 +444,7 @@ impl GuardStatus {
 /// Evaluates the remove/prune guards for a worktree (spec §10/§12). "Dirty" is
 /// modified/staged tracked files (plus untracked when `untracked_blocks`);
 /// "unpushed" is `ahead > 0`, and a branch with no upstream counts as unpushed.
-pub fn guard_status(worktree: &Worktree, untracked_blocks: bool) -> GuardStatus {
+pub(crate) fn guard_status(worktree: &Worktree, untracked_blocks: bool) -> GuardStatus {
     // An unknown dirty state on a *present* worktree (e.g. the status read
     // failed) is treated as dirty so the guard fails safe; a missing worktree's
     // `None` is legitimate and must not block (it skips the guards entirely).
