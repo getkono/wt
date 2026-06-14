@@ -20,15 +20,15 @@ use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status
 /// confirm dialog sets only `force_remove` — the dialog is itself the guard, so
 /// `y` may remove a dirty/unpushed worktree, but it must never silently
 /// force-delete an unmerged branch (spec §10/§12).
-pub struct RemoveOptions {
+pub(crate) struct RemoveOptions {
     /// Skip the dirty/unpushed guards and pass `--force` to `git worktree remove`.
-    pub force_remove: bool,
+    pub(crate) force_remove: bool,
     /// Permit deleting a branch that is not fully merged into its base.
-    pub force_branch: bool,
+    pub(crate) force_branch: bool,
     /// Always keep the local branch.
-    pub keep_branch: bool,
+    pub(crate) keep_branch: bool,
     /// Skip the pre-remove hook.
-    pub no_hooks: bool,
+    pub(crate) no_hooks: bool,
 }
 
 impl RemoveOptions {
@@ -65,7 +65,7 @@ pub(crate) fn run(
 /// Resolves `query` to a worktree and removes it under the given options.
 /// Shared by the CLI (`run`) and the TUI confirm-remove dialog, which differ
 /// only in their [`RemoveOptions`].
-pub fn remove_query(
+pub(crate) fn remove_query(
     cx: &mut Cx,
     hooks: &dyn HookRunner,
     query: &str,
@@ -178,7 +178,12 @@ pub fn remove_query(
 /// safe delete is refused because the branch is unmerged, the returned error
 /// message contains the stable substring "not fully merged", which the TUI keys on
 /// to offer a force-delete.
-pub fn delete_branch_query(cx: &mut Cx, branch: &str, force: bool, json: bool) -> Result<u8> {
+pub(crate) fn delete_branch_query(
+    cx: &mut Cx,
+    branch: &str,
+    force: bool,
+    json: bool,
+) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;

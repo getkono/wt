@@ -17,16 +17,16 @@ use crate::worktree_service::enumerate_worktrees;
 
 /// A base branch found to be behind its upstream (issue #56).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StaleBase {
+pub(crate) struct StaleBase {
     /// How many commits the base is behind its upstream.
-    pub behind: u32,
+    pub(crate) behind: u32,
     /// The remote-tracking ref, e.g. `refs/remotes/origin/main`.
-    pub tracking_ref: String,
+    pub(crate) tracking_ref: String,
     /// The upstream display name, e.g. `origin/main`.
-    pub upstream_display: String,
+    pub(crate) upstream_display: String,
     /// Whether the base has no local-only commits, so it can be fast-forwarded.
     /// When false the base has diverged and "update" would fail.
-    pub can_fast_forward: bool,
+    pub(crate) can_fast_forward: bool,
 }
 
 /// Whether `base` (a local branch) is behind its origin/upstream counterpart, for
@@ -35,7 +35,7 @@ pub struct StaleBase {
 /// not ahead. When a remote is configured it best-effort fetches first so the
 /// comparison sees the latest; a failed fetch is non-fatal (the check proceeds
 /// against the already-known tracking ref).
-pub fn check_base_behind(
+pub(crate) fn check_base_behind(
     cx: &mut Cx,
     git: &dyn GitCli,
     repo: &Repo,
@@ -80,7 +80,7 @@ pub fn check_base_behind(
 /// "update" action). Errors when the base has diverged (cannot fast-forward). If
 /// the base is checked out in a worktree, runs `git merge --ff-only` there so the
 /// working tree follows; otherwise moves the ref with `git branch -f`.
-pub fn fast_forward_base(
+pub(crate) fn fast_forward_base(
     cx: &mut Cx,
     git: &dyn GitCli,
     repo: &Repo,
