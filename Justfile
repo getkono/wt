@@ -40,3 +40,12 @@ test:
 # Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)
 coverage:
     cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80
+
+# Mutation testing — find logic the tests don't pin down (slow); args pass through
+mutants *ARGS:
+    cargo mutants {{ ARGS }}
+
+# Mutation testing limited to code this branch changed vs `base` (default origin/master)
+mutants-diff base="origin/master":
+    git diff {{ base }}...HEAD > target/mutants.diff
+    cargo mutants --in-diff target/mutants.diff

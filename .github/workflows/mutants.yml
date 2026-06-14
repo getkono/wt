@@ -1,0 +1,49 @@
+name: Mutants
+
+# Mutation testing is informational and slow, so this workflow is intentionally
+# NON-BLOCKING (continue-on-error) and, on pull requests, runs only over the code
+# the PR changed (`--in-diff`). A weekly schedule runs a fuller sweep.
+#
+# NOTE: building this project requires the private `sendit` dependency
+# (getkono/fast) fetched over SSH. Set the `SENDIT_DEPLOY_KEY` repository secret
+# to a deploy key with read access to that repo, or this workflow cannot build.
+# (The main `ci.yml` workflow has the same unmet requirement and currently
+# triggers on `main` while the trunk is `master`.)
+
+on:
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC — weekly fuller sweep
+
+jobs:
+  mutants:
+    name: Mutation testing (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so --in-diff can reach the base branch
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SENDIT_DEPLOY_KEY }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - name: Mutants on changed code
+        if: github.event_name == 'pull_request'
+        run: |
+          git diff "origin/${{ github.base_ref }}...HEAD" > mutants.diff
+          cargo mutants --in-diff mutants.diff --no-shuffle -j 2
+      - name: Full mutants sweep (scheduled)
+        if: github.event_name == 'schedule'
+        run: cargo mutants --no-shuffle -j 2
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-report
+          path: mutants.out/
