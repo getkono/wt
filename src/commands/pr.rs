@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{PrArgs, PrSub};
 use crate::commands::{
-    Session, emit_worktree, maybe_init_submodules, open_session, resolve_target, rollback_worktree,
+    Session, emit_worktree, maybe_init_submodules_interactive, open_session, resolve_target,
+    rollback_worktree,
 };
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
@@ -119,8 +120,18 @@ fn pr_checkout(
     args: &PrArgs,
     json: bool,
 ) -> Result<u8> {
-    let (path, existed) =
-        checkout_pr_worktree(cx, git, gh, hooks, session, dir, target, args.no_hooks)?;
+    let (path, existed) = checkout_pr_worktree(
+        cx,
+        git,
+        gh,
+        hooks,
+        session,
+        dir,
+        target,
+        args.no_hooks,
+        // The CLI may prompt before initializing submodules; the TUI passes false.
+        true,
+    )?;
     let note = if existed {
         "worktree already exists at"
     } else {
@@ -133,7 +144,8 @@ fn pr_checkout(
 /// recording its PR metadata (§7). Returns the worktree path and whether the
 /// worktree already existed (vs. was created here). Does not emit output — the
 /// caller decides how to surface the path (CLI navigation result, or TUI
-/// switch).
+/// switch). `prompt` enables the interactive submodule confirmation (issue #50):
+/// the CLI passes `true`; the TUI passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn checkout_pr_worktree(
     cx: &mut Cx,
@@ -144,6 +156,7 @@ pub(crate) fn checkout_pr_worktree(
     dir: &Path,
     target: &str,
     no_hooks: bool,
+    prompt: bool,
 ) -> Result<(PathBuf, bool)> {
     let view = gh.view_pr(dir, target)?;
     let root = session.primary_root.clone();
@@ -245,14 +258,16 @@ pub(crate) fn checkout_pr_worktree(
         no_hooks,
     )?;
 
-    // Honor `[submodules] init` for PR worktrees too (issue #50); no
-    // per-invocation flag here. Non-fatal.
-    maybe_init_submodules(
+    // Honor `[submodules] init` for PR worktrees too (issue #50), prompting
+    // (default yes) at an interactive terminal when the policy is left at its
+    // default; no per-invocation flag here. Non-fatal.
+    maybe_init_submodules_interactive(
         cx,
         git,
         &worktree_path,
         session.config.submodules_init,
         None,
+        prompt,
     )?;
 
     Ok((worktree_path, false))

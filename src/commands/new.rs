@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::NewArgs;
 use crate::commands::{
-    emit_worktree, maybe_init_submodules, open_session, render_target, resolve_target,
+    emit_worktree, maybe_init_submodules_interactive, open_session, render_target, resolve_target,
     rollback_worktree, same_path,
 };
 use crate::config::wtconfig;
@@ -64,18 +64,23 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &NewArgs, json: boo
             }
         }
     }
-    run_core(cx, hooks, args, json)
+    // The CLI may prompt before initializing submodules (issue #50); the TUI
+    // passes `false` to `run_core` and drives its own modal instead.
+    run_core(cx, hooks, args, json, true)
 }
 
 /// Creates a linked worktree for `branch` (creating the branch if needed), runs
 /// the copy step and post-create hook, and prints the new path (unless
 /// `--no-switch`/`--json`). The base-staleness check (issue #56) is the caller's
 /// responsibility — [`run`] does it for the CLI, the TUI before this is reached.
+/// `prompt` enables the interactive submodule confirmation (issue #50): the CLI
+/// passes `true`; the TUI passes `false` and runs its own modal afterwards.
 pub(crate) fn run_core(
     cx: &mut Cx,
     hooks: &dyn HookRunner,
     args: &NewArgs,
     json: bool,
+    prompt: bool,
 ) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
@@ -191,14 +196,16 @@ pub(crate) fn run_core(
         args.no_hooks,
     )?;
 
-    // Initialize submodules when the policy (or `--init-submodules`) asks for it
-    // (issue #50). Non-fatal — the worktree already exists.
-    maybe_init_submodules(
+    // Initialize submodules per the policy/flag, prompting (default yes) at an
+    // interactive terminal when the policy is left at its default (issue #50).
+    // Non-fatal — the worktree already exists.
+    maybe_init_submodules_interactive(
         cx,
         git,
         &target,
         session.config.submodules_init,
         args.submodule_override(),
+        prompt,
     )?;
 
     emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
@@ -636,6 +643,47 @@ mod tests {
         t.cx.input = Box::new(crate::testutil::CannedInput::new(inputs));
         let code = super::run(&mut t.cx, &RealHookRunner, a, false).unwrap();
         (code, t.out.contents(), t.err.contents())
+    }
+
+    /// Runs `new` with a TTY stderr and seeded prompt answers, returning
+    /// `(code, stdout, stderr)`. The TTY makes the submodule prompt fire (issue #50).
+    fn run_with_tty_input(repo: &TestRepo, a: &NewArgs, inputs: &[&str]) -> (u8, String, String) {
+        use crate::cx::Stream;
+        use crate::testutil::{CannedInput, SharedBuf};
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let err = SharedBuf::new();
+        t.cx.err = Stream::new(Box::new(err.clone()), true);
+        t.cx.input = Box::new(CannedInput::new(inputs));
+        let code = super::run(&mut t.cx, &RealHookRunner, a, false).unwrap();
+        (code, t.out.contents(), err.contents())
+    }
+
+    #[test]
+    fn new_prompts_and_initializes_submodules_on_yes() {
+        // The default policy at a TTY asks; `y` runs the recursive init (issue #50).
+        let repo = repo_with_submodule();
+        let (code, _out, err) = run_with_tty_input(&repo, &args("feat"), &["y"]);
+        assert_eq!(code, 0);
+        assert!(err.contains("uninitialized submodule"));
+        assert!(err.contains("initializing 1 submodule"));
+    }
+
+    #[test]
+    fn new_prompt_defaults_to_yes_on_empty_answer() {
+        let repo = repo_with_submodule();
+        let (code, _out, err) = run_with_tty_input(&repo, &args("feat"), &[""]);
+        assert_eq!(code, 0);
+        assert!(err.contains("initializing 1 submodule"));
+    }
+
+    #[test]
+    fn new_prompt_no_leaves_submodules_uninitialized() {
+        let repo = repo_with_submodule();
+        let (code, out, err) = run_with_tty_input(&repo, &args("feat"), &["n"]);
+        assert_eq!(code, 0);
+        assert!(err.contains("uninitialized submodule"));
+        assert!(!err.contains("initializing"));
+        assert!(!Path::new(out.trim()).join("libs/sub/sub.txt").exists());
     }
 
     /// Leaves local `main` one commit behind `origin/main` (with the upstream

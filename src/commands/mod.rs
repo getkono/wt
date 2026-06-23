@@ -161,6 +161,18 @@ pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
+/// Prompts on stderr and reads a yes/no confirmation (default *yes*): an empty
+/// line or EOF counts as yes, so only an explicit `n`/`no` declines. Callers must
+/// gate this on an interactive terminal — a non-interactive EOF would otherwise
+/// silently accept.
+pub(crate) fn confirm_default_yes(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    cx.err.text(prompt)?;
+    cx.err.flush()?;
+    let line = cx.input.read_line()?;
+    let answer = line.trim().to_ascii_lowercase();
+    Ok(answer != "n" && answer != "no")
+}
+
 /// A three-way answer to the stale-base prompt (issue #56): update the base,
 /// proceed off it as-is, or cancel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,8 +202,10 @@ pub(crate) fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
 /// Initializes git submodules in `dir` when enabled, after a worktree is created
 /// or a branch is checked out (issue #50). `flag_override` is the resolved
 /// `--init-submodules`/`--no-init-submodules` choice and wins over `policy`;
-/// without a flag, `policy` (`[submodules] init`) decides. Disabled is the common
-/// case and costs nothing — no `git` runs. A failure is non-fatal: the worktree
+/// without a flag, `policy` decides — only `[submodules] init = "always"` runs
+/// here (`prompt`/`never` are skips, so this is the non-interactive fallback for
+/// the [`Prompt`](SubmoduleInit::Prompt) default). Disabled is the common case
+/// and costs nothing — no `git` runs. A failure is non-fatal: the worktree
 /// already exists, so it is surfaced as a warning rather than propagated.
 pub(crate) fn maybe_init_submodules(
     cx: &mut Cx,
@@ -208,17 +222,57 @@ pub(crate) fn maybe_init_submodules(
     if pending.is_empty() {
         return Ok(());
     }
-    // A heads-up on stderr (never stdout — the `cd` path must stay clean); a
-    // submodule clone can block for a while, so silence would be confusing.
-    let _ = cx
-        .err
-        .line(&format!("initializing {} submodule(s)…", pending.len()));
+    init_submodules(cx, git, dir, pending.len());
+    Ok(())
+}
+
+/// Initializes git submodules in `dir`, prompting first at an interactive
+/// terminal when the policy is left at its [`Prompt`](SubmoduleInit::Prompt)
+/// default (no `--init-submodules`/`--no-init-submodules` flag). An explicit flag
+/// or an `always`/`never` policy decides without a prompt, deferring to
+/// [`maybe_init_submodules`]. `prompt` is the caller's interactivity gate (the
+/// CLI passes `true`; the TUI passes `false` and handles its own modal), so a
+/// prompt only fires for `prompt && stderr.is_tty()`. Non-fatal throughout.
+pub(crate) fn maybe_init_submodules_interactive(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    dir: &Path,
+    policy: SubmoduleInit,
+    flag_override: Option<bool>,
+    prompt: bool,
+) -> Result<()> {
+    // An explicit flag or an always/never policy decides without asking.
+    if flag_override.is_some() || !matches!(policy, SubmoduleInit::Prompt) {
+        return maybe_init_submodules(cx, git, dir, policy, flag_override);
+    }
+    // The Prompt default: only ask interactively; non-interactively leave them be.
+    if !(prompt && cx.err.is_tty()) {
+        return Ok(());
+    }
+    let pending = crate::git::submodule::uninitialized(git, dir)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let ask = format!(
+        "repository has {} uninitialized submodule(s); initialize recursively (`git submodule update --init --recursive`)? [Y/n] ",
+        pending.len()
+    );
+    if confirm_default_yes(cx, &ask)? {
+        init_submodules(cx, git, dir, pending.len());
+    }
+    Ok(())
+}
+
+/// Runs `git submodule update --init --recursive` in `dir`, logging a heads-up on
+/// stderr first (never stdout — the `cd` path must stay clean) since a submodule
+/// clone can block for a while. A failure is surfaced as a warning, not an error.
+fn init_submodules(cx: &mut Cx, git: &dyn GitCli, dir: &Path, count: usize) {
+    let _ = cx.err.line(&format!("initializing {count} submodule(s)…"));
     if let Err(e) = crate::git::submodule::update_init(git, dir) {
         let _ = cx
             .err
             .line(&format!("warning: failed to initialize submodules: {e}"));
     }
-    Ok(())
 }
 
 /// The git directory used for the `.git`-containment check (spec §6).
@@ -496,6 +550,30 @@ mod tests {
     }
 
     #[test]
+    fn confirm_default_yes_treats_empty_as_yes() {
+        use crate::commands::confirm_default_yes;
+        use crate::testutil::CannedInput;
+        let cases = [
+            ("", true),
+            ("y", true),
+            ("yes", true),
+            ("anything", true),
+            ("n", false),
+            ("N", false),
+            ("no", false),
+        ];
+        for (answer, expected) in cases {
+            let mut t = test_cx(&[], "/work");
+            t.cx.input = Box::new(CannedInput::new(&[answer]));
+            assert_eq!(
+                confirm_default_yes(&mut t.cx, "? ").unwrap(),
+                expected,
+                "answer {answer:?}"
+            );
+        }
+    }
+
+    #[test]
     fn choose_maps_answers_and_defaults_to_cancel() {
         use crate::commands::{Choice, choose};
         use crate::testutil::CannedInput;
@@ -516,11 +594,11 @@ mod tests {
 
     mod submodules {
         use super::cx_with_err_tty;
-        use crate::commands::maybe_init_submodules;
+        use crate::commands::{maybe_init_submodules, maybe_init_submodules_interactive};
         use crate::config::SubmoduleInit;
         use crate::git::cli::{GitCli, GitOutput, RealGit};
         use crate::git::submodule::uninitialized;
-        use crate::testutil::TestRepo;
+        use crate::testutil::{CannedInput, TestRepo};
         use std::path::Path;
 
         /// A repo with one submodule deinitialized, so it reports as uninitialized
@@ -622,6 +700,151 @@ mod tests {
             fn run(&self, _repo: &Path, _args: &[&str]) -> crate::error::Result<String> {
                 Err(crate::error::Error::operation("boom"))
             }
+        }
+
+        #[test]
+        fn prompt_default_yes_empty_initializes() {
+            // The Prompt default at a TTY asks, and an empty answer (the default)
+            // initializes (issue #50).
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            t.cx.input = Box::new(CannedInput::new(&[""]));
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(is_initialized(&repo));
+            assert!(err.contents().contains("uninitialized submodule"));
+        }
+
+        #[test]
+        fn prompt_no_leaves_uninitialized() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            t.cx.input = Box::new(CannedInput::new(&["n"]));
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+            // The prompt was shown, but nothing was initialized.
+            assert!(err.contents().contains("uninitialized submodule"));
+            assert!(!err.contents().contains("initializing"));
+        }
+
+        #[test]
+        fn prompt_with_no_submodules_does_not_ask() {
+            let repo = TestRepo::init();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(err.contents().is_empty());
+        }
+
+        #[test]
+        fn prompt_non_tty_is_a_silent_skip() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(false);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+            assert!(err.contents().is_empty());
+        }
+
+        #[test]
+        fn prompt_false_gate_skips_even_at_a_tty() {
+            // The TUI passes `prompt = false` and drives its own modal; the inline
+            // helper must not prompt or init.
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                None,
+                false,
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+            assert!(err.contents().is_empty());
+        }
+
+        #[test]
+        fn flag_skip_overrides_prompt_without_asking() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                Some(false),
+                true,
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+            assert!(err.contents().is_empty());
+        }
+
+        #[test]
+        fn flag_init_overrides_prompt_without_asking() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Prompt,
+                Some(true),
+                true,
+            )
+            .unwrap();
+            assert!(is_initialized(&repo));
+            // Initialized directly, with no `[Y/n]` prompt.
+            assert!(err.contents().contains("initializing"));
+            assert!(!err.contents().contains("uninitialized submodule"));
+        }
+
+        #[test]
+        fn never_policy_does_not_ask_at_a_tty() {
+            let repo = repo_with_uninitialized_submodule();
+            let (mut t, err) = cx_with_err_tty(true);
+            maybe_init_submodules_interactive(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Never,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(!is_initialized(&repo));
+            assert!(err.contents().is_empty());
         }
 
         #[test]

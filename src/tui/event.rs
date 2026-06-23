@@ -84,6 +84,13 @@ pub enum Effect {
         /// Index into `App::worktrees` of the target worktree.
         worktree_index: usize,
     },
+    /// Initialize the submodules in `dir` recursively (confirmed; issue #50).
+    InitSubmodules {
+        /// The worktree directory whose submodules to initialize.
+        dir: PathBuf,
+        /// How many uninitialized submodules were detected (for the status text).
+        count: usize,
+    },
     /// Open the given path in the editor.
     OpenEditor(PathBuf),
     /// Force a full async refresh.
@@ -221,6 +228,7 @@ impl App {
             Mode::ConfirmCreate(_) => self.key_confirm_create(key),
             Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
             Mode::ConfirmStaleBase(_) => self.key_confirm_stale_base(key),
+            Mode::ConfirmInitSubmodules(_) => self.key_confirm_init_submodules(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -666,6 +674,28 @@ impl App {
         }
     }
 
+    /// Confirm-init-submodules key handling (issue #50): `Enter`/`y`/`Y` — the
+    /// default — initializes the new worktree's submodules recursively; `n`/`N`/`Esc`
+    /// dismisses and leaves them uninitialized; any other key is ignored.
+    fn key_confirm_init_submodules(&mut self, key: KeyEvent) -> Effect {
+        let Mode::ConfirmInitSubmodules(state) = &self.mode else {
+            return Effect::None;
+        };
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let dir = state.dir.clone();
+                let count = state.count;
+                self.mode = Mode::List;
+                Effect::InitSubmodules { dir, count }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::List;
+                Effect::None
+            }
+            _ => Effect::None,
+        }
+    }
+
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         // A modal overlay owns all input (issue #70): the background list/detail
@@ -935,6 +965,48 @@ mod tests {
         a.mode = Mode::ConfirmStaleBase(state);
         assert_eq!(a.handle_event(press(KeyCode::Esc)), Effect::None);
         assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn confirm_init_submodules_keys_init_or_skip() {
+        use crate::tui::app::InitSubmodulesState;
+        let state = InitSubmodulesState {
+            dir: PathBuf::from("/wt/feature"),
+            branch: "feature".into(),
+            count: 2,
+        };
+        let mut a = app(&[("main", true)]);
+        // Enter (the default) initializes.
+        a.mode = Mode::ConfirmInitSubmodules(state.clone());
+        assert_eq!(
+            a.handle_event(press(KeyCode::Enter)),
+            Effect::InitSubmodules {
+                dir: PathBuf::from("/wt/feature"),
+                count: 2,
+            }
+        );
+        assert_eq!(a.mode, Mode::List);
+        // `y` also initializes.
+        a.mode = Mode::ConfirmInitSubmodules(state.clone());
+        assert_eq!(
+            a.handle_event(press(KeyCode::Char('y'))),
+            Effect::InitSubmodules {
+                dir: PathBuf::from("/wt/feature"),
+                count: 2,
+            }
+        );
+        // `n` skips back to the list.
+        a.mode = Mode::ConfirmInitSubmodules(state.clone());
+        assert_eq!(a.handle_event(press(KeyCode::Char('n'))), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+        // Esc skips too.
+        a.mode = Mode::ConfirmInitSubmodules(state.clone());
+        assert_eq!(a.handle_event(press(KeyCode::Esc)), Effect::None);
+        assert_eq!(a.mode, Mode::List);
+        // An unrelated key is ignored and leaves the modal open.
+        a.mode = Mode::ConfirmInitSubmodules(state);
+        assert_eq!(a.handle_event(press(KeyCode::Char('x'))), Effect::None);
+        assert!(matches!(a.mode, Mode::ConfirmInitSubmodules(_)));
     }
 
     #[test]

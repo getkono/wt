@@ -11,7 +11,9 @@
 use std::path::Path;
 
 use crate::cli::CheckoutArgs;
-use crate::commands::{Session, emit_worktree, maybe_init_submodules, open_session, same_path};
+use crate::commands::{
+    Session, emit_worktree, maybe_init_submodules_interactive, open_session, same_path,
+};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
@@ -54,6 +56,8 @@ pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
         &args.branch,
         args.force,
         args.submodule_override(),
+        // The CLI may prompt before initializing submodules; the TUI passes false.
+        true,
     )?;
     log_sync_outcome(cx, &args.branch, outcome);
     emit_worktree(
@@ -68,6 +72,9 @@ pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
 /// Switches `worktree_dir` to `branch` in place and syncs it with origin
 /// (fetch + fast-forward). Emits no stdout; a divergence/fetch warning is written
 /// to stderr here. Returns what the sync did so the caller can phrase its result.
+/// `prompt` enables the interactive submodule confirmation (issue #50): the CLI
+/// passes `true`; the TUI passes `false`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn checkout_branch_in_worktree(
     cx: &mut Cx,
     git: &dyn GitCli,
@@ -76,6 +83,7 @@ pub(crate) fn checkout_branch_in_worktree(
     branch: &str,
     force: bool,
     submodule_override: Option<bool>,
+    prompt: bool,
 ) -> Result<SyncOutcome> {
     let repo = &session.repo;
     let remote = session.config.pr_default_remote.clone();
@@ -104,13 +112,15 @@ pub(crate) fn checkout_branch_in_worktree(
 
     let outcome = sync_with_upstream(cx, git, worktree_dir, branch, fetch_skipped)?;
     // Switching can introduce new submodule definitions (issue #50); initialize
-    // them when the policy (or `--init-submodules`) asks. Non-fatal.
-    maybe_init_submodules(
+    // them per the policy/flag, prompting (default yes) at an interactive terminal
+    // when the policy is left at its default. Non-fatal.
+    maybe_init_submodules_interactive(
         cx,
         git,
         worktree_dir,
         session.config.submodules_init,
         submodule_override,
+        prompt,
     )?;
     Ok(outcome)
 }
@@ -317,7 +327,7 @@ mod tests {
         checkout_with_submodules(repo, branch, force, None)
     }
 
-    /// Like [`checkout`] but with an explicit submodule-init override.
+    /// Like [`checkout`] but with an explicit submodule-init override (no prompt).
     fn checkout_with_submodules(
         repo: &TestRepo,
         branch: &str,
@@ -336,6 +346,7 @@ mod tests {
             branch,
             force,
             submodule_override,
+            false,
         );
         (t, res)
     }

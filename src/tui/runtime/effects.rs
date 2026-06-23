@@ -55,9 +55,38 @@ pub(super) fn run_create_command(
 /// Creates the worktree (no staleness check) and maps the result to a
 /// [`CreateOutcome`].
 pub(super) fn create_core(cx: &mut Cx, args: &NewArgs) -> CreateOutcome {
-    match commands::new::run_core(cx, &CapturingHookRunner, args, false) {
-        Ok(_) => CreateOutcome::Created,
+    // `prompt = false`: the TUI never prompts inline; the submodule confirmation
+    // is surfaced afterwards as a modal (see below).
+    match commands::new::run_core(cx, &CapturingHookRunner, args, false, false) {
+        Ok(_) => match pending_submodules_to_confirm(cx, &args.branch) {
+            Some((dir, count)) => CreateOutcome::CreatedNeedsSubmodules { dir, count },
+            None => CreateOutcome::Created,
+        },
         Err(e) => CreateOutcome::Failed(e.to_string()),
+    }
+}
+
+/// After a successful TUI create, reports the new worktree's directory and the
+/// number of uninitialized submodules when the `[submodules] init` policy is left
+/// at its `prompt` default (issue #50), so the loop can open the confirm modal.
+/// `None` when the policy is `always`/`never` (decided inline by `run_core`), the
+/// new worktree can't be located, or there is nothing to initialize.
+fn pending_submodules_to_confirm(cx: &Cx, branch: &str) -> Option<(PathBuf, usize)> {
+    let git = cx.git.clone();
+    let session = open_session(cx, git.as_ref()).ok()?;
+    if session.config.submodules_init != SubmoduleInit::Prompt {
+        return None;
+    }
+    let worktrees = enumerate_worktrees(&session.repo, git.as_ref()).ok()?;
+    let dir = worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(branch))
+        .map(|w| w.path.clone())?;
+    let pending = crate::git::submodule::uninitialized(git.as_ref(), &dir).ok()?;
+    if pending.is_empty() {
+        None
+    } else {
+        Some((dir, pending.len()))
     }
 }
 
@@ -68,7 +97,7 @@ pub(super) fn run_materialize_command(
     branch: &str,
 ) -> std::result::Result<(), String> {
     let args = tui_new_args(branch, None);
-    commands::new::run_core(cx, &CapturingHookRunner, &args, false)
+    commands::new::run_core(cx, &CapturingHookRunner, &args, false, false)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
@@ -120,6 +149,8 @@ pub(super) fn run_checkout_pr_command(
         &dir,
         &number.to_string(),
         false,
+        // No inline prompt on a TUI background job; the policy decides.
+        false,
     )
     .map_err(|e| e.to_string())
 }
@@ -142,6 +173,8 @@ pub(super) fn run_checkout_branch_command(
         false,
         // No per-invocation override in the TUI; `[submodules] init` decides.
         None,
+        // No inline prompt on a TUI background job.
+        false,
     )
     .map_err(|e| e.to_string())
 }
@@ -157,6 +190,17 @@ pub(super) fn run_sync_command(
     let session = open_session(cx, git.as_ref()).map_err(|e| e.to_string())?;
     commands::sync::sync_worktree(cx, git.as_ref(), &session, worktree_dir, None, false, false)
         .map_err(|e| e.to_string())
+}
+
+/// Initializes the submodules in `worktree_dir` recursively (issue #50), after
+/// the user confirmed the post-create modal. Best-effort: a failure is reported
+/// as a status error, not propagated.
+pub(super) fn run_init_submodules_command(
+    cx: &mut Cx,
+    worktree_dir: &Path,
+) -> std::result::Result<(), String> {
+    let git = cx.git.clone();
+    crate::git::submodule::update_init(git.as_ref(), worktree_dir).map_err(|e| e.to_string())
 }
 
 /// Spawns a blocking task that builds the fully-enriched worktrees and sends
@@ -371,6 +415,19 @@ pub(super) fn apply_create(
             // cleared — that would be surprising).
             let _ = app.select_branch(branch);
         }
+        // Created, but the new worktree has uninitialized submodules and the policy
+        // is left at its `prompt` default — refresh and focus the row, then open the
+        // confirm modal over it (issue #50).
+        CreateOutcome::CreatedNeedsSubmodules { dir, count } => {
+            app.set_status(format!("created {branch}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+            let _ = app.select_branch(branch);
+            app.mode = Mode::ConfirmInitSubmodules(InitSubmodulesState {
+                dir,
+                branch: branch.to_string(),
+                count,
+            });
+        }
         // The base is behind origin: open the confirm modal carrying the pending
         // create's inputs so the user's choice can re-issue it (issue #56).
         CreateOutcome::NeedsStaleConfirm {
@@ -562,6 +619,31 @@ pub(super) fn apply_sync(
             do_refresh(cx, app, root);
         }
         Err(e) => app.set_status(e, StatusKind::Error),
+    }
+    app.mode = Mode::List;
+}
+
+/// Applies a finished submodule init (issue #50): report success/error in the
+/// status bar, return to the list, and refresh (the submodule files now exist).
+pub(super) fn apply_init_submodules(
+    cx: &Cx,
+    app: &mut App,
+    count: usize,
+    result: std::result::Result<(), String>,
+    root: &Path,
+) {
+    match result {
+        Ok(()) => {
+            app.set_status(
+                format!("initialized {count} submodule(s)"),
+                StatusKind::Success,
+            );
+            do_refresh(cx, app, root);
+        }
+        Err(e) => app.set_status(
+            format!("failed to initialize submodules: {e}"),
+            StatusKind::Error,
+        ),
     }
     app.mode = Mode::List;
 }

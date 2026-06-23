@@ -50,6 +50,11 @@ pub enum Mode {
     /// Confirm dialog shown when the base a new worktree would fork from is behind
     /// its origin counterpart (issue #56): update the base, proceed as-is, or cancel.
     ConfirmStaleBase(StaleBaseState),
+    /// Confirm dialog shown after a worktree is created with uninitialized
+    /// submodules and the `[submodules] init` policy is left at its `prompt`
+    /// default (issue #50): initialize them recursively, or leave them. Defaults
+    /// to yes.
+    ConfirmInitSubmodules(InitSubmodulesState),
     /// Help overlay.
     Help,
 }
@@ -118,6 +123,19 @@ pub struct StaleBaseState {
     /// Whether the base can be fast-forwarded (no local-only commits); when
     /// false, updating will fail and only proceed/cancel make sense.
     pub can_fast_forward: bool,
+}
+
+/// The submodule-init confirm state (issue #50): a freshly created worktree has
+/// uninitialized submodules and the policy is left at its `prompt` default.
+/// Carries the new worktree directory (where the init runs) and what to say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitSubmodulesState {
+    /// The new worktree directory whose submodules would be initialized.
+    pub dir: PathBuf,
+    /// The branch the worktree was created for (for the status text).
+    pub branch: String,
+    /// How many uninitialized submodules were detected.
+    pub count: usize,
 }
 
 /// Which create-prompt field is active.
