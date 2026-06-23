@@ -15,7 +15,7 @@ You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on you
 `PATH`, and — only for PR commands — the [`gh` CLI](https://cli.github.com).
 
 ```bash
-just install        # cargo install --path .  → installs `wt` to ~/.cargo/bin
+cargo install --path .   # installs `wt` to ~/.cargo/bin
 ```
 
 Make sure `~/.cargo/bin` is on your `PATH`. Then enable shell integration
@@ -135,28 +135,33 @@ These are the things worth knowing up front; the rest is discoverable from
 ### Prerequisites
 
 - [Rust (rustup)](https://rustup.rs) — toolchain (pinned via `rust-toolchain.toml`)
-- [just](https://github.com/casey/just) — command runner
-- [Lefthook](https://github.com/evilmartians/lefthook) — git hooks manager
-- [cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) — code coverage tool
+- [mise](https://mise.jdx.dev) — tool manager + task runner
+- [hk](https://hk.jdx.dev) — git hooks manager
 
-| Command             | Description                          |
-| ------------------- | ------------------------------------ |
-| `cargo run`         | Run the application                  |
-| `just install`      | Build and install `wt` to ~/.cargo/bin |
-| `just test`         | Run tests                            |
-| `just format`       | Format code                          |
-| `just lint`         | Lint with Clippy (warnings as errors)|
-| `just lint-fix`     | Lint and auto-fix                    |
-| `just coverage`     | Run tests with coverage (min 80%)    |
+Run `mise install` once to fetch the pinned dev tools (`hk`, `pkl`,
+`cargo-llvm-cov`, `cargo-mutants`).
 
-After cloning, run `lefthook install` once to activate the git hooks.
+| Command             | Description                            |
+| ------------------- | -------------------------------------- |
+| `mise tasks`        | List available tasks                   |
+| `cargo run`         | Run the application                    |
+| `mise run install`  | Build and install `wt` to ~/.cargo/bin |
+| `mise run test`     | Run tests                              |
+| `mise run format`   | Format code                            |
+| `mise run lint`     | Lint with Clippy (warnings as errors)  |
+| `mise run lint-fix` | Lint and auto-fix                      |
+| `mise run coverage` | Run tests with coverage (min 80%)      |
+
+After cloning, run `mise install` to fetch the dev tools, then `hk install`
+once to activate the git hooks.
 
 ### Tech Stack
 
 - **Runtime:** Rust (edition 2024)
 - **Formatter:** rustfmt
 - **Linter:** Clippy
-- **Task runner:** just
+- **Task runner:** mise
+- **Git hooks:** hk
 - **Key Dependencies:** tokio, eyre + color-eyre, tracing + tracing-subscriber, thiserror
 
 ### Architecture
@@ -168,7 +173,7 @@ excluded from coverage.
 
 ### Git Hooks
 
-This project uses [Lefthook](https://github.com/evilmartians/lefthook).
+This project uses [hk](https://hk.jdx.dev), configured in `hk.pkl`.
 Pre-commit hooks auto-fix formatting and linting on staged Rust files.
 Pre-push hooks run format checks, Clippy, tests, and the coverage gate.
 
@@ -184,7 +189,7 @@ for LLVM-based code coverage. CI enforces a minimum of 80% line coverage and
 uploads the report as a CI artifact.
 
 ```bash
-just coverage
+mise run coverage
 ```
 
 ## License
