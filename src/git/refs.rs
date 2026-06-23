@@ -133,21 +133,40 @@ pub(crate) fn default_branch(repo: &gix::Repository) -> Option<String> {
     origin_head_branch(repo).or_else(|| current_branch(repo))
 }
 
+/// The remote-tracking default a new worktree should fork from (issue #70): the
+/// `origin/HEAD` target in display form, e.g. `origin/main`. Forking off the
+/// remote tip keeps new branches based on the up-to-date default rather than a
+/// possibly-stale local copy. `None` when `origin/HEAD` is unset (no remote, or
+/// the repo was never cloned) — callers then fall back to their own default.
+pub(crate) fn default_base_ref(repo: &gix::Repository) -> Option<String> {
+    origin_head_tracking(repo)
+}
+
 /// The current branch name, or `None` for a detached HEAD or unborn branch.
 pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
     let head = repo.head().ok()?;
     head.referent_name().map(|name| name.shorten().to_string())
 }
 
-/// The branch that `refs/remotes/origin/HEAD` points to, if any.
+/// The branch that `refs/remotes/origin/HEAD` points to, if any (the short name,
+/// e.g. `main`).
 fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
+    // The tracking form is `origin/<branch>`; drop the remote to get the branch
+    // (handles slashes in branch names).
+    origin_head_tracking(repo)?
+        .split_once('/')
+        .map(|(_, branch)| branch.to_string())
+}
+
+/// The remote-tracking ref `refs/remotes/origin/HEAD` points to, in display form
+/// (e.g. `origin/main`), if it is set as a symbolic ref.
+fn origin_head_tracking(repo: &gix::Repository) -> Option<String> {
     let reference = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
     match reference.target() {
         gix::refs::TargetRef::Symbolic(name) => {
-            // e.g. refs/remotes/origin/main -> main (handles slashes in names).
+            // e.g. refs/remotes/origin/main -> origin/main.
             let full = name.as_bstr().to_string();
-            let rest = full.strip_prefix("refs/remotes/")?;
-            rest.split_once('/').map(|(_, branch)| branch.to_string())
+            full.strip_prefix("refs/remotes/").map(str::to_string)
         }
         gix::refs::TargetRef::Object(_) => None,
     }
@@ -284,6 +303,31 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         assert_eq!(default_branch(r.gix()).as_deref(), Some("main"));
         assert_eq!(current_branch(r.gix()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn default_base_ref_is_origin_head_tracking_form() {
+        // The default base is the remote-tracking ref (origin/main), so a new
+        // worktree forks off the up-to-date remote tip (issue #70).
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/main", &head]);
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let r = Repo::discover(repo.root()).unwrap();
+        assert_eq!(default_base_ref(r.gix()).as_deref(), Some("origin/main"));
+    }
+
+    #[test]
+    fn default_base_ref_none_without_origin_head() {
+        // No origin/HEAD: there is no confident remote default, so the caller
+        // falls back to its own resolution rather than guessing.
+        let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        assert_eq!(default_base_ref(r.gix()), None);
     }
 
     #[test]

@@ -261,7 +261,11 @@ impl App {
                 // Seed the branch-options dropdown with existing local + remote
                 // branches; it opens once the user types or reaches the base field.
                 let options = crate::tui::OptionList::new(self.branches.clone());
+                // Default the base to the upstream default branch (e.g.
+                // origin/main) so new worktrees fork off the up-to-date remote
+                // tip (issue #70); empty when there is no confident default.
                 self.mode = Mode::Create(CreateState {
+                    base: self.default_base.clone().unwrap_or_default(),
                     options,
                     ..Default::default()
                 });
@@ -664,6 +668,18 @@ impl App {
 
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
+        // A modal overlay owns all input (issue #70): the background list/detail
+        // must not react to clicks, and the wheel scrolls the modal's own list
+        // rather than the hidden list behind it. List/Filter render inline (no
+        // overlay), so they keep the normal mouse behaviour below.
+        if !matches!(self.mode, Mode::List | Mode::Filter) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.modal_scroll(-1),
+                MouseEventKind::ScrollDown => self.modal_scroll(1),
+                _ => {}
+            }
+            return Effect::None;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 // The bottom row is the status/help bar; clicks there select nothing.
@@ -687,6 +703,38 @@ impl App {
             _ => {}
         }
         Effect::None
+    }
+
+    /// Routes one wheel step to the open modal's own list (issue #70): the
+    /// create/checkout pickers move their options dropdown (a no-op while it is
+    /// closed), the PR picker moves its selection. Other overlays have nothing
+    /// to scroll. `delta` is negative for up, positive for down.
+    fn modal_scroll(&mut self, delta: isize) {
+        let up = delta < 0;
+        match &mut self.mode {
+            Mode::Create(state) => {
+                if up {
+                    state.options.up();
+                } else {
+                    state.options.down();
+                }
+            }
+            Mode::Checkout(state) => {
+                if up {
+                    state.options.up();
+                } else {
+                    state.options.down();
+                }
+            }
+            Mode::PrPicker(state) => {
+                if up {
+                    state.selected = state.selected.saturating_sub(1);
+                } else {
+                    state.selected = (state.selected + 1).min(state.prs.len().saturating_sub(1));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Routes a vertical movement to the detail-pane scroll when that pane has
@@ -939,6 +987,48 @@ mod tests {
         let effect = a.handle_event(press(KeyCode::Enter));
         assert_eq!(
             effect,
+            Effect::Create {
+                branch: "feature/x".into(),
+                base: None,
+                decision: None,
+            }
+        );
+    }
+
+    #[test]
+    fn create_mode_prefills_default_base() {
+        // Opening the create prompt seeds the base with the upstream default
+        // branch so the new worktree forks off the remote tip (issue #70).
+        let mut a = app(&[("main", true)]);
+        a.branches = vec!["main".into(), "origin/main".into()];
+        a.default_base = Some("origin/main".into());
+        a.handle_event(press(KeyCode::Char('n')));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "origin/main");
+            assert_eq!(s.step, CreateStep::Branch); // still starts on the branch
+        } else {
+            panic!("expected create mode");
+        }
+    }
+
+    #[test]
+    fn create_mode_base_empty_without_default() {
+        // No detected default: the base starts empty and submitting leaves it
+        // `None` so the CLI's own resolution applies (unchanged behaviour).
+        let mut a = app(&[("main", true)]);
+        assert!(a.default_base.is_none());
+        a.handle_event(press(KeyCode::Char('n')));
+        for c in "feature/x".chars() {
+            a.handle_event(press(KeyCode::Char(c)));
+        }
+        a.handle_event(press(KeyCode::Enter)); // advance to base
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.base, "");
+        } else {
+            panic!("expected create mode");
+        }
+        assert_eq!(
+            a.handle_event(press(KeyCode::Enter)),
             Effect::Create {
                 branch: "feature/x".into(),
                 base: None,
@@ -1519,6 +1609,108 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         }));
         assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn mouse_in_modal_does_not_touch_background() {
+        // While a modal overlay is open the background list must not react to the
+        // mouse (issue #70): neither a click nor a wheel scroll changes it.
+        let mut a = app(&[("a", true), ("b", false), ("c", false)]);
+        a.selected = 1;
+        a.mode = Mode::Create(CreateState::default());
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!(a.handle_event(click), Effect::None);
+        assert_eq!(a.selected, 1);
+        assert!(matches!(a.mode, Mode::Create(_)));
+        a.handle_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        }));
+        assert_eq!(a.selected, 1); // background selection untouched
+    }
+
+    #[test]
+    fn mouse_scroll_moves_create_dropdown() {
+        // The wheel drives the modal's own options dropdown instead of the
+        // hidden background list (issue #70).
+        let mut a = app(&[("a", true)]);
+        let mut options = crate::tui::OptionList::new(vec![
+            "main".into(),
+            "origin/main".into(),
+            "origin/dev".into(),
+        ]);
+        options.open();
+        a.mode = Mode::Create(CreateState {
+            options,
+            ..Default::default()
+        });
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        a.handle_event(wheel(MouseEventKind::ScrollDown));
+        if let Mode::Create(s) = &a.mode {
+            // Engaged the list and moved one row down.
+            assert_eq!(s.options.selected(), Some("origin/main"));
+        } else {
+            panic!("expected create mode");
+        }
+        a.handle_event(wheel(MouseEventKind::ScrollUp));
+        if let Mode::Create(s) = &a.mode {
+            assert_eq!(s.options.selected(), Some("main"));
+        }
+    }
+
+    #[test]
+    fn mouse_scroll_moves_pr_picker_selection() {
+        use crate::tui::app::{PrItem, PrPickerState};
+        let pr = |number| PrItem {
+            number,
+            title: "t".into(),
+            author: "a".into(),
+            state: "open".into(),
+            created_at: String::new(),
+        };
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrPicker(PrPickerState {
+            loading: false,
+            prs: vec![pr(1), pr(2)],
+            ..Default::default()
+        });
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 5,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        a.handle_event(wheel(MouseEventKind::ScrollDown));
+        if let Mode::PrPicker(s) = &a.mode {
+            assert_eq!(s.selected, 1);
+        } else {
+            panic!("expected pr picker");
+        }
+        // Clamps at the last row, then scrolls back up.
+        a.handle_event(wheel(MouseEventKind::ScrollDown));
+        if let Mode::PrPicker(s) = &a.mode {
+            assert_eq!(s.selected, 1);
+        }
+        a.handle_event(wheel(MouseEventKind::ScrollUp));
+        if let Mode::PrPicker(s) = &a.mode {
+            assert_eq!(s.selected, 0);
+        }
     }
 
     #[test]
