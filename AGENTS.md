@@ -30,10 +30,10 @@ not be covered and will not count toward the 80% threshold.
 Validate changes:
 
 ```bash
-just test            # correctness
-just format-check    # formatting
-just lint            # Clippy (warnings as errors)
-just coverage        # coverage (minimum 80% line coverage)
+mise run test            # correctness
+mise run format-check    # formatting
+mise run lint            # Clippy (warnings as errors)
+mise run coverage        # coverage (minimum 80% line coverage)
 ```
 
 Code quality rules for this project:

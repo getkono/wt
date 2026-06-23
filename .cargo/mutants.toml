@@ -6,8 +6,8 @@
 # i.e. one that no test caught. A survivor marks logic a refactor could silently
 # break without a single test going red.
 #
-# Run a full sweep with `just mutants`, or restrict it to the code a branch
-# changed with `just mutants-diff`.
+# Run a full sweep with `mise run mutants`, or restrict it to the code a branch
+# changed with `mise run mutants-diff`.
 
 # `main.rs` is a deliberately thin entry point: it is excluded from coverage and
 # has no unit tests, so every mutant there would survive and add only noise.

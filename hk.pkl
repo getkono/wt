@@ -1,0 +1,54 @@
+amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+
+// hk git hooks (replaces lefthook.yml) — https://hk.jdx.dev
+//
+// pre-commit auto-fixes formatting then linting (formatting can affect lint
+// output); pre-push is the final gate (format-check, clippy, tests, coverage).
+// cargo fmt/clippy operate on the whole workspace, so the *.rs glob only gates
+// *whether* a step runs — the commands take no file arguments. `depends`
+// serialises the steps within each hook.
+//
+// git invokes hooks with GIT_DIR (and friends) exported, and git honours those
+// over a `-C <dir>` argument. The suite spawns real `git` against throwaway temp
+// repos, so the test/coverage steps strip the inherited GIT_* location variables
+// first — otherwise those subprocesses would target this repo instead of their
+// sandboxes. (`run_git` in src/testutil.rs scrubs the same set as defence in
+// depth.)
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = new Mapping<String, Step> {
+      ["format"] {
+        glob = "*.rs"
+        fix = "cargo fmt"
+      }
+      ["lint-fix"] {
+        glob = "*.rs"
+        depends = List("format")
+        fix = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
+      }
+    }
+  }
+  ["pre-push"] {
+    fix = false
+    steps = new Mapping<String, Step> {
+      ["format-check"] {
+        check = "cargo fmt --check"
+      }
+      ["lint"] {
+        depends = List("format-check")
+        check = "cargo clippy --all-targets -- -D warnings"
+      }
+      ["test"] {
+        depends = List("lint")
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo test"
+      }
+      ["coverage"] {
+        depends = List("test")
+        check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo llvm-cov --ignore-filename-regex 'src/main\\.rs' --fail-under-lines 80"
+      }
+    }
+  }
+}

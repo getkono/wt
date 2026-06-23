@@ -1,0 +1,64 @@
+# mise — dev tools + task runner (replaces Justfile). https://mise.jdx.dev
+#
+# The Rust toolchain itself is pinned by rust-toolchain.toml (rustup); mise
+# manages only the auxiliary dev tools and the project task list.
+
+[tools]
+hk = "1.48.0"                          # git hook manager (replaces lefthook); keep in sync with hk.pkl amends
+pkl = "latest"                         # config language hk.pkl is written in
+"aqua:taiki-e/cargo-llvm-cov" = "latest"   # coverage (needs the llvm-tools-preview component)
+"github:sourcefrog/cargo-mutants" = "latest" # mutation testing (prebuilt GitHub release binaries)
+
+[tasks.run]
+description = "Run the application"
+run = "cargo run"
+
+[tasks.install]
+description = "Build and install the `wt` binary to ~/.cargo/bin"
+run = '''
+cargo install --path .
+echo ''
+echo '✓ Installed wt to ~/.cargo/bin'
+echo 'Next: enable shell integration for navigation + dynamic tab completion.'
+echo 'Add to your shell rc (see README → "Enable shell integration"):'
+echo '  eval "$(wt shell-init bash)"    # bash'
+echo '  eval "$(wt shell-init zsh)"     # zsh'
+echo '  wt shell-init fish | source     # fish'
+'''
+
+[tasks.format]
+description = "Format the code"
+run = "cargo fmt"
+
+[tasks.format-check]
+description = "Check formatting without modifying files (used by CI and pre-push)"
+run = "cargo fmt --check"
+
+[tasks.lint]
+description = "Lint with Clippy, treating warnings as errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.lint-fix]
+description = "Lint and auto-fix where possible (used by the pre-commit hook)"
+run = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.coverage]
+description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)"
+run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
+
+[tasks.mutants]
+description = "Mutation testing — find logic the tests don't pin down (slow); args pass through"
+raw_args = true
+run = "cargo mutants"
+
+[tasks.mutants-diff]
+description = "Mutation testing limited to code this branch changed vs base (default origin/master)"
+usage = 'arg "<base>" help="Base ref to diff against" default="origin/master"'
+run = [
+    'git diff ${usage_base}...HEAD > target/mutants.diff',
+    'cargo mutants --in-diff target/mutants.diff',
+]
