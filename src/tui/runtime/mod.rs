@@ -14,18 +14,20 @@ use tokio::sync::mpsc;
 
 use crate::cli::NewArgs;
 use crate::commands::{self, Session, open_session};
-use crate::config::Config;
+use crate::config::{Config, SubmoduleInit};
 use crate::cx::{Cx, SilentInput, Stream};
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::hooks::CapturingHookRunner;
 use crate::model::{SortSpec, Worktree};
-use crate::tui::app::{App, AppConfig, Mode, PrComposeState, PrItem, StaleBaseState, StatusKind};
+use crate::tui::app::{
+    App, AppConfig, InitSubmodulesState, Mode, PrComposeState, PrItem, StaleBaseState, StatusKind,
+};
 use crate::tui::event::{CreateDecision, Effect};
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
-use crate::worktree_service::{build_rows, enumerate_rows};
+use crate::worktree_service::{build_rows, enumerate_rows, enumerate_worktrees};
 
 mod effects;
 use effects::*;
@@ -283,7 +285,8 @@ fn dispatch_effect(
         | Effect::MaterializeBranch { .. }
         | Effect::CheckoutPr(_)
         | Effect::CheckoutBranch { .. }
-        | Effect::Sync { .. } => Ok(false),
+        | Effect::Sync { .. }
+        | Effect::InitSubmodules { .. } => Ok(false),
         // Compose-only effects are driven by the dedicated compose loop
         // ([`run_pr_compose`]) and never reach the main loop.
         Effect::DraftPrAi | Effect::SubmitPr { .. } => Ok(false),
@@ -302,6 +305,7 @@ fn is_background_action(effect: &Effect) -> bool {
             | Effect::CheckoutPr(_)
             | Effect::CheckoutBranch { .. }
             | Effect::Sync { .. }
+            | Effect::InitSubmodules { .. }
     )
 }
 
@@ -400,6 +404,13 @@ enum Job {
         /// The branch label for the status text, resolved on the foreground.
         label: String,
     },
+    /// Initialize the submodules in `dir` recursively (issue #50).
+    InitSubmodules {
+        /// The worktree directory whose submodules to initialize.
+        dir: PathBuf,
+        /// How many uninitialized submodules were detected (for the status text).
+        count: usize,
+    },
 }
 
 /// The result of a background [`Job`], carrying the minimum its `apply_*` needs.
@@ -460,6 +471,13 @@ enum JobOutcome {
         /// The sync outcome, or the error message.
         result: std::result::Result<commands::sync::SyncOutcome, String>,
     },
+    /// A finished submodule init (issue #50).
+    InitSubmodules {
+        /// How many submodules were initialized (for the status text).
+        count: usize,
+        /// Success, or the error message to surface.
+        result: std::result::Result<(), String>,
+    },
 }
 
 /// The result of a create job (issue #56). When the pre-flight finds the base
@@ -469,6 +487,14 @@ enum JobOutcome {
 enum CreateOutcome {
     /// The worktree was created.
     Created,
+    /// The worktree was created and has uninitialized submodules, with the policy
+    /// left at its `prompt` default — the loop opens the confirm modal (issue #50).
+    CreatedNeedsSubmodules {
+        /// The new worktree directory whose submodules would be initialized.
+        dir: PathBuf,
+        /// How many uninitialized submodules were detected.
+        count: usize,
+    },
     /// The base is behind its upstream; the create paused for confirmation.
     NeedsStaleConfirm {
         /// How many commits the base is behind its upstream.
@@ -562,6 +588,10 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
                 busy,
             )
         }
+        Effect::InitSubmodules { dir, count } => {
+            let label = format!("Initializing {count} submodule(s)");
+            (Job::InitSubmodules { dir, count }, label)
+        }
         _ => return None,
     };
     app.begin_busy(label);
@@ -633,6 +663,10 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
             let result = run_sync_command(&mut cx, &worktree_dir);
             JobOutcome::Sync { label, result }
         }
+        Job::InitSubmodules { dir, count } => {
+            let result = run_init_submodules_command(&mut cx, &dir);
+            JobOutcome::InitSubmodules { count, result }
+        }
     }
 }
 
@@ -662,6 +696,9 @@ fn apply_outcome(cx: &Cx, session: &Session, app: &mut App, outcome: JobOutcome)
             apply_checkout_branch(cx, app, &branch, result, root)
         }
         JobOutcome::Sync { label, result } => apply_sync(cx, app, &label, result, root),
+        JobOutcome::InitSubmodules { count, result } => {
+            apply_init_submodules(cx, app, count, result, root)
+        }
     }
 }
 
@@ -937,6 +974,67 @@ mod tests {
                 .iter()
                 .any(|w| w.has_worktree && w.branch.as_deref() == Some("feature"))
         );
+    }
+
+    #[test]
+    fn do_create_with_submodules_opens_confirm_modal() {
+        // A new worktree with uninitialized submodules and the default `prompt`
+        // policy pauses at the submodule confirm modal (issue #50).
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let (mut t, session, mut app) = setup(&repo);
+        app.mode = Mode::Create(Default::default());
+        do_create(&mut t.cx, &session, &mut app, "feature".into(), None);
+        match &app.mode {
+            Mode::ConfirmInitSubmodules(s) => {
+                assert_eq!(s.branch, "feature");
+                assert_eq!(s.count, 1);
+                assert!(s.dir.exists());
+            }
+            other => panic!("expected ConfirmInitSubmodules, got {other:?}"),
+        }
+        // The worktree was created and is visible behind the modal.
+        assert!(
+            app.worktrees
+                .iter()
+                .any(|w| w.has_worktree && w.branch.as_deref() == Some("feature"))
+        );
+    }
+
+    #[test]
+    fn apply_init_submodules_reports_success_and_refreshes() {
+        let repo = TestRepo::init();
+        let (t, session, mut app) = setup(&repo);
+        app.mode = Mode::ConfirmInitSubmodules(crate::tui::app::InitSubmodulesState {
+            dir: repo.root().to_path_buf(),
+            branch: "feature".into(),
+            count: 2,
+        });
+        apply_init_submodules(&t.cx, &mut app, 2, Ok(()), &session.primary_root);
+        assert_eq!(app.mode, Mode::List);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("initialized 2 submodule")
+        );
+    }
+
+    #[test]
+    fn apply_init_submodules_error_shows_in_status() {
+        let repo = TestRepo::init();
+        let (t, session, mut app) = setup(&repo);
+        apply_init_submodules(
+            &t.cx,
+            &mut app,
+            1,
+            Err("boom".into()),
+            &session.primary_root,
+        );
+        assert_eq!(app.mode, Mode::List);
+        let msg = app.status_message.as_deref().unwrap();
+        assert!(msg.contains("failed to initialize submodules"));
+        assert!(msg.contains("boom"));
     }
 
     #[test]

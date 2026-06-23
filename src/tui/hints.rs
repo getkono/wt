@@ -124,6 +124,13 @@ pub fn confirm_stale_base_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Confirm-init-submodules dialog hints (issue #50): `Enter`/`y` (the default)
+/// initializes recursively, `n`/`Esc` leaves them uninitialized.
+pub fn confirm_init_submodules_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[hint("Enter/y", "initialize"), hint("n/Esc", "skip")];
+    HINTS
+}
+
 /// Help-overlay hints.
 pub fn help_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[hint("any key", "close")];

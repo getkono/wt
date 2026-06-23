@@ -12,12 +12,19 @@ use crate::template::DEFAULT_TEMPLATE;
 use crate::tui::theme::{Palette, ThemePreset};
 
 /// When to initialize git submodules after a worktree is created or a branch is
-/// checked out (`[submodules] init`, issue #50). Opt-in: the default never
-/// touches submodules.
+/// checked out (`[submodules] init`, issue #50). The default ([`Prompt`]) asks
+/// before initializing at an interactive terminal; `always`/`never` decide
+/// without a prompt.
+///
+/// [`Prompt`]: SubmoduleInit::Prompt
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SubmoduleInit {
-    /// Never initialize submodules automatically (the default).
+    /// Ask before initializing (the default): at an interactive terminal, prompt
+    /// `[Y/n]` (defaulting to yes) when uninitialized submodules are present;
+    /// non-interactively, leave them alone.
     #[default]
+    Prompt,
+    /// Never initialize submodules automatically.
     Never,
     /// Always run `git submodule update --init --recursive` when uninitialized
     /// submodules are present.
@@ -25,9 +32,10 @@ pub enum SubmoduleInit {
 }
 
 impl SubmoduleInit {
-    /// Parses a `submodules.init` value (`never`, `always`).
+    /// Parses a `submodules.init` value (`prompt`, `never`, `always`).
     pub fn parse(value: &str) -> Option<SubmoduleInit> {
         match value {
+            "prompt" => Some(SubmoduleInit::Prompt),
             "never" => Some(SubmoduleInit::Never),
             "always" => Some(SubmoduleInit::Always),
             _ => None,
@@ -341,7 +349,7 @@ mod tests {
         assert!(c.remove_delete_merged_branch);
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
-        assert_eq!(c.submodules_init, SubmoduleInit::Never);
+        assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
         assert_eq!(c.agent_model, AgentModel::Sonnet);
         assert_eq!(c.agent_effort, Effort::Medium);
         assert!(c.list_show_untracked);

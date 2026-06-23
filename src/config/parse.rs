@@ -131,7 +131,7 @@ fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Resul
             "init" => {
                 let text = as_string(file, &key, val)?;
                 let policy = SubmoduleInit::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: never, always"))?;
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: prompt, never, always"))?;
                 layer.submodules_init = Some(policy);
             }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
@@ -415,9 +415,15 @@ mod tests {
                 .submodules_init,
             Some(SubmoduleInit::Never)
         );
+        assert_eq!(
+            parse("[submodules]\ninit = \"prompt\"")
+                .unwrap()
+                .submodules_init,
+            Some(SubmoduleInit::Prompt)
+        );
         let (key, reason) = config_reason(parse("[submodules]\ninit = \"sometimes\"").unwrap_err());
         assert_eq!(key, "submodules.init");
-        assert!(reason.contains("never, always"));
+        assert!(reason.contains("prompt, never, always"));
         let (key, _) = config_reason(parse("[submodules]\nwiggle = true").unwrap_err());
         assert_eq!(key, "submodules.wiggle");
     }

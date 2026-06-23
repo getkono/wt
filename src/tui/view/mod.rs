@@ -19,8 +19,8 @@ use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
-    App, BusyState, CheckoutState, ComposeField, CreateState, CreateStep, Mode, Pane,
-    PrComposeState, PrPickerState, StaleBaseState,
+    App, BusyState, CheckoutState, ComposeField, CreateState, CreateStep, InitSubmodulesState,
+    Mode, Pane, PrComposeState, PrPickerState, StaleBaseState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -61,6 +61,9 @@ pub fn render(app: &App, frame: &mut Frame) {
             modals::render_confirm_delete_branch(app, *index, *force, frame, area)
         }
         Mode::ConfirmStaleBase(state) => modals::render_confirm_stale_base(app, state, frame, area),
+        Mode::ConfirmInitSubmodules(state) => {
+            modals::render_confirm_init_submodules(app, state, frame, area)
+        }
         _ => {}
     }
 
@@ -255,6 +258,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::ConfirmCreate(_) => "CREATE",
         Mode::ConfirmDeleteBranch { .. } => "DELETE",
         Mode::ConfirmStaleBase(_) => "CREATE",
+        Mode::ConfirmInitSubmodules(_) => "SUBMODULES",
         Mode::Help => "HELP",
     }
 }
@@ -296,6 +300,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::ConfirmCreate(_) => hint_pairs(hints::confirm_create_hints()),
         Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
         Mode::ConfirmStaleBase(_) => hint_pairs(hints::confirm_stale_base_hints()),
+        Mode::ConfirmInitSubmodules(_) => hint_pairs(hints::confirm_init_submodules_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -440,6 +445,22 @@ mod tests {
         assert!(text.contains("topic"));
         assert!(text.contains("switch into it"));
         assert!(text.contains("[y/N]"));
+    }
+
+    #[test]
+    fn renders_confirm_init_submodules_modal() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::ConfirmInitSubmodules(InitSubmodulesState {
+            dir: std::path::PathBuf::from("/wt/feature"),
+            branch: "feature".into(),
+            count: 3,
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("initialize submodules"));
+        assert!(text.contains("feature"));
+        assert!(text.contains("3 uninitialized"));
+        // Default-yes prompt (capital Y).
+        assert!(text.contains("[Y/n]"));
     }
 
     #[test]

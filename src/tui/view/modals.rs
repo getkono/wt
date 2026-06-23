@@ -719,3 +719,43 @@ pub(super) fn render_confirm_stale_base(
         rect,
     );
 }
+
+/// Renders the submodule-init confirm dialog (issue #50): a freshly created
+/// worktree has uninitialized submodules and the policy is left at its `prompt`
+/// default. Offers to initialize them recursively, defaulting to yes.
+pub(super) fn render_confirm_init_submodules(
+    app: &App,
+    state: &InitSubmodulesState,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("branch:     ", theme.label()),
+            Span::styled(state.branch.clone(), theme.branch(false, false)),
+        ]),
+        Line::from(vec![
+            Span::styled("submodules: ", theme.label()),
+            Span::styled(format!("{} uninitialized", state.count), theme.warning()),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Initialize submodules recursively? ["),
+            Span::styled("Y", theme.success()),
+            Span::raw("/n]"),
+        ]),
+    ];
+
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::bordered().title(Span::styled("initialize submodules", theme.title(true))),
+            )
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}
