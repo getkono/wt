@@ -103,6 +103,7 @@ fn build_app(cx: &Cx, session: &Session, git: &dyn GitCli) -> Result<App> {
     let color = cx.color_enabled_err(session.config.ui_color);
     let mut app = App::new(sync_worktrees, app_config(&session.config, color), size);
     app.branches = crate::git::all_branches(session.repo.gix()).unwrap_or_default();
+    app.default_base = crate::git::default_base_ref(session.repo.gix());
     app.mark_loading();
     Ok(app)
 }

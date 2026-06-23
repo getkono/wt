@@ -282,6 +282,11 @@ pub struct App {
     /// options dropdown and used to tab-complete the base ref (best-effort;
     /// empty when enumeration fails).
     pub branches: Vec<String>,
+    /// The remote-tracking default branch (e.g. `origin/main`) a new worktree
+    /// forks from by default, pre-filled into the create-prompt base field
+    /// (issue #70). `None` when there is no confident remote default (no
+    /// `origin/HEAD`), in which case the base starts empty.
+    pub default_base: Option<String>,
 }
 
 /// Display/config inputs for the TUI (the parts of [`crate::config::Config`]
@@ -322,6 +327,7 @@ impl App {
             too_small: false,
             busy: None,
             branches: Vec::new(),
+            default_base: None,
             worktrees,
             visible,
             selected,
