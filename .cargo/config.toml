@@ -1,4 +1,4 @@
-# Fetch private git dependencies (e.g. the `sendit` crate from getkono/fast)
+# Fetch private git dependencies (e.g. the `sendit` crate from getkono/sendit)
 # using the system `git` and its SSH agent/keys, rather than libgit2. This is
 # the most reliable form for SSH-authenticated private repos.
 [net]
