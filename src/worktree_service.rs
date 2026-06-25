@@ -89,7 +89,7 @@ pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: 
         wt.has_untracked = Some(status.has_untracked);
     }
 
-    fill_commits(repo, git, abbrev, wt);
+    fill_commits(repo, abbrev, wt);
 }
 
 /// Fills `wt.ahead`/`wt.behind` against a present `upstream`. Skipped for a
@@ -109,8 +109,8 @@ fn fill_ahead_behind(git: &dyn GitCli, wt: &mut Worktree, branch: &str, upstream
 /// Fills the tip commit and the recent-commit list that powers the TUI detail
 /// pane (spec §10), resolved from the worktree's tip OID. A worktree with no
 /// resolvable tip keeps both unset.
-fn fill_commits(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
-    let Some(oid) = tip_oid(repo, git, wt) else {
+fn fill_commits(repo: &Repo, abbrev: usize, wt: &mut Worktree) {
+    let Some(oid) = tip_oid(repo, wt) else {
         return;
     };
     if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
@@ -133,16 +133,16 @@ fn to_commit(info: CommitInfo) -> Commit {
     }
 }
 
-/// Resolves the tip commit OID of a worktree: the branch ref for a branch
-/// worktree, or `git rev-parse HEAD` for a detached one.
-fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
+/// Resolves the tip commit OID of a worktree via `gix`: the branch ref for a
+/// branch worktree, or the detached worktree's own `HEAD`.
+fn tip_oid(repo: &Repo, wt: &Worktree) -> Option<String> {
     match &wt.branch {
         Some(branch) => resolve_hex(repo.gix(), &branch_ref(branch)),
-        None => git
-            .run(&wt.path, &["rev-parse", "HEAD"])
+        // A detached worktree's HEAD is per-worktree, so open that worktree
+        // directly rather than reading the session repo's HEAD.
+        None => gix::open(&wt.path)
             .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+            .and_then(|r| r.head_id().ok().map(|id| id.detach().to_string())),
     }
 }
 
@@ -485,6 +485,25 @@ mod tests {
             .unwrap();
         assert_eq!(feat.slug.as_deref(), Some("feature-x"));
         assert!(!feat.is_current);
+    }
+
+    #[test]
+    fn detached_worktree_tip_resolved_from_its_own_head() {
+        // A detached worktree has no branch, so its tip is read from the
+        // worktree's own HEAD via `gix::open` (not the session repo's HEAD).
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["worktree", "add", "--detach", "../wt-det", &head]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let worktrees = build_worktrees(&r, &RealGit).unwrap();
+        let det = worktrees
+            .iter()
+            .find(|w| w.is_detached)
+            .expect("detached worktree row");
+        assert!(det.branch.is_none());
+        let commit = det.commit.as_ref().expect("tip commit filled from HEAD");
+        assert_eq!(commit.subject, "init");
+        assert!(head.starts_with(&commit.hash));
     }
 
     #[test]
