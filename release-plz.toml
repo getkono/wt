@@ -1,0 +1,27 @@
+# release-plz: automated, Conventional-Commit-driven releases for wt.
+# Docs: https://release-plz.dev
+#
+# On every push to master, .github/workflows/release-plz.yml either:
+#   - opens/updates a "release PR" that bumps the version and updates CHANGELOG.md, or
+#   - (when that PR is merged) cuts a GitHub Release + `v{version}` tag, which in turn
+#     triggers the prebuilt-binary build and the Homebrew tap refresh.
+[workspace]
+# crates.io publishing is OFF for now. Two blockers (see RELEASING.md → "Enabling
+# crates.io"):
+#   1. `wt` depends on `sendit` via git, and crates.io rejects git dependencies.
+#   2. the crate name `wt` is already taken on crates.io.
+# Everything else — CHANGELOG, release PR, git tag, GitHub Release — still runs.
+publish = false
+
+# Maintain CHANGELOG.md from Conventional Commits (keep-a-changelog format).
+changelog_update = true
+
+# Cut a GitHub Release (with generated notes) and a `v{version}` git tag per release.
+# The tag name is referenced by the binary/Homebrew jobs, so pin it explicitly.
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+# `wt` exposes a library API but is shipped only as a binary and is not published,
+# so cargo-semver-checks would only add noise.
+semver_check = false

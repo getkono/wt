@@ -2,14 +2,28 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  commit-lint:
+    name: Conventional commits
+    runs-on: ubuntu-latest
+    # Only PRs carry an unmerged commit series worth linting; pushes to master are history.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # convco needs full history to walk the commit range
+      # mise provisions convco (see mise.toml); the install is cached across runs.
+      - uses: jdx/mise-action@v2
+      - name: Conventional Commits check
+        run: convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
   check:
     name: Format, Lint & Test
     runs-on: ubuntu-latest

@@ -9,12 +9,18 @@
 use std::process::Command;
 
 fn main() {
-    let commit = git(&["rev-parse", "--short=12", "HEAD"]).map(|sha| {
-        if is_dirty() {
-            format!("{sha}-dirty")
-        } else {
-            sha
-        }
+    // A CI-provided commit hash takes precedence over the local `git` probe: the
+    // cross container that builds the Linux release binaries has no `git`, so the
+    // release workflow exports `WT_BUILD_SHA` (where git *is* available) and
+    // forwards it into the container via Cross.toml.
+    let commit = env_override("WT_BUILD_SHA").or_else(|| {
+        git(&["rev-parse", "--short=12", "HEAD"]).map(|sha| {
+            if is_dirty() {
+                format!("{sha}-dirty")
+            } else {
+                sha
+            }
+        })
     });
     let commit_date = git(&["log", "-1", "--format=%cI"]);
 
@@ -35,6 +41,16 @@ fn main() {
     }
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo::rerun-if-env-changed=WT_BUILD_SHA");
+}
+
+/// Reads an environment variable, returning its trimmed value only when set and
+/// non-empty. Used to let CI override otherwise git-probed build facts.
+fn env_override(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Emits a `WT_*` value as a compile-time environment variable.

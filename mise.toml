@@ -6,8 +6,15 @@
 [tools]
 hk = "1.48.0"                          # git hook manager (replaces lefthook); keep in sync with hk.pkl amends
 pkl = "latest"                         # config language hk.pkl is written in
+"cargo:convco" = "0.6.4"               # Conventional Commits linter for the commit-msg hook + CI (built from source; not in mise's registry)
 "aqua:taiki-e/cargo-llvm-cov" = "latest"   # coverage (needs the llvm-tools-preview component)
 "github:sourcefrog/cargo-mutants" = "latest" # mutation testing (prebuilt GitHub release binaries)
+
+# After `mise install`, wire hk's git hooks through mise so they resolve hk and
+# convco without requiring shell activation. Skipped in CI, where the hooks
+# aren't installed (CI calls the checks directly).
+[hooks]
+postinstall = 'test -n "$CI" || hk install --mise'
 
 [tasks.run]
 description = "Run the application"
@@ -49,6 +56,15 @@ run = "cargo test"
 [tasks.coverage]
 description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)"
 run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
+
+[tasks.commit-check]
+description = "Verify this branch's commits (vs origin/master) follow Conventional Commits"
+run = "convco check origin/master..HEAD"
+
+[tasks.commit-msg-check]
+description = "Lint a single commit message file against Conventional Commits (commit-msg hook)"
+usage = 'arg "<file>" help="Path to the commit message file"'
+run = 'convco check --from-stdin --strip < "${usage_file}"'
 
 [tasks.mutants]
 description = "Mutation testing — find logic the tests don't pin down (slow); args pass through"

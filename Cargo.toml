@@ -2,6 +2,30 @@
 name = "wt"
 version = "1.0.0"
 edition = "2024"
+description = "A single-binary CLI + TUI for managing Git worktrees and their GitHub pull requests."
+authors = ["Justin Chung"]
+license = "MIT"
+repository = "https://github.com/getkono/wt"
+homepage = "https://github.com/getkono/wt"
+readme = "README.md"
+keywords = ["git", "worktree", "cli", "tui", "productivity"]
+categories = ["command-line-utilities", "development-tools"]
+# Keep the published tarball to what's needed to build the crate. (Publishing is
+# currently disabled in release-plz.toml — see RELEASING.md — but this keeps the
+# crate ready for crates.io once `sendit` is published and the name is settled.)
+exclude = [
+    "/.github",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/CHANGELOG.md",
+    "/Cross.toml",
+    "/RELEASING.md",
+    "/hk.pkl",
+    "/mise.toml",
+    "/release-plz.toml",
+    "/mutants.out",
+    "/mutants.out.old",
+]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive", "cargo", "wrap_help"] }
@@ -16,7 +40,7 @@ globset = "0.4.18"
 jiff = "0.2.28"
 nucleo-matcher = "0.3.1"
 ratatui = "0.30.0"
-sendit = { git = "ssh://git@github.com/getkono/sendit.git", rev = "a7ca12a62d8526dd819aee6298f1d5954784f6f9" }
+sendit = { git = "https://github.com/getkono/sendit.git", rev = "a7ca12a62d8526dd819aee6298f1d5954784f6f9" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 shell-words = "1.1.1"

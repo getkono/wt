@@ -1,0 +1,8 @@
+# Forward the commit hash exported by the release workflow into the cross build
+# container (which has no `git`), so the cross-compiled Linux release binaries
+# report a real commit in `wt --version`. See `build.rs` and the Build step in
+# `.github/workflows/release-plz.yml`.
+[build.env]
+passthrough = [
+    "WT_BUILD_SHA",
+]

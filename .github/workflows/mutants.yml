@@ -4,11 +4,8 @@ name: Mutants
 # NON-BLOCKING (continue-on-error) and, on pull requests, runs only over the code
 # the PR changed (`--in-diff`). A weekly schedule runs a fuller sweep.
 #
-# NOTE: building this project requires the private `sendit` dependency
-# (getkono/sendit) fetched over SSH. Set the `SENDIT_DEPLOY_KEY` repository secret
-# to a deploy key with read access to that repo, or this workflow cannot build.
-# (The main `ci.yml` workflow has the same unmet requirement and currently
-# triggers on `main` while the trunk is `master`.)
+# The `sendit` dependency (getkono/sendit) is a public git dependency fetched over
+# HTTPS, so no SSH deploy key is required to build.
 
 on:
   pull_request:
@@ -27,9 +24,6 @@ jobs:
           fetch-depth: 0 # full history so --in-diff can reach the base branch
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.SENDIT_DEPLOY_KEY }}
       - uses: jdx/mise-action@v2
       - name: Mutants on changed code
         if: github.event_name == 'pull_request'

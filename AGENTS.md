@@ -47,4 +47,4 @@ Code quality rules for this project:
 
 ## License
 
-Proprietary — all rights reserved. See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
