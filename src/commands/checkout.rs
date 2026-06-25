@@ -99,7 +99,7 @@ pub(crate) fn checkout_branch_in_worktree(
     let branch = branch_owned.as_str();
 
     ensure_branch_available(git, repo, worktree_dir, branch, force)?;
-    let fetch_skipped = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
+    let fetch_skipped = fetch_remote_best_effort(cx, git, repo.gix(), worktree_dir, &remote);
     ensure_branch_exists(repo, branch, &remote)?;
 
     // Check out the branch (DWIM creates a local tracking branch when remote-only).
@@ -162,10 +162,11 @@ fn ensure_branch_available(
 pub(crate) fn fetch_remote_best_effort(
     cx: &mut Cx,
     git: &dyn GitCli,
+    repo: &gix::Repository,
     worktree_dir: &Path,
     remote: &str,
 ) -> bool {
-    if !remote_configured(git, worktree_dir, remote) {
+    if !remote_configured(repo, remote) {
         return true;
     }
     match ops::fetch(git, worktree_dir, remote) {
@@ -258,11 +259,13 @@ fn normalize_remote_branch(repo: &Repo, branch: &str) -> String {
     branch.to_string()
 }
 
-/// Whether `remote` is configured for the repository at `worktree_dir`.
-pub(crate) fn remote_configured(git: &dyn GitCli, worktree_dir: &Path, remote: &str) -> bool {
-    git.run_raw(worktree_dir, &["remote", "get-url", remote])
-        .map(|o| o.success)
-        .unwrap_or(false)
+/// Whether `remote` is configured with a fetch URL, read via `gix`. Mirrors
+/// `git remote get-url <remote>` succeeding: the remote section exists and has a
+/// fetch URL.
+pub(crate) fn remote_configured(repo: &gix::Repository, remote: &str) -> bool {
+    repo.try_find_remote(remote)
+        .and_then(|r| r.ok())
+        .is_some_and(|r| r.url(gix::remote::Direction::Fetch).is_some())
 }
 
 /// A human suffix describing the sync outcome, for the TUI status line.

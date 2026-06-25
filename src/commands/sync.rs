@@ -139,7 +139,7 @@ pub(crate) fn sync_worktree(
     }
 
     // Best-effort fetch so the tracking ref reflects the remote (offline-tolerant).
-    let _ = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
+    let _ = fetch_remote_best_effort(cx, git, repo.gix(), worktree_dir, &remote);
 
     // Re-discover so the freshly fetched tracking ref is visible.
     let repo = Repo::discover(worktree_dir)?;
