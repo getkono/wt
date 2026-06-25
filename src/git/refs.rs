@@ -149,8 +149,8 @@ pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
 }
 
 /// The branch that `refs/remotes/origin/HEAD` points to, if any (the short name,
-/// e.g. `main`).
-fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
+/// e.g. `main`). Drives default-branch resolution and PR trunk detection.
+pub(crate) fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
     // The tracking form is `origin/<branch>`; drop the remote to get the branch
     // (handles slashes in branch names).
     origin_head_tracking(repo)?
