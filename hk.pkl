@@ -16,6 +16,16 @@ amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.
 // depth.)
 
 hooks {
+  // Reject commit messages that aren't Conventional Commits (enforced with
+  // convco via a mise task). {{commit_msg_file}} is the path git passes to the
+  // commit-msg hook.
+  ["commit-msg"] {
+    steps = new Mapping<String, Step> {
+      ["convco"] {
+        check = "mise run commit-msg-check {{commit_msg_file}}"
+      }
+    }
+  }
   ["pre-commit"] {
     fix = true
     stash = "git"
@@ -48,6 +58,11 @@ hooks {
       ["coverage"] {
         depends = List("test")
         check = "env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_CEILING_DIRECTORIES -u GIT_PREFIX cargo llvm-cov --ignore-filename-regex 'src/main\\.rs' --fail-under-lines 80"
+      }
+      // Lint this branch's commits (origin/master..HEAD) as a final gate; no
+      // glob, so it runs on every push regardless of which files changed.
+      ["commit-check"] {
+        check = "mise run commit-check"
       }
     }
   }

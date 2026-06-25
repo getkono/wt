@@ -8,15 +8,29 @@ automatically.
 
 ## Getting Started
 
-### 1. Install (from source)
+### 1. Install
 
-`wt` is not published anywhere; building from source is the only way to install it.
+#### Homebrew (recommended)
+
+```bash
+brew install getkono/tap/wt
+```
+
+This pulls a prebuilt binary from the [getkono/homebrew-tap](https://github.com/getkono/homebrew-tap)
+tap (macOS arm64/x86_64 and Linux arm64/x86_64).
+
+#### From source
+
 You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on your
 `PATH`, and — only for PR commands — the [`gh` CLI](https://cli.github.com).
 
 ```bash
-cargo install --path .   # installs `wt` to ~/.cargo/bin
+cargo install --git https://github.com/getkono/wt   # latest from master
+# or, from a checkout:
+cargo install --path .                              # installs `wt` to ~/.cargo/bin
 ```
+
+`wt` is not on crates.io yet (see [RELEASING.md](RELEASING.md)).
 
 Make sure `~/.cargo/bin` is on your `PATH`. Then enable shell integration
 (below) — that single step also gives you the best tab completion.
@@ -194,4 +208,4 @@ mise run coverage
 
 ## License
 
-Proprietary — all rights reserved. See [LICENSE](LICENSE) for details.
+MIT — see [LICENSE](LICENSE) for details.
