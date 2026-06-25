@@ -75,7 +75,7 @@ pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: 
         // Offline merge-state for delete-safety messaging; unknowable for a
         // missing worktree (no checkout to query), left `None` there.
         if !wt.is_missing {
-            let state = compute_merge_state(repo, git, wt, &branch, upstream.as_ref());
+            let state = compute_merge_state(repo, wt, &branch, upstream.as_ref());
             wt.merge_state = state;
         }
     }
@@ -161,7 +161,6 @@ fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
 /// Callers must skip missing worktrees (there is no checkout to query).
 fn compute_merge_state(
     repo: &Repo,
-    git: &dyn GitCli,
     wt: &Worktree,
     branch: &str,
     upstream: Option<&Upstream>,
@@ -185,7 +184,7 @@ fn compute_merge_state(
             if target == branch || tried.contains(&target) {
                 continue;
             }
-            if is_ancestor(git, &wt.path, &full_ref, &target) {
+            if is_ancestor(repo.gix(), &full_ref, &target) {
                 return Some(MergeState::Merged { into: Some(target) });
             }
             tried.push(target);
@@ -593,7 +592,7 @@ mod tests {
         let up = upstream_of(r.gix(), "main");
         let wt = merge_wt(&repo, "main", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "main", up.as_ref()),
+            compute_merge_state(&r, &wt, "main", up.as_ref()),
             Some(MergeState::Tracked)
         );
     }
@@ -605,7 +604,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })
@@ -620,7 +619,7 @@ mod tests {
         // No base recorded: the default-branch fallback must still detect it.
         let wt = merge_wt(&repo, "feat", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })
@@ -634,7 +633,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged { into: None })
         );
     }
@@ -651,7 +650,7 @@ mod tests {
         assert!(up.as_ref().unwrap().is_gone);
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", up.as_ref()),
+            compute_merge_state(&r, &wt, "feat", up.as_ref()),
             Some(MergeState::UpstreamGone)
         );
     }
@@ -663,7 +662,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::NoUpstreamLocal)
         );
     }
@@ -677,7 +676,7 @@ mod tests {
         // must be skipped — otherwise it would wrongly report "merged into main".
         let wt = merge_wt(&repo, "main", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "main", None),
+            compute_merge_state(&r, &wt, "main", None),
             Some(MergeState::NoUpstreamLocal)
         );
     }
@@ -690,7 +689,7 @@ mod tests {
         // Both an ancestor of base AND a merged PR: the named ancestry wins.
         let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })

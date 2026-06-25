@@ -50,13 +50,11 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let mut candidates: Vec<Candidate> = worktrees
         .iter()
         .enumerate()
-        .filter(|(_, w)| !w.is_main && is_candidate(git, &session.repo, &root, w, args, &default))
+        .filter(|(_, w)| !w.is_main && is_candidate(&session.repo, w, args, &default))
         .map(|(i, _)| Candidate::Worktree(i))
         .collect();
     candidates.extend(branch_candidates(
-        git,
         &session.repo,
-        &root,
         args,
         &default,
         &current,
@@ -138,9 +136,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 /// default branch and the current branch are never selected, and branches that
 /// already have a worktree are left to the worktree path.
 fn branch_candidates(
-    git: &dyn GitCli,
     repo: &Repo,
-    root: &Path,
     args: &PruneArgs,
     default: &Option<String>,
     current: &Option<String>,
@@ -156,7 +152,7 @@ fn branch_candidates(
         }
         let merged = default
             .as_deref()
-            .is_some_and(|d| is_ancestor(git, root, &branch_ref(&branch), d));
+            .is_some_and(|d| is_ancestor(repo.gix(), &branch_ref(&branch), d));
         let gone = upstream_of(repo.gix(), &branch).is_some_and(|u| u.is_gone);
         tracing::trace!(branch = %branch, merged, gone, "prune: branch classified");
         if (args.merged && merged) || (args.gone && gone) {
@@ -270,9 +266,7 @@ fn candidate_json(worktrees: &[Worktree], candidate: &Candidate) -> Result<Strin
 
 /// Whether a worktree is a prune candidate for the given flags.
 fn is_candidate(
-    git: &dyn GitCli,
     repo: &crate::git::discover::Repo,
-    root: &Path,
     worktree: &Worktree,
     args: &PruneArgs,
     default: &Option<String>,
@@ -283,7 +277,7 @@ fn is_candidate(
         // The default branch is an ancestor of itself; never prune a worktree
         // that is checked out on the default branch.
         && branch != default
-        && is_ancestor(git, root, &branch_ref(branch), default)
+        && is_ancestor(repo.gix(), &branch_ref(branch), default)
     {
         return true;
     }
@@ -323,7 +317,7 @@ fn delete_merged_branch(
     }
     let merged = default
         .as_deref()
-        .is_some_and(|d| is_ancestor(git, root, &branch_ref(branch), d));
+        .is_some_and(|d| is_ancestor(repo.gix(), &branch_ref(branch), d));
     if merged {
         run_best_effort(
             git,

@@ -88,7 +88,7 @@ pub(crate) fn fast_forward_base(
     base: &str,
     stale: &StaleBase,
 ) -> Result<()> {
-    if !is_ancestor(git, root, &branch_ref(base), &stale.tracking_ref) {
+    if !is_ancestor(repo.gix(), &branch_ref(base), &stale.tracking_ref) {
         return Err(Error::operation(format!(
             "base {base:?} has diverged from {}; cannot fast-forward",
             stale.upstream_display

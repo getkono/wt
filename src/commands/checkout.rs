@@ -219,8 +219,8 @@ fn sync_with_upstream(
         return Ok(SyncOutcome::FetchSkipped);
     }
     let full_ref = branch_ref(branch);
-    let behind = is_ancestor(git, worktree_dir, &full_ref, &upstream.tracking_ref);
-    let ahead = is_ancestor(git, worktree_dir, &upstream.tracking_ref, &full_ref);
+    let behind = is_ancestor(repo.gix(), &full_ref, &upstream.tracking_ref);
+    let ahead = is_ancestor(repo.gix(), &upstream.tracking_ref, &full_ref);
     match (ahead, behind) {
         // Strictly behind: a proven-clean fast-forward (the tree is clean here).
         (false, true) => {
