@@ -2800,7 +2800,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 [[package]]
 name = "sendit"
 version = "0.1.0"
-source = "git+ssh://git@github.com/getkono/fast.git?rev=1f37e2cae48d841119fe20689886cde0816ffc5b#1f37e2cae48d841119fe20689886cde0816ffc5b"
+source = "git+ssh://git@github.com/getkono/sendit.git?rev=a7ca12a62d8526dd819aee6298f1d5954784f6f9#a7ca12a62d8526dd819aee6298f1d5954784f6f9"
 dependencies = [
  "clap",
  "env_logger",

@@ -5,7 +5,7 @@ name: Mutants
 # the PR changed (`--in-diff`). A weekly schedule runs a fuller sweep.
 #
 # NOTE: building this project requires the private `sendit` dependency
-# (getkono/fast) fetched over SSH. Set the `SENDIT_DEPLOY_KEY` repository secret
+# (getkono/sendit) fetched over SSH. Set the `SENDIT_DEPLOY_KEY` repository secret
 # to a deploy key with read access to that repo, or this workflow cannot build.
 # (The main `ci.yml` workflow has the same unmet requirement and currently
 # triggers on `main` while the trunk is `master`.)
