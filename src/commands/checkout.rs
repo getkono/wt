@@ -100,7 +100,7 @@ pub(crate) fn checkout_branch_in_worktree(
 
     ensure_branch_available(git, repo, worktree_dir, branch, force)?;
     let fetch_skipped = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
-    ensure_branch_exists(git, repo, worktree_dir, branch, &remote)?;
+    ensure_branch_exists(repo, branch, &remote)?;
 
     // Check out the branch (DWIM creates a local tracking branch when remote-only).
     let mut argv: Vec<&str> = vec!["checkout"];
@@ -180,23 +180,13 @@ pub(crate) fn fetch_remote_best_effort(
 }
 
 /// Confirms `branch` exists locally or as a remote-tracking ref on `remote` (after
-/// the fetch), erroring otherwise.
-fn ensure_branch_exists(
-    git: &dyn GitCli,
-    repo: &Repo,
-    worktree_dir: &Path,
-    branch: &str,
-    remote: &str,
-) -> Result<()> {
+/// the fetch), erroring otherwise. Both checks resolve refs through `gix`; the
+/// remote-tracking ref the fetch just wrote lives in the shared common dir, so the
+/// session repo handle sees it.
+fn ensure_branch_exists(repo: &Repo, branch: &str, remote: &str) -> Result<()> {
     let local_exists = resolve_hex(repo.gix(), &branch_ref(branch)).is_some();
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
-    let remote_exists = git
-        .run_raw(
-            worktree_dir,
-            &["rev-parse", "--verify", "--quiet", &remote_ref],
-        )
-        .map(|o| o.success)
-        .unwrap_or(false);
+    let remote_exists = resolve_hex(repo.gix(), &remote_ref).is_some();
     if !local_exists && !remote_exists {
         return Err(Error::operation(format!(
             "branch {branch:?} not found locally or on {remote}"
