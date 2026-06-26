@@ -5,7 +5,7 @@
 //! This module is the deliberately-thin, terminal-touching shell of the TUI;
 //! all decisions live in the tested [`crate::tui::app`]/[`crate::tui::event`].
 
-use std::io::{Stderr, stderr};
+use std::io::{IsTerminal, Stderr, stderr};
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -15,7 +15,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tui::App;
 use crate::tui::view;
 
@@ -30,7 +30,21 @@ pub struct Tui {
 
 impl Tui {
     /// Enters raw mode and the alternate screen (with mouse capture if enabled).
+    ///
+    /// Errors (without touching the terminal) when stderr is not a real
+    /// terminal. The TUI draws to stderr, and `enable_raw_mode` performs a
+    /// `tcsetattr` on the controlling terminal — so taking it over is only safe
+    /// when stderr is genuinely a terminal. Enforcing that precondition *here*,
+    /// at the irreversible boundary, rather than relying solely on the
+    /// higher-level [`crate::cx::Cx`] TTY gate, keeps any non-TTY run (tests,
+    /// pipes, or a `cargo mutants` child in a background process group) from
+    /// being stopped by `SIGTTOU` and wedging indefinitely.
     pub fn enter(mouse: bool) -> Result<Tui> {
+        if !stderr().is_terminal() {
+            return Err(Error::operation(
+                "refusing to start the TUI: stderr is not a terminal",
+            ));
+        }
         enable_raw_mode()?;
         execute!(stderr(), EnterAlternateScreen)?;
         if mouse {
@@ -102,4 +116,23 @@ pub fn install_panic_hook() {
         let _ = restore(true);
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enter_refuses_when_stderr_is_not_a_terminal() {
+        // `cargo test` captures stderr, so it is not a terminal: entering the
+        // TUI must fail fast instead of driving raw mode on a non-terminal —
+        // which under a background process group (e.g. a `cargo mutants` child)
+        // would raise SIGTTOU and hang the run. Guard against the rare case of
+        // running attached to a real terminal (e.g. `--nocapture` from a tty),
+        // where grabbing it would be both unwanted and disruptive.
+        if stderr().is_terminal() {
+            return;
+        }
+        assert!(Tui::enter(false).is_err());
+    }
 }
