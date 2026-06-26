@@ -139,7 +139,7 @@ pub(crate) fn sync_worktree(
     }
 
     // Best-effort fetch so the tracking ref reflects the remote (offline-tolerant).
-    let _ = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
+    let _ = fetch_remote_best_effort(cx, git, repo.gix(), worktree_dir, &remote);
 
     // Re-discover so the freshly fetched tracking ref is visible.
     let repo = Repo::discover(worktree_dir)?;
@@ -148,8 +148,8 @@ pub(crate) fn sync_worktree(
     };
 
     let full_ref = branch_ref(&branch);
-    let behind = is_ancestor(git, worktree_dir, &full_ref, &upstream.tracking_ref);
-    let ahead = is_ancestor(git, worktree_dir, &upstream.tracking_ref, &full_ref);
+    let behind = is_ancestor(repo.gix(), &full_ref, &upstream.tracking_ref);
+    let ahead = is_ancestor(repo.gix(), &upstream.tracking_ref, &full_ref);
     match (ahead, behind) {
         // Strictly behind: fast-forward, but never discard uncommitted work.
         (false, true) => {

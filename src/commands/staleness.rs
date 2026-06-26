@@ -57,7 +57,7 @@ pub(crate) fn check_base_behind(
     let remote = up.display.split('/').next().unwrap_or("origin").to_string();
     // Best-effort fetch so the comparison sees the latest origin (skipped when no
     // remote is configured / offline); a failure is non-fatal.
-    if remote_configured(git, dir, &remote)
+    if remote_configured(repo.gix(), &remote)
         && let Err(e) = ops::fetch(git, dir, &remote)
     {
         let _ = cx
@@ -88,7 +88,7 @@ pub(crate) fn fast_forward_base(
     base: &str,
     stale: &StaleBase,
 ) -> Result<()> {
-    if !is_ancestor(git, root, &branch_ref(base), &stale.tracking_ref) {
+    if !is_ancestor(repo.gix(), &branch_ref(base), &stale.tracking_ref) {
         return Err(Error::operation(format!(
             "base {base:?} has diverged from {}; cannot fast-forward",
             stale.upstream_display

@@ -1,10 +1,7 @@
 //! Ref and branch reads via `gix` (spec §4): local branch listing, upstream
 //! resolution, ref resolution, and default-branch resolution.
 
-use std::path::Path;
-
 use crate::error::{Error, Result};
-use crate::git::cli::GitCli;
 
 /// The configured upstream of a local branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,11 +115,20 @@ pub(crate) fn upstream_of(repo: &gix::Repository, branch: &str) -> Option<Upstre
 }
 
 /// Whether commit-ish `a` is an ancestor of `b` (i.e. `a` is fully merged into
-/// `b`), determined offline via `git merge-base --is-ancestor`. Returns `false`
-/// if a ref is missing or the command errors.
-pub(crate) fn is_ancestor(git: &dyn GitCli, root: &Path, a: &str, b: &str) -> bool {
-    git.run_raw(root, &["merge-base", "--is-ancestor", a, b])
-        .map(|o| o.success)
+/// `b`), determined offline via `gix`. Returns `false` if either revspec does not
+/// resolve or there is no merge base (unrelated histories).
+///
+/// `a` is an ancestor of `b` exactly when their best merge base is `a` itself;
+/// this also yields `true` when `a == b`, matching `git merge-base --is-ancestor`.
+pub(crate) fn is_ancestor(repo: &gix::Repository, a: &str, b: &str) -> bool {
+    let Some(a_id) = repo.rev_parse_single(a).ok().map(|id| id.detach()) else {
+        return false;
+    };
+    let Some(b_id) = repo.rev_parse_single(b).ok().map(|id| id.detach()) else {
+        return false;
+    };
+    repo.merge_base(a_id, b_id)
+        .map(|base| base.detach() == a_id)
         .unwrap_or(false)
 }
 
@@ -149,8 +155,8 @@ pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
 }
 
 /// The branch that `refs/remotes/origin/HEAD` points to, if any (the short name,
-/// e.g. `main`).
-fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
+/// e.g. `main`). Drives default-branch resolution and PR trunk detection.
+pub(crate) fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
     // The tracking form is `origin/<branch>`; drop the remote to get the branch
     // (handles slashes in branch names).
     origin_head_tracking(repo)?
@@ -332,44 +338,43 @@ mod tests {
 
     #[test]
     fn is_ancestor_true_when_merged_false_when_divergent() {
-        use crate::git::cli::RealGit;
         let repo = TestRepo::init();
         // `topic` branches off main with no extra commits: an ancestor of main.
         repo.git(&["branch", "topic"]);
-        assert!(is_ancestor(
-            &RealGit,
-            repo.root(),
-            "refs/heads/topic",
-            "refs/heads/main"
-        ));
+        let r = Repo::discover(repo.root()).unwrap();
+        assert!(is_ancestor(r.gix(), "refs/heads/topic", "refs/heads/main"));
+        // A ref is trivially an ancestor of itself (matches `--is-ancestor`).
+        assert!(is_ancestor(r.gix(), "refs/heads/main", "refs/heads/main"));
         // Add a commit on `topic` so it diverges: no longer an ancestor of main.
         repo.git(&["checkout", "topic"]);
         repo.write("t.txt", "1\n");
         repo.commit_all("topic work");
-        assert!(!is_ancestor(
-            &RealGit,
-            repo.root(),
-            "refs/heads/topic",
-            "refs/heads/main"
-        ));
+        let r = Repo::discover(repo.root()).unwrap();
+        assert!(!is_ancestor(r.gix(), "refs/heads/topic", "refs/heads/main"));
         // ...but main is still an ancestor of topic.
-        assert!(is_ancestor(
-            &RealGit,
-            repo.root(),
-            "refs/heads/main",
-            "refs/heads/topic"
-        ));
+        assert!(is_ancestor(r.gix(), "refs/heads/main", "refs/heads/topic"));
     }
 
     #[test]
     fn is_ancestor_false_for_missing_ref() {
-        use crate::git::cli::RealGit;
         let repo = TestRepo::init();
+        let r = Repo::discover(repo.root()).unwrap();
+        assert!(!is_ancestor(r.gix(), "refs/heads/nope", "refs/heads/main"));
+    }
+
+    #[test]
+    fn is_ancestor_false_for_unrelated_histories() {
+        // Two roots with no common ancestor: `git merge-base --is-ancestor`
+        // exits non-zero (no merge base), so this must be `false`, not a panic.
+        let repo = TestRepo::init();
+        repo.git(&["checkout", "--orphan", "unrelated"]);
+        repo.write("o.txt", "x\n");
+        repo.commit_all("orphan root");
+        let r = Repo::discover(repo.root()).unwrap();
         assert!(!is_ancestor(
-            &RealGit,
-            repo.root(),
-            "refs/heads/nope",
-            "refs/heads/main"
+            r.gix(),
+            "refs/heads/main",
+            "refs/heads/unrelated"
         ));
     }
 }

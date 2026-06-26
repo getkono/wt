@@ -99,8 +99,8 @@ pub(crate) fn checkout_branch_in_worktree(
     let branch = branch_owned.as_str();
 
     ensure_branch_available(git, repo, worktree_dir, branch, force)?;
-    let fetch_skipped = fetch_remote_best_effort(cx, git, worktree_dir, &remote);
-    ensure_branch_exists(git, repo, worktree_dir, branch, &remote)?;
+    let fetch_skipped = fetch_remote_best_effort(cx, git, repo.gix(), worktree_dir, &remote);
+    ensure_branch_exists(repo, branch, &remote)?;
 
     // Check out the branch (DWIM creates a local tracking branch when remote-only).
     let mut argv: Vec<&str> = vec!["checkout"];
@@ -162,10 +162,11 @@ fn ensure_branch_available(
 pub(crate) fn fetch_remote_best_effort(
     cx: &mut Cx,
     git: &dyn GitCli,
+    repo: &gix::Repository,
     worktree_dir: &Path,
     remote: &str,
 ) -> bool {
-    if !remote_configured(git, worktree_dir, remote) {
+    if !remote_configured(repo, remote) {
         return true;
     }
     match ops::fetch(git, worktree_dir, remote) {
@@ -180,23 +181,13 @@ pub(crate) fn fetch_remote_best_effort(
 }
 
 /// Confirms `branch` exists locally or as a remote-tracking ref on `remote` (after
-/// the fetch), erroring otherwise.
-fn ensure_branch_exists(
-    git: &dyn GitCli,
-    repo: &Repo,
-    worktree_dir: &Path,
-    branch: &str,
-    remote: &str,
-) -> Result<()> {
+/// the fetch), erroring otherwise. Both checks resolve refs through `gix`; the
+/// remote-tracking ref the fetch just wrote lives in the shared common dir, so the
+/// session repo handle sees it.
+fn ensure_branch_exists(repo: &Repo, branch: &str, remote: &str) -> Result<()> {
     let local_exists = resolve_hex(repo.gix(), &branch_ref(branch)).is_some();
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
-    let remote_exists = git
-        .run_raw(
-            worktree_dir,
-            &["rev-parse", "--verify", "--quiet", &remote_ref],
-        )
-        .map(|o| o.success)
-        .unwrap_or(false);
+    let remote_exists = resolve_hex(repo.gix(), &remote_ref).is_some();
     if !local_exists && !remote_exists {
         return Err(Error::operation(format!(
             "branch {branch:?} not found locally or on {remote}"
@@ -228,8 +219,8 @@ fn sync_with_upstream(
         return Ok(SyncOutcome::FetchSkipped);
     }
     let full_ref = branch_ref(branch);
-    let behind = is_ancestor(git, worktree_dir, &full_ref, &upstream.tracking_ref);
-    let ahead = is_ancestor(git, worktree_dir, &upstream.tracking_ref, &full_ref);
+    let behind = is_ancestor(repo.gix(), &full_ref, &upstream.tracking_ref);
+    let ahead = is_ancestor(repo.gix(), &upstream.tracking_ref, &full_ref);
     match (ahead, behind) {
         // Strictly behind: a proven-clean fast-forward (the tree is clean here).
         (false, true) => {
@@ -268,11 +259,13 @@ fn normalize_remote_branch(repo: &Repo, branch: &str) -> String {
     branch.to_string()
 }
 
-/// Whether `remote` is configured for the repository at `worktree_dir`.
-pub(crate) fn remote_configured(git: &dyn GitCli, worktree_dir: &Path, remote: &str) -> bool {
-    git.run_raw(worktree_dir, &["remote", "get-url", remote])
-        .map(|o| o.success)
-        .unwrap_or(false)
+/// Whether `remote` is configured with a fetch URL, read via `gix`. Mirrors
+/// `git remote get-url <remote>` succeeding: the remote section exists and has a
+/// fetch URL.
+pub(crate) fn remote_configured(repo: &gix::Repository, remote: &str) -> bool {
+    repo.try_find_remote(remote)
+        .and_then(|r| r.ok())
+        .is_some_and(|r| r.url(gix::remote::Direction::Fetch).is_some())
 }
 
 /// A human suffix describing the sync outcome, for the TUI status line.

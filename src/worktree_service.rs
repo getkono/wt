@@ -75,7 +75,7 @@ pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: 
         // Offline merge-state for delete-safety messaging; unknowable for a
         // missing worktree (no checkout to query), left `None` there.
         if !wt.is_missing {
-            let state = compute_merge_state(repo, git, wt, &branch, upstream.as_ref());
+            let state = compute_merge_state(repo, wt, &branch, upstream.as_ref());
             wt.merge_state = state;
         }
     }
@@ -89,7 +89,7 @@ pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: 
         wt.has_untracked = Some(status.has_untracked);
     }
 
-    fill_commits(repo, git, abbrev, wt);
+    fill_commits(repo, abbrev, wt);
 }
 
 /// Fills `wt.ahead`/`wt.behind` against a present `upstream`. Skipped for a
@@ -109,8 +109,8 @@ fn fill_ahead_behind(git: &dyn GitCli, wt: &mut Worktree, branch: &str, upstream
 /// Fills the tip commit and the recent-commit list that powers the TUI detail
 /// pane (spec §10), resolved from the worktree's tip OID. A worktree with no
 /// resolvable tip keeps both unset.
-fn fill_commits(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: &mut Worktree) {
-    let Some(oid) = tip_oid(repo, git, wt) else {
+fn fill_commits(repo: &Repo, abbrev: usize, wt: &mut Worktree) {
+    let Some(oid) = tip_oid(repo, wt) else {
         return;
     };
     if let Ok(info) = commit_info(repo.gix(), &oid, abbrev) {
@@ -133,16 +133,16 @@ fn to_commit(info: CommitInfo) -> Commit {
     }
 }
 
-/// Resolves the tip commit OID of a worktree: the branch ref for a branch
-/// worktree, or `git rev-parse HEAD` for a detached one.
-fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
+/// Resolves the tip commit OID of a worktree via `gix`: the branch ref for a
+/// branch worktree, or the detached worktree's own `HEAD`.
+fn tip_oid(repo: &Repo, wt: &Worktree) -> Option<String> {
     match &wt.branch {
         Some(branch) => resolve_hex(repo.gix(), &branch_ref(branch)),
-        None => git
-            .run(&wt.path, &["rev-parse", "HEAD"])
+        // A detached worktree's HEAD is per-worktree, so open that worktree
+        // directly rather than reading the session repo's HEAD.
+        None => gix::open(&wt.path)
             .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+            .and_then(|r| r.head_id().ok().map(|id| id.detach().to_string())),
     }
 }
 
@@ -161,7 +161,6 @@ fn tip_oid(repo: &Repo, git: &dyn GitCli, wt: &Worktree) -> Option<String> {
 /// Callers must skip missing worktrees (there is no checkout to query).
 fn compute_merge_state(
     repo: &Repo,
-    git: &dyn GitCli,
     wt: &Worktree,
     branch: &str,
     upstream: Option<&Upstream>,
@@ -185,7 +184,7 @@ fn compute_merge_state(
             if target == branch || tried.contains(&target) {
                 continue;
             }
-            if is_ancestor(git, &wt.path, &full_ref, &target) {
+            if is_ancestor(repo.gix(), &full_ref, &target) {
                 return Some(MergeState::Merged { into: Some(target) });
             }
             tried.push(target);
@@ -489,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn detached_worktree_tip_resolved_from_its_own_head() {
+        // A detached worktree has no branch, so its tip is read from the
+        // worktree's own HEAD via `gix::open` (not the session repo's HEAD).
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["worktree", "add", "--detach", "../wt-det", &head]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let worktrees = build_worktrees(&r, &RealGit).unwrap();
+        let det = worktrees
+            .iter()
+            .find(|w| w.is_detached)
+            .expect("detached worktree row");
+        assert!(det.branch.is_none());
+        let commit = det.commit.as_ref().expect("tip commit filled from HEAD");
+        assert_eq!(commit.subject, "init");
+        assert!(head.starts_with(&commit.hash));
+    }
+
+    #[test]
     fn dirty_and_untracked_are_distinguished() {
         let repo = TestRepo::init();
         repo.write("README.md", "changed\n");
@@ -593,7 +611,7 @@ mod tests {
         let up = upstream_of(r.gix(), "main");
         let wt = merge_wt(&repo, "main", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "main", up.as_ref()),
+            compute_merge_state(&r, &wt, "main", up.as_ref()),
             Some(MergeState::Tracked)
         );
     }
@@ -605,7 +623,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })
@@ -620,7 +638,7 @@ mod tests {
         // No base recorded: the default-branch fallback must still detect it.
         let wt = merge_wt(&repo, "feat", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })
@@ -634,7 +652,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged { into: None })
         );
     }
@@ -651,7 +669,7 @@ mod tests {
         assert!(up.as_ref().unwrap().is_gone);
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", up.as_ref()),
+            compute_merge_state(&r, &wt, "feat", up.as_ref()),
             Some(MergeState::UpstreamGone)
         );
     }
@@ -663,7 +681,7 @@ mod tests {
         let r = Repo::discover(repo.root()).unwrap();
         let wt = merge_wt(&repo, "feat", Some("main"), None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::NoUpstreamLocal)
         );
     }
@@ -677,7 +695,7 @@ mod tests {
         // must be skipped — otherwise it would wrongly report "merged into main".
         let wt = merge_wt(&repo, "main", None, None);
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "main", None),
+            compute_merge_state(&r, &wt, "main", None),
             Some(MergeState::NoUpstreamLocal)
         );
     }
@@ -690,7 +708,7 @@ mod tests {
         // Both an ancestor of base AND a merged PR: the named ancestry wins.
         let wt = merge_wt(&repo, "feat", Some("main"), Some(PrState::Merged));
         assert_eq!(
-            compute_merge_state(&r, &RealGit, &wt, "feat", None),
+            compute_merge_state(&r, &wt, "feat", None),
             Some(MergeState::Merged {
                 into: Some("main".into())
             })

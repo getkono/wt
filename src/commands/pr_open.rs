@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::gh::{GhClient, OpenPr};
 use crate::git::cli::GitCli;
 use crate::git::refs::current_branch;
-use crate::git::{resolve_hex, upstream_of};
+use crate::git::{origin_head_branch, resolve_hex, upstream_of};
 use crate::tui::ComposeSeed;
 
 /// Dispatches `wt pr open`: gather context, then either open the TUI compose form
@@ -201,25 +201,6 @@ fn open_pr_to_existing(pr: OpenPr) -> sendit::ExistingPr {
     }
 }
 
-/// The branch behind `refs/remotes/origin/HEAD`, read through the injected
-/// `git` boundary (so trunk detection respects `-C` and is fakeable), or `None`.
-fn origin_head(git: &dyn GitCli, root: &Path) -> Option<String> {
-    let out = git
-        .run_raw(
-            root,
-            &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        )
-        .ok()?;
-    if !out.success {
-        return None;
-    }
-    out.stdout
-        .trim()
-        .strip_prefix("origin/")
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-}
-
 /// Gathers everything needed to compose a PR for the current branch, using the
 /// injected `git`/`gh` boundaries plus `sendit`'s pure parsers. Refuses (with a
 /// typed error) when HEAD is detached, the branch *is* the trunk, or there is
@@ -237,7 +218,7 @@ pub(crate) fn gather_pr_context(
     })?;
 
     let gh_default = gh.default_branch(dir)?;
-    let origin = origin_head(git, root);
+    let origin = origin_head_branch(repo);
     let trunk = sendit::resolve_trunk(
         base_override,
         gh_default.as_deref(),

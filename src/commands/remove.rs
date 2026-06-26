@@ -3,8 +3,7 @@
 use std::path::Path;
 
 use crate::cli::RemoveArgs;
-use crate::commands::{Resolution, open_session, resolve_query};
-use crate::config::Config;
+use crate::commands::{Resolution, Session, open_session, resolve_query};
 use crate::config::wtconfig::{self, WtMeta};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
@@ -103,15 +102,7 @@ pub(crate) fn remove_query(
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
         ops::worktree_prune(git, &root)?;
-        let deleted = maybe_delete_branch(
-            git,
-            &root,
-            &worktree,
-            &meta,
-            &session.config,
-            opts,
-            &default,
-        );
+        let deleted = maybe_delete_branch(git, &session, &worktree, &meta, opts, &default);
         clear_metadata(git, &root, &worktree);
         return finish(cx, &worktree, json, deleted);
     }
@@ -157,15 +148,7 @@ pub(crate) fn remove_query(
     let path = worktree.path.to_string_lossy().into_owned();
     ops::worktree_remove(git, &root, &path, opts.force_remove)?;
 
-    let deleted = maybe_delete_branch(
-        git,
-        &root,
-        &worktree,
-        &meta,
-        &session.config,
-        opts,
-        &default,
-    );
+    let deleted = maybe_delete_branch(git, &session, &worktree, &meta, opts, &default);
     clear_metadata(git, &root, &worktree);
     finish(cx, &worktree, json, deleted)
 }
@@ -241,10 +224,9 @@ pub(crate) fn delete_branch_query(
 /// the branch was deleted.
 fn maybe_delete_branch(
     git: &dyn GitCli,
-    root: &Path,
+    session: &Session,
     worktree: &Worktree,
     meta: &WtMeta,
-    config: &Config,
     opts: &RemoveOptions,
     default: &Option<String>,
 ) -> bool {
@@ -257,16 +239,16 @@ fn maybe_delete_branch(
     let base = meta.base_ref.clone().or_else(|| default.clone());
     let merged = base
         .as_deref()
-        .is_some_and(|b| is_ancestor(git, root, &branch_ref(branch), b));
+        .is_some_and(|b| is_ancestor(session.repo.gix(), &branch_ref(branch), b));
     let should_delete = if merged {
-        config.remove_delete_merged_branch
+        session.config.remove_delete_merged_branch
     } else {
         opts.force_branch
     };
     if !should_delete {
         return false;
     }
-    ops::delete_branch(git, root, branch, true).is_ok()
+    ops::delete_branch(git, &session.primary_root, branch, true).is_ok()
 }
 
 /// Clears the worktree's `wt.*` metadata, best-effort.
