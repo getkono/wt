@@ -92,6 +92,25 @@ pub(crate) fn remove_query(
         return Err(Error::operation("refusing to remove the primary worktree"));
     }
 
+    let deleted = remove_resolved(cx, git, hooks, &session, &root, &worktree, opts)?;
+    finish(cx, &worktree, json, deleted)
+}
+
+/// Removes an already-resolved `worktree` under the given options: applies the
+/// safety guards, runs the pre-remove hook, removes the worktree (pruning a
+/// missing one), and optionally deletes a fully-merged wt-created branch. Returns
+/// whether the branch was deleted. Shared by `wt remove` (which resolves a query
+/// first) and `wt drop` (which targets the current worktree). The caller is
+/// responsible for the primary-worktree guard and for reporting the outcome.
+pub(crate) fn remove_resolved(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    hooks: &dyn HookRunner,
+    session: &Session,
+    root: &Path,
+    worktree: &Worktree,
+    opts: &RemoveOptions,
+) -> Result<bool> {
     let meta = worktree
         .branch
         .as_deref()
@@ -101,14 +120,14 @@ pub(crate) fn remove_query(
 
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
-        ops::worktree_prune(git, &root)?;
-        let deleted = maybe_delete_branch(git, &session, &worktree, &meta, opts, &default);
-        clear_metadata(git, &root, &worktree);
-        return finish(cx, &worktree, json, deleted);
+        ops::worktree_prune(git, root)?;
+        let deleted = maybe_delete_branch(git, session, worktree, &meta, opts, &default);
+        clear_metadata(git, root, worktree);
+        return Ok(deleted);
     }
 
     // Safety guards (spec §10/§12).
-    let guard = guard_status(&worktree, session.config.remove_untracked_blocks);
+    let guard = guard_status(worktree, session.config.remove_untracked_blocks);
     if guard.blocks() && !opts.force_remove {
         let mut reasons = Vec::new();
         if guard.dirty {
@@ -131,7 +150,7 @@ pub(crate) fn remove_query(
     let ctx = HookContext {
         worktree_path: worktree.path.clone(),
         branch: worktree.branch.clone().unwrap_or_default(),
-        repo_root: root.clone(),
+        repo_root: root.to_path_buf(),
         base_ref: meta.base_ref.clone(),
         pr_number: meta.pr_number,
     };
@@ -146,11 +165,11 @@ pub(crate) fn remove_query(
 
     // Remove the worktree.
     let path = worktree.path.to_string_lossy().into_owned();
-    ops::worktree_remove(git, &root, &path, opts.force_remove)?;
+    ops::worktree_remove(git, root, &path, opts.force_remove)?;
 
-    let deleted = maybe_delete_branch(git, &session, &worktree, &meta, opts, &default);
-    clear_metadata(git, &root, &worktree);
-    finish(cx, &worktree, json, deleted)
+    let deleted = maybe_delete_branch(git, session, worktree, &meta, opts, &default);
+    clear_metadata(git, root, worktree);
+    Ok(deleted)
 }
 
 /// Deletes a local branch that has no worktree — a TUI "branch row" (issue #53),

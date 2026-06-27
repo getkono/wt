@@ -73,6 +73,8 @@ pub(crate) enum Command {
     /// Remove a linked worktree.
     #[command(visible_alias = "rm")]
     Remove(RemoveArgs),
+    /// Remove the worktree you are in (keeps the branch).
+    Drop(DropArgs),
     /// Bulk-clean merged or stale worktrees.
     Prune(PruneArgs),
     /// Check out a GitHub PR into its own worktree.
@@ -237,6 +239,17 @@ pub(crate) struct RemoveArgs {
     /// Always keep the local branch.
     #[arg(long = "keep-branch")]
     pub(crate) keep_branch: bool,
+    /// Skip the pre-remove hook.
+    #[arg(long = "no-hooks")]
+    pub(crate) no_hooks: bool,
+}
+
+/// Arguments for `wt drop`.
+#[derive(Debug, Args)]
+pub(crate) struct DropArgs {
+    /// Remove even when dirty or with unpushed work (work may be lost).
+    #[arg(long)]
+    pub(crate) force: bool,
     /// Skip the pre-remove hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
@@ -416,6 +429,7 @@ impl Cli {
                 | Command::Sync(_)
                 | Command::List(_)
                 | Command::Remove(_)
+                | Command::Drop(_)
                 | Command::Prune(_)
                 | Command::Pr(_)
                 | Command::Status(_),
@@ -434,6 +448,7 @@ impl Cli {
             Some(Command::List(_)) => "list",
             Some(Command::Switch(_)) => "switch",
             Some(Command::Remove(_)) => "remove",
+            Some(Command::Drop(_)) => "drop",
             Some(Command::Prune(_)) => "prune",
             Some(Command::Pr(_)) => "pr",
             Some(Command::Status(_)) => "status",
@@ -521,6 +536,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),
         Some(Command::Remove(args)) => {
             crate::commands::remove::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
+        Some(Command::Drop(args)) => {
+            crate::commands::drop::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
         Some(Command::Prune(args)) => crate::commands::prune::run(cx, &args, json),
         Some(Command::Pr(args)) => {
@@ -652,6 +670,25 @@ mod tests {
     }
 
     #[test]
+    fn drop_parses_with_flags_and_takes_no_query() {
+        let cli = parse(&["drop", "--force", "--no-hooks"]).unwrap();
+        match cli.command {
+            Some(Command::Drop(a)) => {
+                assert!(a.force);
+                assert!(a.no_hooks);
+            }
+            _ => panic!("expected drop"),
+        }
+        // Bare `drop` is valid (no positional query).
+        assert!(matches!(
+            parse(&["drop"]).unwrap().command,
+            Some(Command::Drop(_))
+        ));
+        // `drop` takes no positional argument.
+        assert!(parse(&["drop", "somequery"]).is_err());
+    }
+
+    #[test]
     fn pr_forms_parse_distinctly() {
         // `pr list` -> the list sub-form.
         let cli = parse(&["pr", "list"]).unwrap();
@@ -752,6 +789,7 @@ mod tests {
             vec!["checkout", "b"],
             vec!["sync"],
             vec!["remove", "q"],
+            vec!["drop"],
             vec!["prune", "--merged"],
             vec!["pr", "list"],
             vec!["config", "list"],
