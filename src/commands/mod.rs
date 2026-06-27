@@ -5,6 +5,7 @@ pub mod checkout;
 pub mod complete;
 pub mod completions;
 pub mod config_cmd;
+pub mod drop;
 pub mod init;
 pub mod list;
 pub mod new;

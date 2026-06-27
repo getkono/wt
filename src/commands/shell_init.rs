@@ -38,7 +38,7 @@ pub(crate) fn run(cx: &mut Cx, args: &ShellInitArgs) -> Result<u8> {
 const BASH: &str = r#"# wt shell integration (bash) — source this from your ~/.bashrc
 wt() {
   case "${1-}" in
-    switch|sw|checkout|co|new|pr|ui|tui|"")
+    switch|sw|checkout|co|new|pr|drop|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
@@ -84,7 +84,7 @@ _wt_complete() {
       fi ;;
   esac
   if [ "$COMP_CWORD" -eq 1 ]; then
-    COMPREPLY=($(compgen -W "new checkout co list ls switch sw remove rm prune pr status path root init config completions shell-init ui tui" -- "$cur"))
+    COMPREPLY=($(compgen -W "new checkout co list ls switch sw remove rm drop prune pr status path root init config completions shell-init ui tui" -- "$cur"))
   fi
 }
 complete -F _wt_complete wt
@@ -93,7 +93,7 @@ complete -F _wt_complete wt
 const ZSH: &str = r#"# wt shell integration (zsh) — source this from your ~/.zshrc
 wt() {
   case "${1-}" in
-    switch|sw|checkout|co|new|pr|ui|tui|"")
+    switch|sw|checkout|co|new|pr|drop|ui|tui|"")
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
@@ -127,7 +127,7 @@ _wt() {
     pr)
       compadd -- ${(f)"$(command wt __complete pr-numbers "${words[CURRENT]}" 2>/dev/null)"}; return ;;
   esac
-  compadd -- new checkout co list ls switch sw remove rm prune pr status path root init config completions shell-init ui tui
+  compadd -- new checkout co list ls switch sw remove rm drop prune pr status path root init config completions shell-init ui tui
 }
 compdef _wt wt
 "#;
@@ -135,7 +135,7 @@ compdef _wt wt
 const FISH: &str = r#"# wt shell integration (fish) — source this from your config.fish
 function wt
     set -l cmd $argv[1]
-    if test (count $argv) -eq 0; or contains -- "$cmd" switch sw checkout co new pr ui tui
+    if test (count $argv) -eq 0; or contains -- "$cmd" switch sw checkout co new pr drop ui tui
         if contains -- --json $argv; or contains -- --print-path $argv; or contains -- -h $argv; or contains -- --help $argv; or contains -- -V $argv; or contains -- --version $argv
             command wt $argv
             return $status
@@ -165,12 +165,12 @@ complete -c wt -n '__fish_seen_subcommand_from checkout co' \
 complete -c wt -n '__fish_seen_subcommand_from pr' \
     -a '(command wt __complete pr-numbers 2>/dev/null)'
 complete -c wt -n '__fish_use_subcommand' \
-    -a 'new checkout co list switch remove prune pr status path root init config completions shell-init ui tui'
+    -a 'new checkout co list switch remove drop prune pr status path root init config completions shell-init ui tui'
 "#;
 
 const POWERSHELL: &str = r#"# wt shell integration (PowerShell) — add to your $PROFILE
 function wt {
-    $nav = @('switch','sw','checkout','co','new','pr','ui','tui')
+    $nav = @('switch','sw','checkout','co','new','pr','drop','ui','tui')
     $exe = (Get-Command wt -CommandType Application | Select-Object -First 1).Source
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
         if ($args -contains '--json' -or $args -contains '--print-path' -or $args -contains '-h' -or $args -contains '--help' -or $args -contains '-V' -or $args -contains '--version') { & $exe @args; return }
@@ -194,14 +194,14 @@ Register-ArgumentCompleter -CommandName wt -Native -ScriptBlock {
         '^new$' { & $exe __complete branches $wordToComplete }
         '^(checkout|co)$' { & $exe __complete all-branches $wordToComplete }
         '^pr$'  { & $exe __complete pr-numbers $wordToComplete }
-        default { 'new','checkout','co','list','switch','remove','prune','pr','status','path','root','init','config','completions','shell-init','ui','tui' | Where-Object { $_ -like "$wordToComplete*" } }
+        default { 'new','checkout','co','list','switch','remove','drop','prune','pr','status','path','root','init','config','completions','shell-init','ui','tui' | Where-Object { $_ -like "$wordToComplete*" } }
     }
 }
 "#;
 
 const ELVISH: &str = r#"# wt shell integration (elvish) — source this from your rc.elv
 fn wt {|@a|
-    var nav = [switch sw checkout co new pr ui tui]
+    var nav = [switch sw checkout co new pr drop ui tui]
     if (or (== (count $a) 0) (and (> (count $a) 0) (has-value $nav $a[0]))) {
         if (or (has-value $a --json) (has-value $a --print-path) (has-value $a -h) (has-value $a --help) (has-value $a -V) (has-value $a --version)) {
             (external wt) $@a
@@ -354,6 +354,26 @@ mod tests {
             assert!(
                 s.contains("checkout"),
                 "{shell:?} wrapper does not mention checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wrapper_navigates_drop() {
+        // `wt drop` removes the current worktree and prints the primary root, so
+        // every wrapper must treat `drop` as cd-eligible (issue #81) and offer it
+        // as a subcommand for completion.
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let s = snippet(shell);
+            assert!(
+                s.contains("drop"),
+                "{shell:?} wrapper does not wire up drop"
             );
         }
     }

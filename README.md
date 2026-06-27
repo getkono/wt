@@ -136,6 +136,10 @@ These are the things worth knowing up front; the rest is discoverable from
   ```
 - **Removal protects your work.** `wt remove` and `wt prune` refuse to drop a
   worktree with uncommitted or unpushed changes unless you pass `--force`.
+- **Drop the worktree you're in.** `wt drop` removes the worktree containing the
+  current directory (from any depth), keeps the branch, and `cd`s you back to the
+  main worktree. It refuses the primary worktree and honors the same `--force`
+  guard.
 - **Bulk-clean stale branches.** `wt prune --merged` removes worktrees whose branch
   is merged into the default branch, and `wt prune --gone` removes worktrees whose
   upstream was deleted (plus any missing worktrees). Both also delete matching
