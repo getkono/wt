@@ -46,12 +46,17 @@ impl Tui {
             ));
         }
         enable_raw_mode()?;
-        execute!(stderr(), EnterAlternateScreen)?;
-        if mouse {
-            execute!(stderr(), EnableMouseCapture)?;
+        // Raw mode is now on, but no `Tui` exists yet — so if the alternate
+        // screen, mouse capture, or backend setup fails, `Tui::drop` will never
+        // run to undo it. Restore by hand on any such failure to avoid leaving
+        // the shell wedged in raw mode / the alternate screen.
+        match build_terminal(mouse) {
+            Ok(terminal) => Ok(Tui { terminal, mouse }),
+            Err(e) => {
+                let _ = restore(mouse);
+                Err(e)
+            }
         }
-        let terminal = Terminal::new(CrosstermBackend::new(stderr()))?;
-        Ok(Tui { terminal, mouse })
     }
 
     /// Draws the current app state.
@@ -96,6 +101,17 @@ impl Drop for Tui {
     fn drop(&mut self) {
         let _ = restore(self.mouse);
     }
+}
+
+/// Enters the alternate screen (with mouse capture if enabled) and builds the
+/// ratatui backend over stderr. Kept separate from [`Tui::enter`] so a failure
+/// here can be unwound by the caller before any `Tui` exists to restore on drop.
+fn build_terminal(mouse: bool) -> Result<Terminal<Backend>> {
+    execute!(stderr(), EnterAlternateScreen)?;
+    if mouse {
+        execute!(stderr(), EnableMouseCapture)?;
+    }
+    Ok(Terminal::new(CrosstermBackend::new(stderr()))?)
 }
 
 /// Restores the terminal to its normal state (idempotent, best-effort).
