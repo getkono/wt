@@ -11,7 +11,17 @@
 #   1. `wt` depends on `sendit` via git, and crates.io rejects git dependencies.
 #   2. the crate name `wt` is already taken on crates.io.
 # Everything else — CHANGELOG, release PR, git tag, GitHub Release — still runs.
-publish = false
+#
+# Use git-only mode: determine the last released version from the `v{version}` git
+# tags, NOT from crates.io. `publish = false` alone is the wrong knob here — it only
+# skips `cargo publish` while release-plz STILL reads the registry to learn the last
+# release. Unpublished, the registry reports 0.0.0, so release-plz saw local 1.0.0 >
+# registry 0.0.0, concluded "only changelog will be updated", and never opened a
+# release PR for the feat:/fix: commits piling up after v1.0.0. `git_only = true`
+# reads the existing tag instead and bumps from there. It also implies skipping
+# `cargo publish`, so no separate `publish = false` is needed. Requires release-plz
+# >= 0.3.151 (the action ships a newer one). https://release-plz.dev/docs/config
+git_only = true
 
 # Maintain CHANGELOG.md from Conventional Commits (keep-a-changelog format).
 changelog_update = true
