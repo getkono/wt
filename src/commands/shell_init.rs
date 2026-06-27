@@ -207,7 +207,7 @@ fn wt {|@a|
             (external wt) $@a
             return
         }
-        var out = (external wt $@a | slurp | str:trim-space (one))
+        var out = ((external wt) $@a | slurp | str:trim-space (one))
         # Only cd into a real directory: `wt pr open` succeeds by printing a PR
         # URL. cd raises on a non-directory, so echo it instead (issue #40).
         if (and (== $edit:command-exit-status 0) (not-eq $out "")) {
