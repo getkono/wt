@@ -405,6 +405,14 @@ enum Job {
         /// The branch label for the status text, resolved on the foreground.
         label: String,
     },
+    /// Sync a worktree-less `branch` by moving its ref from the repo root
+    /// (issue #47/#63).
+    SyncBranch {
+        /// The branch to sync.
+        branch: String,
+        /// The branch label for the status text (the branch name).
+        label: String,
+    },
     /// Initialize the submodules in `dir` recursively (issue #50).
     InitSubmodules {
         /// The worktree directory whose submodules to initialize.
@@ -575,19 +583,23 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
         }
         Effect::Sync { worktree_index } => {
             let worktree = app.worktrees.get(worktree_index)?;
-            let worktree_dir = worktree.path.clone();
             let label = worktree
                 .branch
                 .clone()
                 .unwrap_or_else(|| "worktree".to_string());
             let busy = format!("Syncing {label}");
-            (
+            let job = if worktree.has_worktree {
                 Job::Sync {
-                    worktree_dir,
+                    worktree_dir: worktree.path.clone(),
                     label,
-                },
-                busy,
-            )
+                }
+            } else {
+                // A branch row syncs by branch name from the repo root; a row with
+                // no branch (none exist today) has nothing to sync.
+                let branch = worktree.branch.clone()?;
+                Job::SyncBranch { branch, label }
+            };
+            (job, busy)
         }
         Effect::InitSubmodules { dir, count } => {
             let label = format!("Initializing {count} submodule(s)");
@@ -662,6 +674,10 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
             label,
         } => {
             let result = run_sync_command(&mut cx, &worktree_dir);
+            JobOutcome::Sync { label, result }
+        }
+        Job::SyncBranch { branch, label } => {
+            let result = run_sync_branch_command(&mut cx, &branch);
             JobOutcome::Sync { label, result }
         }
         Job::InitSubmodules { dir, count } => {
@@ -950,6 +966,24 @@ mod tests {
         repo.git(&["config", "branch.main.remote", "origin"]);
         repo.git(&["config", "branch.main.merge", "refs/heads/main"]);
         c2
+    }
+
+    /// Creates a worktree-less `feat` branch one commit behind `origin/feat`
+    /// (upstream configured, no fetchable remote so the sync's fetch is skipped),
+    /// leaving the repo on `main`. Returns origin's tip.
+    fn feat_branch_behind_origin(repo: &TestRepo) -> String {
+        let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.write("u.txt", "1\n");
+        repo.commit_all("ahead on origin/feat");
+        let tip = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["update-ref", "refs/remotes/origin/feat", &tip]);
+        repo.git(&["checkout", "-q", "main"]);
+        // Rewind local feat behind origin/feat; it is not checked out.
+        repo.git(&["branch", "-f", "feat", &base]);
+        repo.git(&["config", "branch.feat.remote", "origin"]);
+        repo.git(&["config", "branch.feat.merge", "refs/heads/feat"]);
+        tip
     }
 
     #[test]
@@ -1374,6 +1408,30 @@ mod tests {
                 .contains("fast-forwarded")
         );
         assert_eq!(repo.git(&["rev-parse", "main"]).trim(), c2);
+    }
+
+    #[test]
+    fn do_sync_branch_row_fast_forwards() {
+        // A worktree-less `feat` branch row that is behind `origin/feat` syncs by
+        // moving its ref (no checkout involved) — issue #47/#63.
+        let repo = TestRepo::init();
+        let tip = feat_branch_behind_origin(&repo);
+        let (mut t, session, mut app) = setup(&repo);
+        let index = app
+            .worktrees
+            .iter()
+            .position(|w| w.branch.as_deref() == Some("feat") && !w.has_worktree)
+            .unwrap();
+        do_sync(&mut t.cx, &session, &mut app, index);
+        assert_eq!(app.mode, Mode::List);
+        assert_eq!(app.status_kind, StatusKind::Success);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("fast-forwarded")
+        );
+        assert_eq!(repo.git(&["rev-parse", "feat"]).trim(), tip);
     }
 
     #[test]

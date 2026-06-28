@@ -54,10 +54,13 @@ pub struct Worktree {
     /// Recorded pull request; `None` when none.
     pub pr: Option<Pr>,
     /// Whether a checked-out worktree exists for this row. `false` marks a
-    /// TUI-only "branch row": a local branch with no worktree, listed beneath the
-    /// real worktrees with its ahead/behind relative to its base (issue #47). Not
-    /// part of the §7 JSON schema (where every row is a real worktree), so it is
-    /// skipped during serialization and always `true` for serialized rows.
+    /// "branch row": a local branch with no worktree, listed beneath the real
+    /// worktrees with its ahead/behind relative to its base (issue #47). Not part
+    /// of the §7 JSON schema (where every row is a real worktree), so it is skipped
+    /// during serialization. Branch rows are normally TUI-only, but `wt sync
+    /// <branch>` of a worktree-less branch emits one in `--json`; such a row's
+    /// `path` is the `branch://<branch>` sentinel rather than a filesystem path,
+    /// since no checkout exists.
     #[serde(skip)]
     pub has_worktree: bool,
     /// Up to the last five commits, for the TUI detail pane only. Not part of
