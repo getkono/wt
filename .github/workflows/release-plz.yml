@@ -108,7 +108,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # Key the cache by target. Both Linux musl targets run on the same
+      # ubuntu-latest runner, and rust-cache's default key omits the target — so
+      # without this they share one cache. The aarch64 job would then restore the
+      # x86_64 job's host-compiled build scripts and fail inside the older aarch64
+      # `cross` container with "GLIBC_2.28 not found" (cross-rs/cross#724).
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Install cross
         if: matrix.use_cross
         uses: taiki-e/install-action@cross
