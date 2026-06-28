@@ -19,11 +19,14 @@
 # commits piling up after v1.0.0. Requires release-plz >= 0.3.151 (the action ships a
 # newer one). https://release-plz.dev/docs/config
 #
-# Skipping `cargo publish` is controlled separately by `publish = false` in
-# `Cargo.toml` — contrary to the docs, `git_only` does NOT reliably skip publishing
-# (release-plz#2693), and without it the release job dies on a missing
-# CARGO_REGISTRY_TOKEN before it can cut the tag.
+# `publish = false` skips `cargo publish` while STILL cutting the tag + GitHub Release.
+# It is REQUIRED with git_only: release-plz treats `git_only = true` + `publish = true`
+# (the default) as mutually exclusive, and without it the release job tries to publish
+# and dies on a missing CARGO_REGISTRY_TOKEN. Set it HERE, not in Cargo.toml — a
+# Cargo.toml `publish = false` marks the package fully private and release-plz then
+# reports "nothing to release" and never cuts the tag.
 git_only = true
+publish = false
 
 # Maintain CHANGELOG.md from Conventional Commits (keep-a-changelog format).
 changelog_update = true
