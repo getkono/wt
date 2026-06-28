@@ -10,9 +10,13 @@ homepage = "https://github.com/getkono/wt"
 readme = "README.md"
 keywords = ["git", "worktree", "cli", "tui", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
-# Keep the published tarball to what's needed to build the crate. (Publishing is
-# currently disabled in release-plz.toml — see RELEASING.md — but this keeps the
-# crate ready for crates.io once `sendit` is published and the name is settled.)
+# crates.io publishing is intentionally OFF (the crate name `wt` is still taken — see
+# RELEASING.md). This is the reliable switch: release-plz reads it from cargo metadata
+# and skips `cargo publish`, whereas `git_only` alone does NOT (release-plz#2693). It
+# still cuts the tag + GitHub Release. Flip to `true` (and rename the crate) to publish.
+publish = false
+# Keep the published tarball to what's needed to build the crate, so the crate stays
+# ready for crates.io once the name is settled.
 exclude = [
     "/.github",
     "/AGENTS.md",
