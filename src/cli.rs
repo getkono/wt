@@ -173,7 +173,8 @@ impl CheckoutArgs {
 /// Arguments for `wt sync`.
 #[derive(Debug, Args)]
 pub(crate) struct SyncArgs {
-    /// Worktree query (default: the current worktree).
+    /// Worktree or branch query (default: the current worktree). A branch with no
+    /// worktree is synced in place by moving its ref (fast-forward / push).
     pub(crate) query: Option<String>,
     /// Sync every worktree.
     #[arg(long)]

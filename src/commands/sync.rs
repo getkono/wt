@@ -9,7 +9,7 @@
 //! `[submodules] init` policy). The core (`sync_worktree`) is shared with the TUI
 //! (`tui::runtime`), mirroring `commands::checkout`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cli::SyncArgs;
 use crate::commands::checkout::fetch_remote_best_effort;
@@ -22,8 +22,8 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::{branch_ref, current_branch, is_ancestor, ops, status_of, upstream_of};
-use crate::worktree_service::build_worktrees;
+use crate::git::{branch_ref, current_branch, enumerate, is_ancestor, ops, status_of, upstream_of};
+use crate::worktree_service::{build_rows, build_worktrees};
 
 /// What a sync did to a worktree's branch, for the caller's messaging (CLI + TUI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +36,9 @@ pub(crate) enum SyncOutcome {
     Pushed,
     /// The branch has diverged from its upstream; refused (no rewrite, no push).
     Diverged,
+    /// A worktree-less branch has diverged from its upstream; it cannot be merged
+    /// in place (it has no working tree), so the user must check it out first.
+    DivergedNoWorktree,
     /// No present upstream is configured (or detached HEAD); nothing to sync with.
     NoUpstream,
     /// A fast-forward was needed but the worktree is dirty; refused.
@@ -51,7 +54,14 @@ pub(crate) fn run(cx: &mut Cx, args: &SyncArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
-    let worktrees = build_worktrees(&session.repo, git)?;
+    // A `<query>` may name a worktree-less branch, so resolve over branch rows too
+    // (issue #47/#63); `--all` and the default stay worktrees-only so `--all` does
+    // not mass-sync every local branch.
+    let worktrees = if args.query.is_some() {
+        build_rows(&session.repo, git)?
+    } else {
+        build_worktrees(&session.repo, git)?
+    };
 
     let selected: Vec<usize> = if args.all {
         (0..worktrees.len()).collect()
@@ -82,15 +92,23 @@ pub(crate) fn run(cx: &mut Cx, args: &SyncArgs, json: bool) -> Result<u8> {
             let _ = cx.err.line(&format!("skipping missing worktree {label}"));
             continue;
         }
-        let outcome = sync_worktree(
-            cx,
-            git,
-            &session,
-            &worktree.path,
-            submodule_override,
-            !json,
-            args.no_push,
-        )?;
+        let outcome = if worktree.has_worktree {
+            sync_worktree(
+                cx,
+                git,
+                &session,
+                &worktree.path,
+                submodule_override,
+                !json,
+                args.no_push,
+            )?
+        } else {
+            // A worktree-less branch row: move the branch ref in place.
+            match &worktree.branch {
+                Some(branch) => sync_branch(cx, git, &session, branch, args.no_push)?,
+                None => continue,
+            }
+        };
         if !json {
             cx.out
                 .line(&format!("{label}: {}", outcome_note(outcome)))?;
@@ -99,8 +117,10 @@ pub(crate) fn run(cx: &mut Cx, args: &SyncArgs, json: bool) -> Result<u8> {
 
     if json {
         // Re-read post-sync state so the emitted rows reflect the new ahead/behind.
+        // Include branch rows so a synced worktree-less branch is found by its
+        // stable `branch://<branch>` virtual path.
         let repo = Repo::discover(&session.primary_root)?;
-        let fresh = build_worktrees(&repo, git)?;
+        let fresh = build_rows(&repo, git)?;
         for &index in &selected {
             let target = &worktrees[index].path;
             if let Some(worktree) = fresh.iter().find(|w| same_path(&w.path, target)) {
@@ -194,6 +214,91 @@ pub(crate) fn sync_worktree(
     }
 }
 
+/// Syncs a worktree-less `branch` by moving its ref directly: fetch, fast-forward
+/// the local ref to its upstream when strictly behind, push when strictly ahead,
+/// and refuse on divergence (a non-checked-out branch has no working tree to merge
+/// in). The branch must not be checked out — moving a checked-out branch's ref is
+/// refused with guidance to sync from that worktree instead. Refs and config are
+/// repo-global, so every step runs from the primary root. Shared with the TUI's
+/// branch-row sync, mirroring [`sync_worktree`] (issue #47/#63).
+pub(crate) fn sync_branch(
+    cx: &mut Cx,
+    git: &dyn GitCli,
+    session: &Session,
+    branch: &str,
+    no_push: bool,
+) -> Result<SyncOutcome> {
+    let remote = session.config.pr_default_remote.clone();
+    let root = &session.primary_root;
+
+    // A branch checked out in a worktree has a working tree and a locked ref; we
+    // must not move it from here. Point the user at that worktree to sync in place.
+    if let Some(path) = checked_out_at(git, root, branch)? {
+        return Err(Error::operation(format!(
+            "{branch} is checked out at {}; sync from that worktree",
+            path.display()
+        )));
+    }
+
+    // A present upstream must be configured to sync against.
+    let repo = Repo::discover(root)?;
+    if upstream_of(repo.gix(), branch).is_none_or(|u| u.is_gone) {
+        return Ok(SyncOutcome::NoUpstream);
+    }
+
+    // Best-effort fetch so the tracking ref reflects the remote (offline-tolerant).
+    let _ = fetch_remote_best_effort(cx, git, repo.gix(), root, &remote);
+
+    // Re-discover so the freshly fetched tracking ref is visible.
+    let repo = Repo::discover(root)?;
+    let Some(upstream) = upstream_of(repo.gix(), branch).filter(|u| !u.is_gone) else {
+        return Ok(SyncOutcome::NoUpstream);
+    };
+
+    let full_ref = branch_ref(branch);
+    let behind = is_ancestor(repo.gix(), &full_ref, &upstream.tracking_ref);
+    let ahead = is_ancestor(repo.gix(), &upstream.tracking_ref, &full_ref);
+    match (ahead, behind) {
+        // Strictly behind: fast-forward the ref in place (no working tree to touch,
+        // so no dirty guard and no submodule step). `git branch -f` would itself
+        // refuse a checked-out branch — a backstop to the guard above.
+        (false, true) => {
+            ops::set_branch_ref(git, root, branch, &upstream.tracking_ref)?;
+            Ok(SyncOutcome::FastForwarded)
+        }
+        // Diverged: a worktree-less branch cannot be merged in place — guide the
+        // user to check it out (never rewrite history, never push).
+        (false, false) => {
+            let _ = cx.err.line(&format!(
+                "warning: {branch} has diverged from {}; check it out in a worktree to rebase or merge manually",
+                upstream.display
+            ));
+            Ok(SyncOutcome::DivergedNoWorktree)
+        }
+        // Strictly ahead: push (a push never touches a working tree); `--no-push`
+        // makes sync pull-only.
+        (true, false) => {
+            if no_push {
+                Ok(SyncOutcome::UpToDate)
+            } else {
+                push_branch(cx, git, root, &remote, branch)
+            }
+        }
+        // Equal tips (each is an ancestor of the other): nothing to do.
+        (true, true) => Ok(SyncOutcome::UpToDate),
+    }
+}
+
+/// The path of the worktree that has `branch` checked out, or `None` if no
+/// worktree does. Bare entries (no working directory) never count. Used to refuse
+/// moving a checked-out branch's ref from elsewhere.
+fn checked_out_at(git: &dyn GitCli, root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(enumerate(git, root)?
+        .into_iter()
+        .find(|w| !w.is_bare && w.branch.as_deref() == Some(branch))
+        .map(|w| w.path))
+}
+
 /// Pushes `branch` to `remote`, classifying a rejected push as a sentinel
 /// outcome (never an error) so `--all` keeps going. The rejection reason is
 /// written to stderr.
@@ -258,6 +363,7 @@ fn outcome_note(outcome: SyncOutcome) -> &'static str {
         SyncOutcome::FastForwarded => "fast-forwarded",
         SyncOutcome::Pushed => "pushed",
         SyncOutcome::Diverged => "diverged (resolve manually)",
+        SyncOutcome::DivergedNoWorktree => "diverged (check out to merge manually)",
         SyncOutcome::NoUpstream => "no upstream",
         SyncOutcome::Dirty => "dirty (commit or stash first)",
         SyncOutcome::PushRejected => "push rejected",
@@ -270,6 +376,7 @@ pub(crate) fn sync_suffix(outcome: SyncOutcome) -> &'static str {
         SyncOutcome::FastForwarded => " (fast-forwarded)",
         SyncOutcome::Pushed => " (pushed)",
         SyncOutcome::Diverged => " (diverged from origin)",
+        SyncOutcome::DivergedNoWorktree => " (diverged — check out to merge manually)",
         SyncOutcome::NoUpstream => " (no upstream)",
         SyncOutcome::Dirty => " (dirty — commit/stash first)",
         SyncOutcome::PushRejected => " (push rejected)",
@@ -644,5 +751,189 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }));
+    }
+
+    // --- worktree-less branch sync (issue #47/#63) ---
+
+    /// Calls the worktree-less branch core against `repo` for `branch`.
+    fn sync_branch_call(
+        repo: &TestRepo,
+        branch: &str,
+        no_push: bool,
+    ) -> (TestCx, Result<SyncOutcome>) {
+        let mut t = test_cx(&[], repo.root().to_str().unwrap());
+        let git = t.cx.git.clone();
+        let session = open_session(&t.cx, git.as_ref()).unwrap();
+        let res = super::sync_branch(&mut t.cx, git.as_ref(), &session, branch, no_push);
+        (t, res)
+    }
+
+    /// A repo left on `main` with a worktree-less `feat` tracking `origin/feat` and
+    /// strictly behind it (set up to fast-forward the ref on sync).
+    fn repo_branch_behind() -> (TestRepo, TestRepo) {
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        repo.git(&["push", "-q", "-u", "origin", "main"]);
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.git(&["push", "-q", "-u", "origin", "feat"]);
+        let base = repo.git(&["rev-parse", "feat"]).trim().to_string();
+        repo.write("f.txt", "advanced\n");
+        repo.commit_all("advanced feat");
+        repo.git(&["push", "-q", "origin", "feat"]);
+        repo.git(&["checkout", "-q", "main"]);
+        // Rewind local feat so it is strictly behind origin/feat (it is not checked
+        // out, so the ref can be moved without a worktree).
+        repo.git(&["branch", "-f", "feat", &base]);
+        (repo, bare)
+    }
+
+    /// A repo left on `main` with a worktree-less `feat` one commit ahead of
+    /// `origin/feat`.
+    fn repo_branch_ahead() -> (TestRepo, TestRepo) {
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        repo.git(&["push", "-q", "-u", "origin", "main"]);
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.git(&["push", "-q", "-u", "origin", "feat"]);
+        repo.write("g.txt", "local\n");
+        repo.commit_all("local feat commit");
+        repo.git(&["checkout", "-q", "main"]);
+        (repo, bare)
+    }
+
+    /// A repo left on `main` with a worktree-less `feat` diverged from
+    /// `origin/feat` (each has a unique commit atop a common base).
+    fn repo_branch_diverged() -> (TestRepo, TestRepo) {
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        repo.git(&["push", "-q", "-u", "origin", "main"]);
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.git(&["push", "-q", "-u", "origin", "feat"]);
+        let base = repo.git(&["rev-parse", "feat"]).trim().to_string();
+        repo.write("o.txt", "origin side\n");
+        repo.commit_all("origin feat commit");
+        repo.git(&["push", "-q", "origin", "feat"]);
+        repo.git(&["reset", "-q", "--hard", &base]);
+        repo.write("l.txt", "local side\n");
+        repo.commit_all("local feat commit");
+        repo.git(&["checkout", "-q", "main"]);
+        (repo, bare)
+    }
+
+    /// A repo left on `main` with a worktree-less `feat` equal to `origin/feat`.
+    fn repo_branch_up_to_date() -> (TestRepo, TestRepo) {
+        let bare = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        repo.git(&["remote", "add", "origin", bare.root().to_str().unwrap()]);
+        repo.git(&["push", "-q", "-u", "origin", "main"]);
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.git(&["push", "-q", "-u", "origin", "feat"]);
+        repo.git(&["checkout", "-q", "main"]);
+        (repo, bare)
+    }
+
+    #[test]
+    fn branch_fast_forwards_when_behind() {
+        let (repo, _bare) = repo_branch_behind();
+        let (_t, res) = sync_branch_call(&repo, "feat", false);
+        assert_eq!(res.unwrap(), SyncOutcome::FastForwarded);
+        // The local ref was moved up to the tracking ref (no worktree involved).
+        assert_eq!(
+            repo.git(&["rev-parse", "feat"]).trim(),
+            repo.git(&["rev-parse", "refs/remotes/origin/feat"]).trim()
+        );
+    }
+
+    #[test]
+    fn branch_pushes_when_ahead() {
+        let (repo, bare) = repo_branch_ahead();
+        let local = repo.git(&["rev-parse", "feat"]).trim().to_string();
+        let (_t, res) = sync_branch_call(&repo, "feat", false);
+        assert_eq!(res.unwrap(), SyncOutcome::Pushed);
+        assert_eq!(bare.git(&["rev-parse", "feat"]).trim(), local);
+    }
+
+    #[test]
+    fn branch_ahead_with_no_push_is_up_to_date() {
+        let (repo, bare) = repo_branch_ahead();
+        let before = bare.git(&["rev-parse", "feat"]).trim().to_string();
+        let (_t, res) = sync_branch_call(&repo, "feat", true);
+        assert_eq!(res.unwrap(), SyncOutcome::UpToDate);
+        assert_eq!(bare.git(&["rev-parse", "feat"]).trim(), before);
+    }
+
+    #[test]
+    fn branch_diverged_refuses_and_warns() {
+        let (repo, bare) = repo_branch_diverged();
+        let local = repo.git(&["rev-parse", "feat"]).trim().to_string();
+        let origin_before = bare.git(&["rev-parse", "feat"]).trim().to_string();
+        let (t, res) = sync_branch_call(&repo, "feat", false);
+        assert_eq!(res.unwrap(), SyncOutcome::DivergedNoWorktree);
+        assert!(t.err.contents().contains("diverged"));
+        assert!(t.err.contents().contains("check it out"));
+        // No rewrite and no push.
+        assert_eq!(repo.git(&["rev-parse", "feat"]).trim(), local);
+        assert_eq!(bare.git(&["rev-parse", "feat"]).trim(), origin_before);
+    }
+
+    #[test]
+    fn branch_up_to_date_when_equal() {
+        let (repo, _bare) = repo_branch_up_to_date();
+        let (_t, res) = sync_branch_call(&repo, "feat", false);
+        assert_eq!(res.unwrap(), SyncOutcome::UpToDate);
+    }
+
+    #[test]
+    fn branch_without_upstream_is_no_upstream() {
+        let repo = TestRepo::init();
+        repo.git(&["branch", "topic"]); // local-only, not checked out
+        let (_t, res) = sync_branch_call(&repo, "topic", false);
+        assert_eq!(res.unwrap(), SyncOutcome::NoUpstream);
+    }
+
+    #[test]
+    fn branch_checked_out_elsewhere_is_refused_with_path() {
+        // A branch that turns out to be checked out in a worktree must not have its
+        // ref moved from here; the guard refuses and names the worktree path.
+        let repo = TestRepo::init();
+        repo.add_worktree("feat", "../wt-feat");
+        let (_t, res) = sync_branch_call(&repo, "feat", false);
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("checked out"), "got {msg:?}");
+        assert!(msg.contains("wt-feat"), "got {msg:?}");
+    }
+
+    #[test]
+    fn run_syncs_worktree_less_branch_by_query() {
+        let (repo, _bare) = repo_branch_behind();
+        let mut t = test_cx(&[], repo.root().to_str().unwrap());
+        let code = super::run(&mut t.cx, &args(Some("feat"), false, false), false).unwrap();
+        assert_eq!(code, 0);
+        assert!(t.out.contents().contains("fast-forwarded"));
+        assert_eq!(
+            repo.git(&["rev-parse", "feat"]).trim(),
+            repo.git(&["rev-parse", "refs/remotes/origin/feat"]).trim()
+        );
+    }
+
+    #[test]
+    fn run_json_emits_branch_row_for_worktree_less_branch() {
+        let (repo, _bare) = repo_branch_up_to_date();
+        let mut t = test_cx(&[], repo.root().to_str().unwrap());
+        let code = super::run(&mut t.cx, &args(Some("feat"), false, false), true).unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(t.out.contents().trim()).unwrap();
+        assert_eq!(v["branch"], serde_json::json!("feat"));
+        // A worktree-less branch has no checkout, so its path is the sentinel.
+        assert_eq!(v["path"], serde_json::json!("branch://feat"));
+    }
+
+    #[test]
+    fn outcome_note_covers_diverged_no_worktree() {
+        assert!(super::outcome_note(SyncOutcome::DivergedNoWorktree).contains("check out"));
+        assert!(super::sync_suffix(SyncOutcome::DivergedNoWorktree).contains("check out"));
     }
 }
