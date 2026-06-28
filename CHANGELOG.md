@@ -11,6 +11,18 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/getkono/wt/releases/tag/v1.1.0) - 2026-06-27
+
+### Added
+
+- `wt drop` removes the current worktree.
+
+### Fixed
+
+- `shell-init`: run `wt` in the elvish navigation-capture path.
+- TUI: require a real terminal before entering raw mode, and restore the
+  terminal when setup fails after raw mode was already enabled.
+
 ## [1.0.0](https://github.com/getkono/wt/releases/tag/v1.0.0) - 2026-06-25
 
 Initial public release of `wt`, a single-binary CLI + TUI for managing Git

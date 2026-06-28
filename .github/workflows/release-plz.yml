@@ -49,8 +49,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
 
   # Open/update the release PR (bumped version + changelog) for the next release.
+  # Runs AFTER the release job: release-plz determines the next version by diffing
+  # the working tree against the last released tag, so the just-cut tag must already
+  # exist — otherwise this job diffs against a stale tag (and previously failed when
+  # that older tag still carried the unpackageable `sendit` git dependency).
   release-plz-pr:
     name: Release-plz PR
+    needs: release-plz-release
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'getkono' && github.event_name == 'push' }}
     permissions:
