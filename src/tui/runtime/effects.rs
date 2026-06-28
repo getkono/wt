@@ -192,6 +192,19 @@ pub(super) fn run_sync_command(
         .map_err(|e| e.to_string())
 }
 
+/// Syncs a worktree-less `branch` by moving its ref from the repo root, rebuilding
+/// the session from the job's `Cx` (issue #47/#63). Mirrors [`run_sync_command`]
+/// but for a branch with no checkout.
+pub(super) fn run_sync_branch_command(
+    cx: &mut Cx,
+    branch: &str,
+) -> std::result::Result<commands::sync::SyncOutcome, String> {
+    let git = cx.git.clone();
+    let session = open_session(cx, git.as_ref()).map_err(|e| e.to_string())?;
+    commands::sync::sync_branch(cx, git.as_ref(), &session, branch, false)
+        .map_err(|e| e.to_string())
+}
+
 /// Initializes the submodules in `worktree_dir` recursively (issue #50), after
 /// the user confirmed the post-create modal. Best-effort: a failure is reported
 /// as a status error, not propagated.
@@ -372,25 +385,30 @@ pub(crate) fn do_checkout_branch(
     apply_outcome(cx, session, app, outcome);
 }
 
-/// Syncs the worktree at `index` in place (fetch + ff/push), then refreshes and
-/// stays in the list. Outcomes (and errors) surface in the status bar.
+/// Syncs the row at `index` (a worktree in place, or a worktree-less branch by
+/// ref), then refreshes and stays in the list. Outcomes (and errors) surface in
+/// the status bar. Dispatches on `has_worktree` exactly as [`begin_job`] does.
 #[cfg(test)]
 pub(crate) fn do_sync(cx: &mut Cx, session: &Session, app: &mut App, index: usize) {
     let Some(worktree) = app.worktrees.get(index) else {
         return;
     };
-    let worktree_dir = worktree.path.clone();
     let label = worktree
         .branch
         .clone()
         .unwrap_or_else(|| "worktree".to_string());
-    let outcome = run_job(
-        JobCx::capture(cx),
+    let job = if worktree.has_worktree {
         Job::Sync {
-            worktree_dir,
+            worktree_dir: worktree.path.clone(),
             label,
-        },
-    );
+        }
+    } else {
+        let Some(branch) = worktree.branch.clone() else {
+            return;
+        };
+        Job::SyncBranch { branch, label }
+    };
+    let outcome = run_job(JobCx::capture(cx), job);
     apply_outcome(cx, session, app, outcome);
 }
 
@@ -607,9 +625,10 @@ pub(super) fn apply_sync(
     match result {
         Ok(outcome) => {
             let kind = match outcome {
-                SyncOutcome::Diverged | SyncOutcome::Dirty | SyncOutcome::PushRejected => {
-                    StatusKind::Error
-                }
+                SyncOutcome::Diverged
+                | SyncOutcome::DivergedNoWorktree
+                | SyncOutcome::Dirty
+                | SyncOutcome::PushRejected => StatusKind::Error,
                 _ => StatusKind::Success,
             };
             app.set_status(

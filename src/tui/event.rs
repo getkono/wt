@@ -321,11 +321,11 @@ impl App {
                 }
             }
             KeyAction::Sync => {
-                // Sync acts in place on a real worktree (fetch + ff/push), so it is
-                // a no-op on a worktree-less branch row (issue #47/#63).
-                if let Some(&index) = self.visible.get(self.selected)
-                    && self.worktrees[index].has_worktree
-                {
+                // Sync works on a real worktree (fetch + ff/push in place) and on a
+                // worktree-less branch row (fetch + move the ref / push from the
+                // repo root); the runtime picks the path by `has_worktree`
+                // (issue #47/#63).
+                if let Some(&index) = self.visible.get(self.selected) {
                     return Effect::Sync {
                         worktree_index: index,
                     };
@@ -880,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_acts_on_worktree_rows_and_is_noop_on_branch_rows() {
+    fn sync_acts_on_worktree_rows_and_branch_rows() {
         use crate::tui::app::testutil::branch_row;
         let mut a = app(&[("main", true), ("feat", false)]);
         // On a real worktree row, `y` yields a Sync effect for that row's index.
@@ -889,11 +889,22 @@ mod tests {
             a.handle_event(press(KeyCode::Char('y'))),
             Effect::Sync { worktree_index: 1 }
         );
-        // On a worktree-less branch row, `y` does nothing (issue #63).
+        // On a worktree-less branch row, `y` now also yields a Sync effect for that
+        // row's index; the runtime syncs it by branch name (issue #47/#63).
         a.worktrees.push(branch_row("topic"));
         a.apply_filter(String::new());
-        a.selected = a.visible.len() - 1;
-        assert_eq!(a.handle_event(press(KeyCode::Char('y'))), Effect::None);
+        let idx = a
+            .worktrees
+            .iter()
+            .position(|w| w.branch.as_deref() == Some("topic"))
+            .unwrap();
+        a.selected = a.visible.iter().position(|&i| i == idx).unwrap();
+        assert_eq!(
+            a.handle_event(press(KeyCode::Char('y'))),
+            Effect::Sync {
+                worktree_index: idx
+            }
+        );
         assert_eq!(a.mode, Mode::List);
     }
 
