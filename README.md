@@ -19,6 +19,15 @@ brew install getkono/tap/wt
 This pulls a prebuilt binary from the [getkono/homebrew-tap](https://github.com/getkono/homebrew-tap)
 tap (macOS arm64/x86_64 and Linux arm64/x86_64).
 
+#### Cargo (crates.io)
+
+The crate is published as [`kono-wt`](https://crates.io/crates/kono-wt) (the bare
+`wt` name was already taken); the installed binary is still `wt`.
+
+```bash
+cargo install kono-wt                               # installs `wt` to ~/.cargo/bin
+```
+
 #### From source
 
 You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on your
@@ -29,8 +38,6 @@ cargo install --git https://github.com/getkono/wt   # latest from master
 # or, from a checkout:
 cargo install --path .                              # installs `wt` to ~/.cargo/bin
 ```
-
-`wt` is not on crates.io yet (see [RELEASING.md](RELEASING.md)).
 
 Make sure `~/.cargo/bin` is on your `PATH`. Then enable shell integration
 (below) — that single step also gives you the best tab completion.

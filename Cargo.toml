@@ -1,5 +1,5 @@
 [package]
-name = "wt"
+name = "kono-wt"
 version = "1.1.0"
 edition = "2024"
 description = "A single-binary CLI + TUI for managing Git worktrees and their GitHub pull requests."
@@ -10,12 +10,11 @@ homepage = "https://github.com/getkono/wt"
 readme = "README.md"
 keywords = ["git", "worktree", "cli", "tui", "productivity"]
 categories = ["command-line-utilities", "development-tools"]
-# crates.io publishing is disabled in release-plz.toml (`publish = false`) because the
-# crate name `wt` is still taken — see RELEASING.md. Do NOT set `publish = false` here:
-# that marks the package fully private and release-plz then refuses to cut the tag
-# ("nothing to release"); the release-plz.toml knob skips `cargo publish` while still
-# cutting the tag + GitHub Release. This `exclude` keeps the crate ready for crates.io
-# once the name is settled.
+# Published to crates.io as `kono-wt`: the bare `wt` name is an unrelated 2020
+# placeholder (see RELEASING.md). The library and binary targets below are both
+# named `wt`, so the public API is still imported as `wt::…` and `cargo install
+# kono-wt` still produces a `wt` binary — only the crates.io package name differs.
+# `exclude` keeps dev/CI-only files out of the published tarball.
 exclude = [
     "/.github",
     "/AGENTS.md",
@@ -29,6 +28,17 @@ exclude = [
     "/mutants.out",
     "/mutants.out.old",
 ]
+
+# Keep the library importable as `wt`. Without this the package rename to
+# `kono-wt` would make the lib crate `kono_wt` and break `src/main.rs`'s `use wt::…`.
+[lib]
+name = "wt"
+path = "src/lib.rs"
+
+# Ship the binary as `wt`, independent of the crates.io package name.
+[[bin]]
+name = "wt"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive", "cargo", "wrap_help"] }
