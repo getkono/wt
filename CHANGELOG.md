@@ -11,6 +11,12 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.3.0](https://github.com/getkono/wt/compare/v1.2.0...v1.3.0) - 2026-07-01
+
+### Added
+
+- *(tui)* run background jobs concurrently with per-row spinners
+
 ## [1.2.0](https://github.com/getkono/wt/compare/v1.1.0...v1.2.0) - 2026-06-28
 
 ### Added
