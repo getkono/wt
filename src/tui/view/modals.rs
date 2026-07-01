@@ -759,3 +759,38 @@ pub(super) fn render_confirm_init_submodules(
         rect,
     );
 }
+
+/// Renders the confirm-quit dialog shown when the user quits while background
+/// jobs are still running (issue #46 overhaul): quitting abandons them (in-flight
+/// git subprocesses are killed, which can leave e.g. a partial submodule clone),
+/// so it asks first.
+pub(super) fn render_confirm_quit(app: &App, jobs: usize, frame: &mut Frame, area: Rect) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let plural = if jobs == 1 { "job" } else { "jobs" };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{jobs} background {plural}"), theme.warning()),
+            Span::raw(" still running."),
+        ]),
+        Line::from(Span::styled(
+            "Quitting now abandons them and may leave partial work.",
+            theme.hint_label(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("Quit anyway? ["),
+            Span::styled("y", theme.warning()),
+            Span::raw("/N]"),
+        ]),
+    ];
+
+    let height = lines.len() as u16 + 2;
+    let rect = centered(area, 72, height);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(Span::styled("confirm quit", theme.error())))
+            .wrap(Wrap { trim: false }),
+        rect,
+    );
+}

@@ -34,6 +34,7 @@ pub(super) fn render_list(app: &App, frame: &mut Frame, area: Rect) {
         .map(|&i| {
             let worktree = &app.worktrees[i];
             let loaded = app.is_loaded(worktree);
+            let job = app.job_for(worktree).map(|j| j.label.as_str());
             let item = ListItem::new(list_row(
                 worktree,
                 &glyphs,
@@ -41,6 +42,8 @@ pub(super) fn render_list(app: &App, frame: &mut Frame, area: Rect) {
                 loaded,
                 app.show_untracked,
                 now,
+                job,
+                app.spinner_frame,
             ));
             // Missing worktrees and worktree-less branch rows (issue #47) are both
             // secondary, so they render dimmed.
@@ -112,7 +115,11 @@ fn sort_label(sort: &SortSpec) -> String {
     format!("{key} {arrow}")
 }
 
-/// Builds one list-pane row as colored spans.
+/// Builds one list-pane row as colored spans. When a background job (`job`) is
+/// attached to the row, its animated spinner replaces the status marker and its
+/// label is appended, so the work is visible in place without a blocking overlay
+/// (issue #46 overhaul).
+#[allow(clippy::too_many_arguments)]
 fn list_row(
     worktree: &Worktree,
     glyphs: &Glyphs,
@@ -120,8 +127,13 @@ fn list_row(
     loaded: bool,
     show_untracked: bool,
     now: i64,
+    job: Option<&str>,
+    spinner_frame: usize,
 ) -> Line<'static> {
-    let (status, status_style) = if !worktree.has_worktree {
+    let (status, status_style) = if job.is_some() {
+        // A background job is running on this row: animate the status marker.
+        (glyphs.spinner_frame(spinner_frame), theme.spinner())
+    } else if !worktree.has_worktree {
         // A worktree-less branch row (issue #47): a branch with no checkout.
         (glyphs.branchless(), theme.branchless())
     } else if worktree.is_current {
@@ -158,10 +170,19 @@ fn list_row(
         ),
         Span::raw("  "),
     ];
-    spans.extend(ahead_behind_spans(worktree, theme, loaded, glyphs));
-    spans.push(Span::raw("  "));
-    spans.extend(commit_spans(worktree, theme, loaded, glyphs, now));
-    spans.push(Span::raw("  "));
-    spans.extend(pr_spans(worktree, theme, loaded, glyphs));
+    // While a job runs on the row, its label stands in for the async cells (which
+    // may be mid-change) rather than crowding them; otherwise render the cells.
+    if let Some(label) = job {
+        spans.push(Span::styled(
+            format!("{label}…"),
+            theme.spinner().add_modifier(Modifier::DIM),
+        ));
+    } else {
+        spans.extend(ahead_behind_spans(worktree, theme, loaded, glyphs));
+        spans.push(Span::raw("  "));
+        spans.extend(commit_spans(worktree, theme, loaded, glyphs, now));
+        spans.push(Span::raw("  "));
+        spans.extend(pr_spans(worktree, theme, loaded, glyphs));
+    }
     Line::from(spans)
 }

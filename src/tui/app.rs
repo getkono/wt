@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::agent::{AgentModel, Effort};
 use crate::keys::Keymap;
 use crate::model::{Column, SortKey, SortSpec, Worktree};
+use crate::tui::event::Effect;
 use crate::tui::options::OptionList;
 use crate::tui::theme::Palette;
 use crate::util::fuzzy;
@@ -55,6 +56,13 @@ pub enum Mode {
     /// default (issue #50): initialize them recursively, or leave them. Defaults
     /// to yes.
     ConfirmInitSubmodules(InitSubmodulesState),
+    /// Confirm dialog shown when the user quits while background jobs are still
+    /// running: quit anyway (abandoning them) or cancel. Carries how many jobs
+    /// were in flight, for the prompt text.
+    ConfirmQuit {
+        /// The number of background jobs running when the quit was requested.
+        jobs: usize,
+    },
     /// Help overlay.
     Help,
 }
@@ -80,15 +88,50 @@ pub enum StatusKind {
     Error,
 }
 
-/// An in-flight background action (issue #46): the label to display and the
-/// animation frame. While set, the TUI shows a centered spinner overlay and
-/// ignores input until the action completes.
+/// Identifies the target of a background job so its per-row spinner can be found
+/// and so a second action on the same target can be refused (issue #46 overhaul).
+/// Keyed by the row's stable identity (path or branch name) so it survives a
+/// re-sort/refresh, mirroring [`App::loaded_paths`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BusyState {
-    /// The human-facing label, e.g. `Removing feat/foo` or `Creating feat/bar`.
+pub enum JobKey {
+    /// A job targeting the worktree at this path (remove, sync, checkout, submodule
+    /// init).
+    Path(PathBuf),
+    /// A job targeting the worktree-less branch row with this name (delete branch,
+    /// materialize, branch-row sync).
+    Branch(String),
+    /// A job with no existing row yet (creating a brand-new worktree, or checking
+    /// out a PR into a new branch): it has nothing to attach a per-row spinner to,
+    /// so it shows only in the status-bar summary.
+    New(String),
+}
+
+/// An in-flight background action (issue #46 overhaul). Multiple jobs run
+/// concurrently, each attached to its target row via [`JobKey`]; the shared
+/// [`App::spinner_frame`] animates every row spinner in sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveJob {
+    /// The target this job acts on.
+    pub key: JobKey,
+    /// The human-facing label, e.g. `Removing feat/foo` or `Initializing submodules`.
     pub label: String,
-    /// The monotonic spinner frame counter, advanced on each animation tick.
-    pub frame: usize,
+}
+
+/// The interaction context a finished job is allowed to drive a mode change from,
+/// so a background job never clobbers an unrelated modal the user opened while it
+/// ran (issue #46 overhaul). A job may transition the mode only when the user is
+/// idle (List/Filter) or still in the job's own single-instance modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobHome {
+    /// The job's confirm dialog already closed to the list before it began, so it
+    /// may act only when the user is idle.
+    List,
+    /// The create modal stays open (submitting) during a create job.
+    Create,
+    /// The checkout picker stays open during an in-place checkout.
+    Checkout,
+    /// The PR picker stays open during a PR checkout.
+    PrPicker,
 }
 
 /// The create-worktree prompt state.
@@ -279,10 +322,6 @@ pub struct App {
     pub quit: bool,
     /// Set to the chosen path when the user switches (Enter).
     pub chosen: Option<PathBuf>,
-    /// When set, checking out a PR sets `chosen` and exits the loop (switching
-    /// into the new worktree) instead of returning to the list. Used by the
-    /// `wt pr` no-argument picker entry; the `p`-key picker leaves it `false`.
-    pub exit_on_pr_checkout: bool,
     /// Worktree paths whose async fields have loaded; rows not in this set show
     /// the per-row spinner (spec §10). Keyed by path so it survives re-sorting.
     loaded_paths: std::collections::HashSet<PathBuf>,
@@ -292,10 +331,17 @@ pub struct App {
     pub status_kind: StatusKind,
     /// Set when the terminal became too small to continue (spec §10).
     pub too_small: bool,
-    /// An in-flight background action (issue #46): `Some` while a shell-based
-    /// action runs on a background task, driving the spinner overlay and gating
-    /// input. `None` when idle.
-    pub busy: Option<BusyState>,
+    /// The in-flight background actions (issue #46 overhaul): each runs on its own
+    /// task and shows a per-row spinner; input is never gated. Empty when idle.
+    pub jobs: Vec<ActiveJob>,
+    /// The shared spinner animation frame, advanced on each tick while any job is
+    /// in flight; every per-row job spinner reads it so they animate in sync.
+    pub spinner_frame: usize,
+    /// Follow-up background actions queued by a just-applied job outcome (e.g. a
+    /// created worktree with uninitialized submodules under the `always` policy),
+    /// drained by the event loop after `apply_outcome` and spawned as their own
+    /// jobs. Kept off the render path.
+    pub pending_jobs: Vec<Effect>,
     /// Local + remote-tracking branch names offered in the create-prompt
     /// options dropdown and used to tab-complete the base ref (best-effort;
     /// empty when enumeration fails).
@@ -343,7 +389,9 @@ impl App {
             status_message: None,
             status_kind: StatusKind::Info,
             too_small: false,
-            busy: None,
+            jobs: Vec::new(),
+            spinner_frame: 0,
+            pending_jobs: Vec::new(),
             branches: Vec::new(),
             default_base: None,
             worktrees,
@@ -367,7 +415,6 @@ impl App {
             palette: config.palette,
             quit: false,
             chosen: None,
-            exit_on_pr_checkout: false,
         }
     }
 
@@ -377,31 +424,88 @@ impl App {
         self.status_kind = kind;
     }
 
-    /// Marks a background action in flight with the given label (issue #46),
-    /// resetting the spinner to its first frame.
-    pub fn begin_busy(&mut self, label: impl Into<String>) {
-        self.busy = Some(BusyState {
+    /// Registers a background job on `key` with a display label (issue #46
+    /// overhaul). If a job already targets `key` it is replaced (the caller
+    /// guards against conflicts first via [`App::has_job`]).
+    pub fn begin_job(&mut self, key: JobKey, label: impl Into<String>) {
+        self.jobs.retain(|j| j.key != key);
+        self.jobs.push(ActiveJob {
+            key,
             label: label.into(),
-            frame: 0,
         });
     }
 
-    /// Advances the busy spinner one frame (called on each animation tick); a
-    /// no-op when no action is in flight.
-    pub fn tick_busy(&mut self) {
-        if let Some(busy) = &mut self.busy {
-            busy.frame = busy.frame.wrapping_add(1);
+    /// Removes the job targeting `key` once it completes; a no-op if absent.
+    pub fn finish_job(&mut self, key: &JobKey) {
+        self.jobs.retain(|j| &j.key != key);
+    }
+
+    /// Whether a background job already targets `key` (used to refuse a second,
+    /// conflicting action on the same row).
+    pub fn has_job(&self, key: &JobKey) -> bool {
+        self.jobs.iter().any(|j| &j.key == key)
+    }
+
+    /// The active job attached to `worktree`'s row, if any, so the list can render
+    /// its per-row spinner and label. Matches a `Path` job by path and a `Branch`
+    /// job by the branch-row's name; `New` jobs attach to no row.
+    pub fn job_for(&self, worktree: &Worktree) -> Option<&ActiveJob> {
+        self.jobs.iter().find(|j| match &j.key {
+            JobKey::Path(p) => worktree.has_worktree && &worktree.path == p,
+            JobKey::Branch(b) => {
+                !worktree.has_worktree && worktree.branch.as_deref() == Some(b.as_str())
+            }
+            JobKey::New(_) => false,
+        })
+    }
+
+    /// Advances the shared spinner one frame (called on each animation tick); a
+    /// no-op when no job is in flight.
+    pub fn tick_spinner(&mut self) {
+        if !self.jobs.is_empty() {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }
     }
 
-    /// Clears the busy state once the background action completes.
-    pub fn end_busy(&mut self) {
-        self.busy = None;
+    /// Whether any background job is in flight (keeps the animation ticker awake).
+    pub fn any_jobs(&self) -> bool {
+        !self.jobs.is_empty()
     }
 
-    /// Whether a background action is in flight (input is gated while set).
-    pub fn is_busy(&self) -> bool {
-        self.busy.is_some()
+    /// A compact status-bar summary of the in-flight jobs — the count and the
+    /// first job's label — so background work stays visible even when its row is
+    /// scrolled off. `None` when idle.
+    pub fn job_summary(&self) -> Option<String> {
+        let first = self.jobs.first()?;
+        Some(if self.jobs.len() == 1 {
+            format!("{}…", first.label)
+        } else {
+            format!("{} (+{} more)…", first.label, self.jobs.len() - 1)
+        })
+    }
+
+    /// Whether a finished job in `home` context may drive a mode change without
+    /// clobbering an unrelated modal the user opened while it ran (issue #46
+    /// overhaul): true when the user is idle or still in the job's own modal.
+    pub fn may_apply_mode(&self, home: JobHome) -> bool {
+        matches!(self.mode, Mode::List | Mode::Filter)
+            || match home {
+                JobHome::List => false,
+                JobHome::Create => matches!(self.mode, Mode::Create(_)),
+                JobHome::Checkout => matches!(self.mode, Mode::Checkout(_)),
+                JobHome::PrPicker => matches!(self.mode, Mode::PrPicker(_)),
+            }
+    }
+
+    /// Queues a follow-up background action for the loop to spawn after the
+    /// current outcome is applied (e.g. submodule init after a create).
+    pub fn queue_job(&mut self, effect: Effect) {
+        self.pending_jobs.push(effect);
+    }
+
+    /// Drains the queued follow-up actions (issue #46 overhaul).
+    pub fn take_pending_jobs(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.pending_jobs)
     }
 
     /// The currently selected worktree, if any.
@@ -566,7 +670,7 @@ impl App {
     }
 
     /// Selects the visible row whose worktree path matches `path`.
-    fn select_path(&mut self, path: &std::path::Path) {
+    pub fn select_path(&mut self, path: &std::path::Path) {
         if let Some(pos) = self
             .visible
             .iter()
@@ -841,24 +945,90 @@ mod tests {
     }
 
     #[test]
-    fn busy_lifecycle_begin_tick_end() {
-        let mut a = app(&[("a", true)]);
-        assert!(!a.is_busy());
-        a.begin_busy("Removing feat/foo");
-        assert!(a.is_busy());
-        assert_eq!(a.busy.as_ref().unwrap().frame, 0);
-        assert_eq!(a.busy.as_ref().unwrap().label, "Removing feat/foo");
-        a.tick_busy();
-        a.tick_busy();
-        assert_eq!(a.busy.as_ref().unwrap().frame, 2);
-        a.end_busy();
-        assert!(!a.is_busy());
+    fn job_registry_begin_finish_and_query() {
+        let mut a = app(&[("main", true), ("feat", false)]);
+        assert!(!a.any_jobs());
+        let key = JobKey::Path(PathBuf::from("/r/feat"));
+        a.begin_job(key.clone(), "Removing feat");
+        assert!(a.any_jobs());
+        assert!(a.has_job(&key));
+        assert_eq!(a.job_summary().as_deref(), Some("Removing feat…"));
+        // The job attaches to the matching worktree row (by path).
+        let feat = a
+            .worktrees
+            .iter()
+            .find(|w| w.branch.as_deref() == Some("feat"));
+        assert_eq!(a.job_for(feat.unwrap()).unwrap().label, "Removing feat");
+        // Re-registering the same key replaces rather than duplicates.
+        a.begin_job(key.clone(), "Removing feat again");
+        assert_eq!(a.jobs.len(), 1);
+        a.finish_job(&key);
+        assert!(!a.any_jobs());
+        assert!(a.job_summary().is_none());
     }
 
     #[test]
-    fn tick_busy_is_noop_when_idle() {
+    fn job_summary_counts_multiple() {
+        let mut a = app(&[("main", true)]);
+        a.begin_job(JobKey::New("feat/a".into()), "Creating feat/a");
+        a.begin_job(JobKey::Branch("feat/b".into()), "Deleting branch feat/b");
+        let summary = a.job_summary().unwrap();
+        assert!(summary.contains("+1 more"));
+    }
+
+    #[test]
+    fn branch_job_attaches_to_branch_row_only() {
+        use super::testutil::branch_row;
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(branch_row("topic"));
+        a.begin_job(JobKey::Branch("topic".into()), "Deleting branch topic");
+        let row = a
+            .worktrees
+            .iter()
+            .find(|w| !w.has_worktree && w.branch.as_deref() == Some("topic"))
+            .unwrap();
+        assert!(a.job_for(row).is_some());
+        // A `New` job attaches to no existing row (status-bar only).
+        a.begin_job(JobKey::New("brand-new".into()), "Creating brand-new");
+        assert!(a.job_for(&a.worktrees[0]).is_none());
+    }
+
+    #[test]
+    fn tick_spinner_advances_only_with_jobs() {
         let mut a = app(&[("a", true)]);
-        a.tick_busy();
-        assert!(!a.is_busy());
+        a.tick_spinner();
+        assert_eq!(a.spinner_frame, 0); // idle: no advance
+        a.begin_job(JobKey::New("x".into()), "Creating x");
+        a.tick_spinner();
+        a.tick_spinner();
+        assert_eq!(a.spinner_frame, 2);
+    }
+
+    #[test]
+    fn may_apply_mode_guards_against_unrelated_modals() {
+        let mut a = app(&[("a", true)]);
+        // Idle: any job may transition.
+        assert!(a.may_apply_mode(JobHome::List));
+        assert!(a.may_apply_mode(JobHome::Create));
+        // In an unrelated confirm modal, a List-home job must not touch the mode.
+        a.mode = Mode::ConfirmRemove(0);
+        assert!(!a.may_apply_mode(JobHome::List));
+        // A checkout job may still finish into its own open picker.
+        a.mode = Mode::Checkout(Default::default());
+        assert!(a.may_apply_mode(JobHome::Checkout));
+        assert!(!a.may_apply_mode(JobHome::Create));
+    }
+
+    #[test]
+    fn pending_jobs_queue_and_drain() {
+        let mut a = app(&[("a", true)]);
+        assert!(a.take_pending_jobs().is_empty());
+        a.queue_job(Effect::InitSubmodules {
+            dir: PathBuf::from("/wt/x"),
+            count: 2,
+        });
+        let drained = a.take_pending_jobs();
+        assert_eq!(drained.len(), 1);
+        assert!(a.take_pending_jobs().is_empty());
     }
 }

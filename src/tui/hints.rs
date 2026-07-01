@@ -131,6 +131,13 @@ pub fn confirm_init_submodules_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Confirm-quit dialog hints (issue #46 overhaul): `y` quits and abandons the
+/// running background jobs, any other key cancels.
+pub fn confirm_quit_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[hint("y", "quit anyway"), hint("Esc", "cancel")];
+    HINTS
+}
+
 /// Help-overlay hints.
 pub fn help_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[hint("any key", "close")];

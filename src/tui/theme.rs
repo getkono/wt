@@ -312,6 +312,7 @@ impl Theme {
             Mode::ConfirmDeleteBranch { .. } => self.palette.red,
             Mode::ConfirmStaleBase(_) => self.palette.yellow,
             Mode::ConfirmInitSubmodules(_) => self.palette.green,
+            Mode::ConfirmQuit { .. } => self.palette.red,
             Mode::Help => self.palette.cyan,
         };
         Style::default()

@@ -19,8 +19,8 @@ use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
-    App, BusyState, CheckoutState, ComposeField, CreateState, CreateStep, InitSubmodulesState,
-    Mode, Pane, PrComposeState, PrPickerState, StaleBaseState,
+    App, CheckoutState, ComposeField, CreateState, CreateStep, InitSubmodulesState, Mode, Pane,
+    PrComposeState, PrPickerState, StaleBaseState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -64,40 +64,9 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::ConfirmInitSubmodules(state) => {
             modals::render_confirm_init_submodules(app, state, frame, area)
         }
+        Mode::ConfirmQuit { jobs } => modals::render_confirm_quit(app, *jobs, frame, area),
         _ => {}
     }
-
-    // The busy-spinner overlay (issue #46) is drawn last so it sits on top of
-    // whatever mode triggered the action (e.g. the checkout picker).
-    if let Some(busy) = &app.busy {
-        render_busy(app, busy, frame, area);
-    }
-}
-
-/// Renders the centered busy-spinner overlay shown while a shell-based action
-/// runs on a background task (issue #46): an animated spinner frame followed by
-/// the action label, e.g. `⠹ Removing feat/foo…`.
-fn render_busy(app: &App, busy: &BusyState, frame: &mut Frame, area: Rect) {
-    let theme = Theme::with_palette(app.color, app.palette);
-    let glyphs = Glyphs::new(app.nerd_fonts);
-    let line = Line::from(vec![
-        Span::styled(
-            glyphs.spinner_frame(busy.frame).to_string(),
-            theme.spinner(),
-        ),
-        Span::raw(" "),
-        Span::styled(format!("{}…", busy.label), theme.label()),
-    ]);
-    // Size to the label (spinner + spacing + ellipsis + side padding); `centered`
-    // clamps to the available area.
-    let width = (busy.label.chars().count() as u16 + 8).clamp(20, area.width);
-    let rect = centered(area, width, 3);
-    frame.render_widget(Clear, rect);
-    frame.render_widget(
-        Paragraph::new(line)
-            .block(Block::bordered().title(Span::styled("working", theme.title(true)))),
-        rect,
-    );
 }
 
 /// The ahead/behind cell as spans: green `↑N`, red `↓M`, or the absent marker
@@ -230,7 +199,23 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         spans.push(Span::styled(format!("/{}", app.filter), theme.accent()));
     }
     spans.push(Span::raw("  "));
-    if let Some(message) = &app.status_message {
+    // While background jobs run, the status bar leads with an animated spinner and
+    // a compact summary of the in-flight work (issue #46 overhaul) so it stays
+    // visible even when a job's row is scrolled off; a transient status message
+    // (e.g. "created feat/x") follows it, otherwise the key hints do.
+    if let Some(summary) = app.job_summary() {
+        let glyphs = Glyphs::new(app.nerd_fonts);
+        spans.push(Span::styled(
+            glyphs.spinner_frame(app.spinner_frame).to_string(),
+            theme.spinner(),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(summary, theme.label()));
+        if let Some(message) = &app.status_message {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(message.clone(), theme.status(app.status_kind)));
+        }
+    } else if let Some(message) = &app.status_message {
         spans.push(Span::styled(message.clone(), theme.status(app.status_kind)));
     } else {
         for (i, (key, label)) in mode_hints(app).into_iter().enumerate() {
@@ -259,6 +244,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::ConfirmDeleteBranch { .. } => "DELETE",
         Mode::ConfirmStaleBase(_) => "CREATE",
         Mode::ConfirmInitSubmodules(_) => "SUBMODULES",
+        Mode::ConfirmQuit { .. } => "QUIT",
         Mode::Help => "HELP",
     }
 }
@@ -301,6 +287,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
         Mode::ConfirmStaleBase(_) => hint_pairs(hints::confirm_stale_base_hints()),
         Mode::ConfirmInitSubmodules(_) => hint_pairs(hints::confirm_init_submodules_hints()),
+        Mode::ConfirmQuit { .. } => hint_pairs(hints::confirm_quit_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -1194,40 +1181,40 @@ mod tests {
     }
 
     #[test]
-    fn busy_overlay_renders_label_and_spinner() {
-        let mut a = app(&[("main", true)]);
-        a.begin_busy("Removing feat/foo");
-        let text = render_to_text(&a, 100, 20);
-        assert!(text.contains("working"));
+    fn per_row_job_shows_spinner_and_label() {
+        // A background job attached to a row replaces its status marker with an
+        // animated spinner and appends the job label inline — no blocking overlay
+        // (issue #46 overhaul).
+        use crate::tui::app::JobKey;
+        let mut a = app(&[("main", true), ("feat/foo", false)]);
+        a.begin_job(JobKey::Path("/r/feat/foo".into()), "Removing feat/foo");
+        let text = render_to_text(&a, 120, 20);
         assert!(text.contains("Removing feat/foo"));
-        assert!(text.contains('…'));
-        // The first ASCII spinner frame is shown.
-        let frame0 = Glyphs::new(false).spinner_frame(0);
-        assert!(text.contains(frame0));
+        // The first ASCII spinner frame animates the row's status marker.
+        assert!(text.contains(Glyphs::new(false).spinner_frame(0)));
     }
 
     #[test]
-    fn busy_overlay_animates_with_frame() {
+    fn status_bar_summarizes_running_jobs() {
+        use crate::tui::app::JobKey;
         let mut a = app(&[("main", true)]);
-        a.begin_busy("Working");
-        let glyphs = Glyphs::new(false);
-        let at0 = render_to_text(&a, 100, 20);
-        a.tick_busy();
-        let at1 = render_to_text(&a, 100, 20);
-        // The frame index flows into the rendered glyph; frame 1 differs from 0.
-        assert_ne!(glyphs.spinner_frame(0), glyphs.spinner_frame(1));
-        assert!(at1.contains(glyphs.spinner_frame(1)));
+        a.begin_job(JobKey::New("feat/a".into()), "Creating feat/a");
+        let at0 = render_to_text(&a, 120, 20);
+        assert!(at0.contains("Creating feat/a"));
+        // The shared spinner frame animates the status-bar summary too.
+        a.spinner_frame = 1;
+        let at1 = render_to_text(&a, 120, 20);
+        assert!(at1.contains(Glyphs::new(false).spinner_frame(1)));
         assert_ne!(at0, at1);
     }
 
     #[test]
-    fn busy_overlay_sits_over_mode() {
+    fn confirm_quit_modal_renders_over_mode() {
         let mut a = app(&[("main", true)]);
-        a.mode = crate::tui::app::Mode::ConfirmRemove(0);
-        a.begin_busy("Removing main");
+        a.mode = crate::tui::app::Mode::ConfirmQuit { jobs: 2 };
         let text = render_to_text(&a, 100, 20);
-        // The overlay is drawn last, over the confirm dialog.
-        assert!(text.contains("working"));
-        assert!(text.contains("Removing main"));
+        assert!(text.contains("confirm quit"));
+        assert!(text.contains("2 background jobs"));
+        assert!(text.contains("Quit anyway?"));
     }
 }

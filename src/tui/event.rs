@@ -229,6 +229,7 @@ impl App {
             Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
             Mode::ConfirmStaleBase(_) => self.key_confirm_stale_base(key),
             Mode::ConfirmInitSubmodules(_) => self.key_confirm_init_submodules(key),
+            Mode::ConfirmQuit { .. } => self.key_confirm_quit(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -344,8 +345,17 @@ impl App {
             KeyAction::SortReverse => self.reverse_sort(),
             KeyAction::Help => self.mode = Mode::Help,
             KeyAction::Quit => {
-                self.quit = true;
-                return Effect::Quit;
+                // Quitting while background jobs run would abandon them (killing
+                // in-flight git subprocesses), so confirm first (issue #46
+                // overhaul); with nothing running, quit immediately.
+                if self.any_jobs() {
+                    self.mode = Mode::ConfirmQuit {
+                        jobs: self.jobs.len(),
+                    };
+                } else {
+                    self.quit = true;
+                    return Effect::Quit;
+                }
             }
             KeyAction::ToggleSidebar => self.show_sidebar = !self.show_sidebar,
             KeyAction::ResizeSidebarGrow => {
@@ -696,6 +706,18 @@ impl App {
         }
     }
 
+    /// Confirm-quit key handling (issue #46 overhaul): `y`/`Y` quits, abandoning
+    /// the running background jobs; any other key cancels back to the list.
+    fn key_confirm_quit(&mut self, key: KeyEvent) -> Effect {
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            self.quit = true;
+            Effect::Quit
+        } else {
+            self.mode = Mode::List;
+            Effect::None
+        }
+    }
+
     /// Mouse handling: row click selects, wheel scrolls, detail click focuses.
     fn on_mouse(&mut self, mouse: MouseEvent) -> Effect {
         // A modal overlay owns all input (issue #70): the background list/detail
@@ -1025,6 +1047,28 @@ mod tests {
         let mut a = app(&[("a", true)]);
         assert_eq!(a.handle_event(press(KeyCode::Char('q'))), Effect::Quit);
         assert!(a.quit);
+    }
+
+    #[test]
+    fn quit_with_jobs_confirms_first() {
+        // Quitting while a background job runs opens the confirm dialog rather than
+        // abandoning it outright (issue #46 overhaul).
+        use crate::tui::app::JobKey;
+        let mut a = app(&[("a", true)]);
+        a.begin_job(JobKey::New("feat".into()), "Creating feat");
+        assert_eq!(a.handle_event(press(KeyCode::Char('q'))), Effect::None);
+        assert!(matches!(a.mode, Mode::ConfirmQuit { jobs: 1 }));
+        assert!(!a.quit);
+        // `y` quits and abandons the jobs; any other key cancels back to the list.
+        assert_eq!(a.handle_event(press(KeyCode::Char('y'))), Effect::Quit);
+        assert!(a.quit);
+        // Cancel path.
+        let mut b = app(&[("a", true)]);
+        b.begin_job(JobKey::New("feat".into()), "Creating feat");
+        b.handle_event(press(KeyCode::Char('q')));
+        assert_eq!(b.handle_event(press(KeyCode::Char('n'))), Effect::None);
+        assert_eq!(b.mode, Mode::List);
+        assert!(!b.quit);
     }
 
     #[test]

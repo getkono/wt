@@ -6,8 +6,10 @@
 
 use super::*;
 
-/// Builds the `NewArgs` a TUI create/materialize uses (no per-invocation
-/// submodule override — the `[submodules] init` policy decides, issue #50).
+/// Builds the `NewArgs` a TUI create/materialize uses. Submodule init is always
+/// suppressed here (`no_init_submodules`) so the worktree-add stays fast and never
+/// blocks; the TUI schedules any needed init as its own background job on the new
+/// row instead (issue #46 overhaul), driven by the `[submodules] init` policy.
 pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
     NewArgs {
         branch: branch.to_string(),
@@ -18,7 +20,7 @@ pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
         no_hooks: false,
         copy_from: None,
         init_submodules: false,
-        no_init_submodules: false,
+        no_init_submodules: true,
     }
 }
 
@@ -55,28 +57,30 @@ pub(super) fn run_create_command(
 /// Creates the worktree (no staleness check) and maps the result to a
 /// [`CreateOutcome`].
 pub(super) fn create_core(cx: &mut Cx, args: &NewArgs) -> CreateOutcome {
-    // `prompt = false`: the TUI never prompts inline; the submodule confirmation
-    // is surfaced afterwards as a modal (see below).
+    // `run_core` never inits submodules (see [`tui_new_args`]); the TUI schedules
+    // any needed init as its own background job after this returns.
     match commands::new::run_core(cx, &CapturingHookRunner, args, false, false) {
-        Ok(_) => match pending_submodules_to_confirm(cx, &args.branch) {
-            Some((dir, count)) => CreateOutcome::CreatedNeedsSubmodules { dir, count },
+        Ok(_) => match detect_pending_submodules(cx, &args.branch) {
+            Some((dir, count, auto)) => CreateOutcome::CreatedNeedsSubmodules { dir, count, auto },
             None => CreateOutcome::Created,
         },
         Err(e) => CreateOutcome::Failed(e.to_string()),
     }
 }
 
-/// After a successful TUI create, reports the new worktree's directory and the
-/// number of uninitialized submodules when the `[submodules] init` policy is left
-/// at its `prompt` default (issue #50), so the loop can open the confirm modal.
-/// `None` when the policy is `always`/`never` (decided inline by `run_core`), the
-/// new worktree can't be located, or there is nothing to initialize.
-fn pending_submodules_to_confirm(cx: &Cx, branch: &str) -> Option<(PathBuf, usize)> {
+/// After a worktree is created/materialized, reports its directory, the number of
+/// uninitialized submodules, and whether the `[submodules] init` policy wants them
+/// initialized automatically (`always` → `auto = true`) or after a prompt
+/// (`prompt` → `auto = false`). `None` when the policy is `never`, the worktree
+/// can't be located, or there is nothing to initialize (issue #50).
+pub(super) fn detect_pending_submodules(cx: &Cx, branch: &str) -> Option<(PathBuf, usize, bool)> {
     let git = cx.git.clone();
     let session = open_session(cx, git.as_ref()).ok()?;
-    if session.config.submodules_init != SubmoduleInit::Prompt {
-        return None;
-    }
+    let auto = match session.config.submodules_init {
+        SubmoduleInit::Never => return None,
+        SubmoduleInit::Always => true,
+        SubmoduleInit::Prompt => false,
+    };
     let worktrees = enumerate_worktrees(&session.repo, git.as_ref()).ok()?;
     let dir = worktrees
         .iter()
@@ -86,7 +90,7 @@ fn pending_submodules_to_confirm(cx: &Cx, branch: &str) -> Option<(PathBuf, usiz
     if pending.is_empty() {
         None
     } else {
-        Some((dir, pending.len()))
+        Some((dir, pending.len(), auto))
     }
 }
 
@@ -257,31 +261,48 @@ pub(crate) fn do_refresh(cx: &Cx, app: &mut App, root: &Path) {
 }
 
 /// Fetches open PRs into the picker (best-effort; errors shown inline).
+#[cfg(test)]
 pub(crate) fn do_fetch_prs(cx: &Cx, session: &Session, app: &mut App) {
     let dir = session
         .repo
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
-    let result = cx.gh.list_open_prs(&dir);
+    apply_prs(app, fetch_prs_result(cx.gh.as_ref(), &dir));
+}
+
+/// Lists open PRs and maps them to [`PrItem`]s, stringifying any error to ferry
+/// across the async task boundary. Shared by the synchronous test helper and the
+/// background fetch (issue #46 overhaul).
+pub(super) fn fetch_prs_result(
+    gh: &dyn crate::gh::GhClient,
+    dir: &Path,
+) -> std::result::Result<Vec<PrItem>, String> {
+    gh.list_open_prs(dir)
+        .map(|prs| {
+            prs.into_iter()
+                .map(|p| {
+                    let pr_state = p.pr_state().as_str().to_string();
+                    PrItem {
+                        number: p.number,
+                        title: p.title,
+                        author: p.author.login,
+                        state: pr_state,
+                        created_at: p.created_at,
+                    }
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Folds a finished PR fetch into the picker, if it is still open (the user may
+/// have closed it while the fetch ran).
+pub(super) fn apply_prs(app: &mut App, result: std::result::Result<Vec<PrItem>, String>) {
     if let Mode::PrPicker(state) = &mut app.mode {
         state.loading = false;
         match result {
-            Ok(prs) => {
-                state.prs = prs
-                    .into_iter()
-                    .map(|p| {
-                        let pr_state = p.pr_state().as_str().to_string();
-                        PrItem {
-                            number: p.number,
-                            title: p.title,
-                            author: p.author.login,
-                            state: pr_state,
-                            created_at: p.created_at,
-                        }
-                    })
-                    .collect();
-            }
-            Err(e) => state.error = Some(e.to_string()),
+            Ok(prs) => state.prs = prs,
+            Err(e) => state.error = Some(e),
         }
     }
 }
@@ -351,10 +372,9 @@ pub(crate) fn do_materialize_branch(cx: &mut Cx, session: &Session, app: &mut Ap
     apply_outcome(cx, session, app, outcome);
 }
 
-/// Checks out a PR into a worktree. When `app.exit_on_pr_checkout` is set (the
-/// `wt pr` picker entry), records the new worktree as `chosen` so the loop exits
-/// and the wrapper `cd`s into it; otherwise returns to the list and refreshes
-/// (the in-TUI `p`-key flow).
+/// Checks out a PR into a worktree, then returns to the list and refreshes,
+/// focusing the new worktree row (issue #46 overhaul — the checkout stays in the
+/// TUI rather than switching-and-exiting).
 #[cfg(test)]
 pub(crate) fn do_checkout_pr(cx: &mut Cx, session: &Session, app: &mut App, number: u64) {
     let outcome = run_job(JobCx::capture(cx), Job::CheckoutPr { number });
@@ -424,7 +444,6 @@ pub(super) fn apply_create(
 ) {
     match outcome {
         CreateOutcome::Created => {
-            app.mode = Mode::List;
             app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
             // Focus the newly created worktree (issue #52). `do_refresh` restores
@@ -432,39 +451,64 @@ pub(super) fn apply_create(
             // hides the new row, the selection is left as-is (the filter is not
             // cleared — that would be surprising).
             let _ = app.select_branch(branch);
+            close_create_modal(app);
         }
-        // Created, but the new worktree has uninitialized submodules and the policy
-        // is left at its `prompt` default — refresh and focus the row, then open the
-        // confirm modal over it (issue #50).
-        CreateOutcome::CreatedNeedsSubmodules { dir, count } => {
+        // Created, but the new worktree has uninitialized submodules (issue #50).
+        // Under `always` (or when a modal can't be shown) start a background init
+        // job on the new row and return to the list; under `prompt` open the
+        // confirm modal over the row (issue #46 overhaul).
+        CreateOutcome::CreatedNeedsSubmodules { dir, count, auto } => {
             app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
             let _ = app.select_branch(branch);
-            app.mode = Mode::ConfirmInitSubmodules(InitSubmodulesState {
-                dir,
-                branch: branch.to_string(),
-                count,
-            });
+            if !auto && app.may_apply_mode(JobHome::Create) {
+                app.mode = Mode::ConfirmInitSubmodules(InitSubmodulesState {
+                    dir,
+                    branch: branch.to_string(),
+                    count,
+                });
+            } else {
+                app.queue_job(Effect::InitSubmodules { dir, count });
+                close_create_modal(app);
+            }
         }
         // The base is behind origin: open the confirm modal carrying the pending
-        // create's inputs so the user's choice can re-issue it (issue #56).
+        // create's inputs so the user's choice can re-issue it (issue #56). If the
+        // user navigated into another modal meanwhile, report it instead of
+        // clobbering their screen (rare — the create modal stays open otherwise).
         CreateOutcome::NeedsStaleConfirm {
             behind,
             upstream_display,
             can_fast_forward,
         } => {
-            app.mode = Mode::ConfirmStaleBase(StaleBaseState {
-                branch: branch.to_string(),
-                base,
-                behind,
-                upstream_display,
-                can_fast_forward,
-            });
+            if app.may_apply_mode(JobHome::Create) {
+                app.mode = Mode::ConfirmStaleBase(StaleBaseState {
+                    branch: branch.to_string(),
+                    base,
+                    behind,
+                    upstream_display,
+                    can_fast_forward,
+                });
+            } else {
+                app.set_status(
+                    format!("{branch}: base is behind {upstream_display}; not created"),
+                    StatusKind::Error,
+                );
+            }
         }
         CreateOutcome::Failed(e) => match &mut app.mode {
             Mode::Create(state) => state.error = Some(e),
             _ => app.set_status(e, StatusKind::Error),
         },
+    }
+}
+
+/// Returns to the list after a create-family job, unless the user has moved on to
+/// an unrelated modal meanwhile (issue #46 overhaul): a background job must never
+/// close a modal it does not own.
+fn close_create_modal(app: &mut App) {
+    if app.may_apply_mode(JobHome::Create) {
+        app.mode = Mode::List;
     }
 }
 
@@ -481,7 +525,9 @@ pub(super) fn apply_remove(
         Ok(()) => app.set_status(format!("removed {query}"), StatusKind::Success),
         Err(e) => app.set_status(e, StatusKind::Error),
     }
-    app.mode = Mode::List;
+    if app.may_apply_mode(JobHome::List) {
+        app.mode = Mode::List;
+    }
     do_refresh(cx, app, root);
 }
 
@@ -498,34 +544,41 @@ pub(super) fn apply_delete_branch(
 ) {
     match result {
         Ok(()) => {
-            app.mode = Mode::List;
             app.set_status(format!("deleted branch {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
+            if app.may_apply_mode(JobHome::List) {
+                app.mode = Mode::List;
+            }
         }
-        // A safe `git branch -d` refused an unmerged branch: re-prompt to force.
-        // The delete failed, so the branch row still exists — re-find it by name.
+        // A safe `git branch -d` refused an unmerged branch: re-prompt to force
+        // (only when the user is idle — never clobbering an unrelated modal). The
+        // delete failed, so the branch row still exists — re-find it by name.
         Err(e) if !force && e.contains("not fully merged") => {
-            if let Some(index) = app
+            let index = app
                 .worktrees
                 .iter()
-                .position(|w| !w.has_worktree && w.branch.as_deref() == Some(branch))
-            {
-                app.mode = Mode::ConfirmDeleteBranch { index, force: true };
-            } else {
-                app.mode = Mode::List;
-                app.set_status(e, StatusKind::Error);
+                .position(|w| !w.has_worktree && w.branch.as_deref() == Some(branch));
+            match index {
+                Some(index) if app.may_apply_mode(JobHome::List) => {
+                    app.mode = Mode::ConfirmDeleteBranch { index, force: true };
+                }
+                _ => app.set_status(e, StatusKind::Error),
             }
         }
         Err(e) => {
-            app.mode = Mode::List;
             app.set_status(e, StatusKind::Error);
+            if app.may_apply_mode(JobHome::List) {
+                app.mode = Mode::List;
+            }
         }
     }
 }
 
-/// Applies a finished materialize: on success refresh and record the new
-/// worktree as `chosen` (so the loop exits and the wrapper `cd`s into it); on
-/// failure surface the error in the status bar.
+/// Applies a finished materialize: on success refresh, focus the new worktree
+/// row, and background any submodule init on it, staying in the TUI so the user
+/// can keep working and switch into it with Enter when ready (issue #46
+/// overhaul — no longer auto-switches-and-exits). Errors surface in the status
+/// bar.
 pub(super) fn apply_materialize(
     cx: &Cx,
     app: &mut App,
@@ -537,24 +590,24 @@ pub(super) fn apply_materialize(
         Ok(()) => {
             app.set_status(format!("created {branch}"), StatusKind::Success);
             do_refresh(cx, app, root);
-            // Switch into the freshly created worktree for this branch.
-            if let Some(path) = app
-                .worktrees
-                .iter()
-                .find(|w| w.has_worktree && w.branch.as_deref() == Some(branch))
-                .map(|w| w.path.clone())
-            {
-                app.chosen = Some(path);
+            let _ = app.select_branch(branch);
+            // The worktree exists; initialize its submodules (if any) as a
+            // background job on the new row rather than blocking the switch.
+            if let Some((dir, count, _auto)) = detect_pending_submodules(cx, branch) {
+                app.queue_job(Effect::InitSubmodules { dir, count });
             }
         }
         Err(e) => app.set_status(e, StatusKind::Error),
     }
-    app.mode = Mode::List;
+    if app.may_apply_mode(JobHome::List) {
+        app.mode = Mode::List;
+    }
 }
 
-/// Applies a finished PR checkout: switch into the new worktree when
-/// `exit_on_pr_checkout` is set, else return to the list and refresh; errors
-/// show inline in the picker.
+/// Applies a finished PR checkout: return to the list, refresh, and focus the new
+/// worktree row, staying in the TUI so the user switches into it with Enter when
+/// ready (issue #46 overhaul — no longer auto-switches-and-exits). Errors show
+/// inline in the picker.
 pub(super) fn apply_checkout_pr(
     cx: &Cx,
     app: &mut App,
@@ -564,12 +617,11 @@ pub(super) fn apply_checkout_pr(
 ) {
     match result {
         Ok((path, _existed)) => {
-            if app.exit_on_pr_checkout {
-                app.chosen = Some(path);
-            } else {
+            app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
+            do_refresh(cx, app, root);
+            app.select_path(&path);
+            if app.may_apply_mode(JobHome::PrPicker) {
                 app.mode = Mode::List;
-                app.set_status(format!("checked out PR #{number}"), StatusKind::Success);
-                do_refresh(cx, app, root);
             }
         }
         Err(e) => match &mut app.mode {
@@ -590,7 +642,6 @@ pub(super) fn apply_checkout_branch(
 ) {
     match result {
         Ok(outcome) => {
-            app.mode = Mode::List;
             app.set_status(
                 format!(
                     "checked out {branch}{}",
@@ -599,6 +650,9 @@ pub(super) fn apply_checkout_branch(
                 StatusKind::Success,
             );
             do_refresh(cx, app, root);
+            if app.may_apply_mode(JobHome::Checkout) {
+                app.mode = Mode::List;
+            }
         }
         Err(e) => match &mut app.mode {
             Mode::Checkout(state) => {
@@ -639,7 +693,9 @@ pub(super) fn apply_sync(
         }
         Err(e) => app.set_status(e, StatusKind::Error),
     }
-    app.mode = Mode::List;
+    if app.may_apply_mode(JobHome::List) {
+        app.mode = Mode::List;
+    }
 }
 
 /// Applies a finished submodule init (issue #50): report success/error in the
@@ -664,7 +720,9 @@ pub(super) fn apply_init_submodules(
             StatusKind::Error,
         ),
     }
-    app.mode = Mode::List;
+    if app.may_apply_mode(JobHome::List) {
+        app.mode = Mode::List;
+    }
 }
 
 /// Drafts the PR title/body with the code agent and seeds the compose form,

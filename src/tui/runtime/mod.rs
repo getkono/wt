@@ -22,7 +22,8 @@ use crate::git::discover::Repo;
 use crate::hooks::CapturingHookRunner;
 use crate::model::{SortSpec, Worktree};
 use crate::tui::app::{
-    App, AppConfig, InitSubmodulesState, Mode, PrComposeState, PrItem, StaleBaseState, StatusKind,
+    App, AppConfig, InitSubmodulesState, JobHome, JobKey, Mode, PrComposeState, PrItem,
+    StaleBaseState, StatusKind,
 };
 use crate::tui::event::{CreateDecision, Effect};
 use crate::tui::terminal::{Tui, install_panic_hook};
@@ -71,7 +72,6 @@ pub fn run_pr_picker(cx: &mut Cx) -> Result<Option<PathBuf>> {
     let session = open_session(cx, git.as_ref())?;
     let opened_in = anchor_at_root(cx, &session);
     let mut app = build_app(cx, &session, git.as_ref())?;
-    app.exit_on_pr_checkout = true;
     app.mode = Mode::PrPicker(crate::tui::app::PrPickerState {
         loading: true,
         ..Default::default()
@@ -120,7 +120,12 @@ fn drive_tui(
     opened_in: &Path,
 ) -> Result<Option<PathBuf>> {
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run_loop(cx, session, &mut app, initial))?;
+    let outcome = runtime.block_on(run_loop(cx, session, &mut app, initial));
+    // Abandon any still-running background jobs (e.g. a submodule clone the user
+    // quit past) rather than blocking on runtime drop (issue #46 overhaul): the
+    // confirm-quit prompt already warned they may be left partial.
+    runtime.shutdown_background();
+    outcome?;
 
     if app.too_small {
         cx.err.line("terminal too small (need ≥5 rows)")?;
@@ -182,8 +187,14 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
     }
     tui.draw(app)?;
 
+    // Background shell-based actions run on blocking tasks and send their keyed
+    // outcome here; PR fetches stream into the picker; a ticker animates the
+    // per-row spinners while any job is in flight (issue #46 overhaul).
+    let (job_tx, mut job_rx) = mpsc::channel::<(JobKey, JobOutcome)>(64);
+    let (pr_tx, mut pr_rx) = mpsc::channel::<PrFetch>(4);
+
     if initial != Effect::None {
-        if dispatch_effect(cx, session, app, &mut tui, initial)? {
+        if dispatch_effect(cx, session, app, &mut tui, initial, &pr_tx)? {
             return Ok(());
         }
         tui.draw(app)?;
@@ -193,42 +204,44 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
     let (tx, mut rx) = mpsc::channel::<Vec<Worktree>>(1);
     spawn_enrichment(session.primary_root.clone(), cx.git.clone(), tx);
 
-    // Background shell-based actions (issue #46) run on a blocking task and send
-    // their outcome here; a ticker animates the spinner overlay while one is in
-    // flight.
-    let (job_tx, mut job_rx) = mpsc::channel::<JobOutcome>(1);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
 
     let mut events = EventStream::new();
     loop {
         tokio::select! {
-            // Animate the spinner while a background action runs (the guard
+            // Animate the per-row spinners while any background job runs (the guard
             // disables this branch — and the timer wakeups — when idle).
-            _ = ticker.tick(), if app.is_busy() => {
-                app.tick_busy();
+            _ = ticker.tick(), if app.any_jobs() => {
+                app.tick_spinner();
                 tui.draw(app)?;
             }
-            // A background action finished: clear the overlay, apply its result,
-            // and exit the loop if it set a worktree to switch into.
-            Some(outcome) = job_rx.recv() => {
-                app.end_busy();
+            // A background action finished: clear its per-row spinner, apply its
+            // result, spawn any queued follow-up jobs (e.g. submodule init), and
+            // exit only if it set a worktree to switch into.
+            Some((key, outcome)) = job_rx.recv() => {
+                app.finish_job(&key);
                 apply_outcome(cx, session, app, outcome);
+                for effect in app.take_pending_jobs() {
+                    spawn_job(cx, app, effect, &job_tx);
+                }
                 tui.draw(app)?;
                 if app.chosen.is_some() {
                     break;
                 }
             }
+            // A PR fetch finished: fold it into the picker (if still open).
+            Some(fetch) = pr_rx.recv() => {
+                apply_prs(app, fetch);
+                tui.draw(app)?;
+            }
             maybe = events.next() => {
                 let Some(Ok(event)) = maybe else { continue };
-                // Ignore input while a background action is in flight.
-                if app.is_busy() {
-                    continue;
-                }
+                // Input is never gated: the user can act while jobs run.
                 let effect = app.handle_event(event);
                 if is_background_action(&effect) {
                     spawn_job(cx, app, effect, &job_tx);
                     tui.draw(app)?;
-                } else if dispatch_effect(cx, session, app, &mut tui, effect)? {
+                } else if dispatch_effect(cx, session, app, &mut tui, effect, &pr_tx)? {
                     break;
                 } else {
                     tui.draw(app)?;
@@ -236,11 +249,7 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
             }
             Some(worktrees) = rx.recv() => {
                 mark_all_loaded(app, worktrees);
-                // Don't redraw mid-action so the spinner cadence stays smooth; the
-                // post-completion draw shows the enriched rows.
-                if !app.is_busy() {
-                    tui.draw(app)?;
-                }
+                tui.draw(app)?;
             }
         }
     }
@@ -255,6 +264,7 @@ fn dispatch_effect(
     app: &mut App,
     tui: &mut Tui,
     effect: Effect,
+    pr_tx: &mpsc::Sender<PrFetch>,
 ) -> Result<bool> {
     match effect {
         Effect::None => Ok(false),
@@ -268,7 +278,9 @@ fn dispatch_effect(
             Ok(false)
         }
         Effect::FetchPrs => {
-            do_fetch_prs(cx, session, app);
+            // Fetch off-thread so opening the picker never freezes on the gh
+            // network call; the picker shows its loading state until it arrives.
+            spawn_fetch_prs(cx, session, pr_tx);
             Ok(false)
         }
         Effect::OpenEditor(path) => {
@@ -496,13 +508,18 @@ enum JobOutcome {
 enum CreateOutcome {
     /// The worktree was created.
     Created,
-    /// The worktree was created and has uninitialized submodules, with the policy
-    /// left at its `prompt` default — the loop opens the confirm modal (issue #50).
+    /// The worktree was created and has uninitialized submodules (issue #50). The
+    /// TUI never initializes them inline (issue #46 overhaul): under the `always`
+    /// policy (`auto`) it starts a background init job on the new row; under the
+    /// `prompt` default it opens the confirm modal first.
     CreatedNeedsSubmodules {
         /// The new worktree directory whose submodules would be initialized.
         dir: PathBuf,
         /// How many uninitialized submodules were detected.
         count: usize,
+        /// Whether to start the init automatically (`always` policy) rather than
+        /// prompting (`prompt` policy).
+        auto: bool,
     },
     /// The base is behind its upstream; the create paused for confirmation.
     NeedsStaleConfirm {
@@ -530,42 +547,50 @@ fn remove_query_of(app: &App, index: usize) -> Option<String> {
     }))
 }
 
-/// Resolves a background effect into a [`Job`] (owning its arguments) and marks
-/// the app busy with a display label. Returns `None` (and leaves the app idle)
-/// when the effect's target row is gone.
-fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
-    let (job, label) = match effect {
+/// Resolves a background effect into a [`Job`] (owning its arguments), the
+/// [`JobKey`] that attaches its per-row spinner and guards against a conflicting
+/// action, and a display label. Pure — it does not touch the registry. Returns
+/// `None` when the effect's target row is gone or it is not a background action.
+fn resolve_job(app: &App, effect: Effect) -> Option<(Job, JobKey, String)> {
+    match effect {
         Effect::Create {
             branch,
             base,
             decision,
         } => {
             let label = format!("Creating {branch}");
-            (
+            let key = JobKey::New(branch.clone());
+            Some((
                 Job::Create {
                     branch,
                     base,
                     decision,
                 },
+                key,
                 label,
-            )
+            ))
         }
         Effect::Remove(index) => {
+            let worktree = app.worktrees.get(index)?;
+            let key = JobKey::Path(worktree.path.clone());
             let query = remove_query_of(app, index)?;
             let label = format!("Removing {query}");
-            (Job::Remove { query }, label)
+            Some((Job::Remove { query }, key, label))
         }
         Effect::DeleteBranch { branch, force } => {
             let label = format!("Deleting branch {branch}");
-            (Job::DeleteBranch { branch, force }, label)
+            let key = JobKey::Branch(branch.clone());
+            Some((Job::DeleteBranch { branch, force }, key, label))
         }
         Effect::MaterializeBranch { branch } => {
             let label = format!("Creating worktree for {branch}");
-            (Job::Materialize { branch }, label)
+            let key = JobKey::Branch(branch.clone());
+            Some((Job::Materialize { branch }, key, label))
         }
         Effect::CheckoutPr(number) => {
             let label = format!("Checking out PR #{number}");
-            (Job::CheckoutPr { number }, label)
+            let key = JobKey::New(format!("PR #{number}"));
+            Some((Job::CheckoutPr { number }, key, label))
         }
         Effect::CheckoutBranch {
             worktree_index,
@@ -573,13 +598,15 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
         } => {
             let worktree_dir = app.worktrees.get(worktree_index)?.path.clone();
             let label = format!("Checking out {branch}");
-            (
+            let key = JobKey::Path(worktree_dir.clone());
+            Some((
                 Job::CheckoutBranch {
                     worktree_dir,
                     branch,
                 },
+                key,
                 label,
-            )
+            ))
         }
         Effect::Sync { worktree_index } => {
             let worktree = app.worktrees.get(worktree_index)?;
@@ -587,41 +614,68 @@ fn begin_job(app: &mut App, effect: Effect) -> Option<Job> {
                 .branch
                 .clone()
                 .unwrap_or_else(|| "worktree".to_string());
-            let busy = format!("Syncing {label}");
-            let job = if worktree.has_worktree {
-                Job::Sync {
-                    worktree_dir: worktree.path.clone(),
-                    label,
-                }
+            let display = format!("Syncing {label}");
+            let (job, key) = if worktree.has_worktree {
+                (
+                    Job::Sync {
+                        worktree_dir: worktree.path.clone(),
+                        label,
+                    },
+                    JobKey::Path(worktree.path.clone()),
+                )
             } else {
                 // A branch row syncs by branch name from the repo root; a row with
                 // no branch (none exist today) has nothing to sync.
                 let branch = worktree.branch.clone()?;
-                Job::SyncBranch { branch, label }
+                let key = JobKey::Branch(branch.clone());
+                (Job::SyncBranch { branch, label }, key)
             };
-            (job, busy)
+            Some((job, key, display))
         }
         Effect::InitSubmodules { dir, count } => {
             let label = format!("Initializing {count} submodule(s)");
-            (Job::InitSubmodules { dir, count }, label)
+            let key = JobKey::Path(dir.clone());
+            Some((Job::InitSubmodules { dir, count }, key, label))
         }
-        _ => return None,
-    };
-    app.begin_busy(label);
-    Some(job)
+        _ => None,
+    }
 }
 
-/// Spawns a background task to run `effect`'s shell action, marking the app busy
-/// so the spinner overlay shows; the outcome is sent to `tx` for the loop to
-/// apply (issue #46).
-fn spawn_job(cx: &Cx, app: &mut App, effect: Effect, tx: &mpsc::Sender<JobOutcome>) {
-    let Some(job) = begin_job(app, effect) else {
+/// Spawns a background task to run `effect`'s shell action, registering it on its
+/// target row so a per-row spinner shows; the keyed outcome is sent to `tx` for
+/// the loop to apply (issue #46 overhaul). A second action on a row that already
+/// has a job in flight is refused with a status note so the two never race.
+fn spawn_job(cx: &Cx, app: &mut App, effect: Effect, tx: &mpsc::Sender<(JobKey, JobOutcome)>) {
+    let Some((job, key, label)) = resolve_job(app, effect) else {
         return;
     };
+    if app.has_job(&key) {
+        app.set_status(format!("{label} — already in progress"), StatusKind::Info);
+        return;
+    }
+    app.begin_job(key.clone(), label);
     let jobcx = JobCx::capture(cx);
     let tx = tx.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = tx.blocking_send(run_job(jobcx, job));
+        let outcome = run_job(jobcx, job);
+        let _ = tx.blocking_send((key, outcome));
+    });
+}
+
+/// The payload of an async PR fetch: the picker items, or the error to surface.
+type PrFetch = std::result::Result<Vec<PrItem>, String>;
+
+/// Spawns a background task to fetch open PRs (a `gh` network call) and stream the
+/// result into the picker, so opening it never freezes the loop.
+fn spawn_fetch_prs(cx: &Cx, session: &Session, tx: &mpsc::Sender<PrFetch>) {
+    let gh = cx.gh.clone();
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = tx.blocking_send(fetch_prs_result(gh.as_ref(), &dir));
     });
 }
 
@@ -1040,11 +1094,8 @@ mod tests {
     fn apply_init_submodules_reports_success_and_refreshes() {
         let repo = TestRepo::init();
         let (t, session, mut app) = setup(&repo);
-        app.mode = Mode::ConfirmInitSubmodules(crate::tui::app::InitSubmodulesState {
-            dir: repo.root().to_path_buf(),
-            branch: "feature".into(),
-            count: 2,
-        });
+        // The confirm/loop already returned to the list before the job ran; the
+        // init job runs concurrently and only reports its result on completion.
         apply_init_submodules(&t.cx, &mut app, 2, Ok(()), &session.primary_root);
         assert_eq!(app.mode, Mode::List);
         assert!(
@@ -1172,7 +1223,9 @@ mod tests {
                 .iter()
                 .any(|w| w.branch.as_deref() == Some("unmerged"))
         );
-        // The forced delete removes it.
+        // The forced delete removes it. The re-prompt's `y` returns to the list
+        // before the job runs (as the real key handler does), so apply sees List.
+        app.mode = Mode::List;
         do_delete_branch(&mut t.cx, &session, &mut app, "unmerged".into(), true);
         assert_eq!(app.mode, Mode::List);
         assert!(
@@ -1183,9 +1236,11 @@ mod tests {
     }
 
     #[test]
-    fn do_materialize_branch_creates_worktree_and_switches() {
-        // A worktree-less branch (issue #47): materializing it creates a worktree,
-        // refreshes so the row becomes a real worktree, and records it as `chosen`.
+    fn do_materialize_branch_creates_worktree_and_stays_focused() {
+        // A worktree-less branch (issue #47): materializing it creates a worktree
+        // and refreshes so the row becomes a real worktree. Post-overhaul it stays
+        // in the TUI (no `chosen`) and focuses the new worktree row so the user can
+        // switch into it with Enter when ready (issue #46 overhaul).
         let repo = TestRepo::init();
         repo.git(&["branch", "topic"]);
         let (mut t, session, mut app) = setup(&repo);
@@ -1195,17 +1250,17 @@ mod tests {
                 .iter()
                 .any(|w| !w.has_worktree && w.branch.as_deref() == Some("topic"))
         );
-        app.mode = Mode::ConfirmCreate(0);
         do_materialize_branch(&mut t.cx, &session, &mut app, "topic".into());
         assert_eq!(app.mode, Mode::List);
-        let chosen = app.chosen.clone().expect("chosen path set on materialize");
-        assert!(chosen.is_dir());
-        // `topic` is now a real worktree row, not a branch row.
+        assert!(app.chosen.is_none());
+        // `topic` is now a real worktree row, not a branch row, and is focused.
         assert!(
             app.worktrees
                 .iter()
                 .any(|w| w.has_worktree && w.branch.as_deref() == Some("topic"))
         );
+        let focused = app.selected_worktree().unwrap();
+        assert!(focused.has_worktree && focused.branch.as_deref() == Some("topic"));
         assert!(
             app.status_message
                 .as_deref()
@@ -1225,6 +1280,56 @@ mod tests {
         assert!(app.chosen.is_none());
         assert_eq!(app.status_kind, StatusKind::Error);
         assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn do_materialize_branch_queues_background_submodule_init() {
+        // Materializing a worktree that has uninitialized submodules queues a
+        // background init job on the new row rather than blocking the switch
+        // (issue #46 overhaul).
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        repo.git(&["branch", "topic"]); // branches from HEAD, which has the submodule
+        let (mut t, session, mut app) = setup(&repo);
+        do_materialize_branch(&mut t.cx, &session, &mut app, "topic".into());
+        assert!(app.chosen.is_none());
+        // A follow-up submodule-init job is queued for the loop to spawn.
+        let queued = app.take_pending_jobs();
+        assert!(
+            queued
+                .iter()
+                .any(|e| matches!(e, Effect::InitSubmodules { .. })),
+            "expected a queued InitSubmodules job, got {queued:?}"
+        );
+    }
+
+    #[test]
+    fn apply_create_auto_policy_queues_submodule_job() {
+        // Under the `always` policy a created worktree with uninitialized
+        // submodules starts a background init job (no modal) and returns to the
+        // list (issue #46 overhaul).
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let (t, session, mut app) = setup(&repo);
+        apply_create(
+            &t.cx,
+            &mut app,
+            "feature",
+            None,
+            CreateOutcome::CreatedNeedsSubmodules {
+                dir: session.primary_root.clone(),
+                count: 1,
+                auto: true,
+            },
+            &session.primary_root,
+        );
+        assert_eq!(app.mode, Mode::List);
+        let queued = app.take_pending_jobs();
+        assert!(
+            queued
+                .iter()
+                .any(|e| matches!(e, Effect::InitSubmodules { .. }))
+        );
     }
 
     #[test]
@@ -1307,18 +1412,22 @@ mod tests {
     }
 
     #[test]
-    fn do_checkout_pr_switches_when_exit_flag_set() {
-        // The `wt pr` picker entry: selecting a PR checks it out and exits the
-        // loop with the new worktree as `chosen` (honoring the nav contract).
+    fn do_checkout_pr_stays_in_list_and_focuses_new_worktree() {
+        // Checking out a PR now always stays in the TUI (issue #46 overhaul): the
+        // new worktree is checked out, the list refreshes and focuses it, and
+        // `chosen` stays unset so the user switches into it with Enter when ready.
         let repo = repo_with_pr(123);
         let (mut t, session, mut app) = setup(&repo);
         t.cx.gh = StdArc::new(FakeGh::with_view(pr_view(123, "pr-feature", "main")));
-        app.exit_on_pr_checkout = true;
         app.mode = Mode::PrPicker(Default::default());
         do_checkout_pr(&mut t.cx, &session, &mut app, 123);
-        let path = app.chosen.clone().expect("chosen path set on checkout");
-        assert!(path.to_string_lossy().ends_with("pr-feature"));
-        assert!(path.is_dir());
+        assert!(app.chosen.is_none());
+        assert_eq!(app.mode, Mode::List);
+        // The picker closed to the list, focused on the new worktree row.
+        assert_eq!(
+            app.selected_worktree().unwrap().branch.as_deref(),
+            Some("pr-feature")
+        );
     }
 
     #[test]
@@ -1672,12 +1781,12 @@ mod tests {
     }
 
     #[test]
-    fn begin_job_sets_label_and_resolves_args() {
+    fn resolve_job_sets_label_key_and_args() {
         use crate::tui::app::testutil::app as make_app;
-        let mut a = make_app(&[("main", true), ("feat/x", false)]);
+        let a = make_app(&[("main", true), ("feat/x", false)]);
 
-        let job = begin_job(
-            &mut a,
+        let (job, key, label) = resolve_job(
+            &a,
             Effect::Create {
                 branch: "feat/new".into(),
                 base: Some("main".into()),
@@ -1686,16 +1795,18 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(job, Job::Create { .. }));
-        assert_eq!(a.busy.as_ref().unwrap().label, "Creating feat/new");
+        assert_eq!(label, "Creating feat/new");
+        assert_eq!(key, JobKey::New("feat/new".into()));
 
-        // Remove resolves the query from the target row's branch.
-        let job = begin_job(&mut a, Effect::Remove(1)).unwrap();
+        // Remove resolves the query and keys on the target row's path.
+        let (job, key, label) = resolve_job(&a, Effect::Remove(1)).unwrap();
         assert!(matches!(job, Job::Remove { query } if query == "feat/x"));
-        assert_eq!(a.busy.as_ref().unwrap().label, "Removing feat/x");
+        assert_eq!(label, "Removing feat/x");
+        assert_eq!(key, JobKey::Path(a.worktrees[1].path.clone()));
 
         // CheckoutBranch resolves the worktree directory from the row.
-        let job = begin_job(
-            &mut a,
+        let (job, key, label) = resolve_job(
+            &a,
             Effect::CheckoutBranch {
                 worktree_index: 0,
                 branch: "feat/x".into(),
@@ -1703,26 +1814,28 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(job, Job::CheckoutBranch { .. }));
-        assert_eq!(a.busy.as_ref().unwrap().label, "Checking out feat/x");
+        assert_eq!(label, "Checking out feat/x");
+        assert_eq!(key, JobKey::Path(a.worktrees[0].path.clone()));
 
         // Sync resolves the worktree directory and labels with the branch.
-        let job = begin_job(&mut a, Effect::Sync { worktree_index: 1 }).unwrap();
+        let (job, _key, label) = resolve_job(&a, Effect::Sync { worktree_index: 1 }).unwrap();
         assert!(matches!(job, Job::Sync { .. }));
-        assert_eq!(a.busy.as_ref().unwrap().label, "Syncing feat/x");
+        assert_eq!(label, "Syncing feat/x");
 
-        let job = begin_job(&mut a, Effect::CheckoutPr(7)).unwrap();
+        let (job, key, label) = resolve_job(&a, Effect::CheckoutPr(7)).unwrap();
         assert!(matches!(job, Job::CheckoutPr { number } if number == 7));
-        assert_eq!(a.busy.as_ref().unwrap().label, "Checking out PR #7");
+        assert_eq!(label, "Checking out PR #7");
+        assert_eq!(key, JobKey::New("PR #7".into()));
     }
 
     #[test]
-    fn begin_job_returns_none_and_stays_idle_for_missing_row() {
+    fn resolve_job_returns_none_for_missing_row() {
         use crate::tui::app::testutil::app as make_app;
-        let mut a = make_app(&[("main", true)]);
-        assert!(begin_job(&mut a, Effect::Remove(99)).is_none());
+        let a = make_app(&[("main", true)]);
+        assert!(resolve_job(&a, Effect::Remove(99)).is_none());
         assert!(
-            begin_job(
-                &mut a,
+            resolve_job(
+                &a,
                 Effect::CheckoutBranch {
                     worktree_index: 99,
                     branch: "x".into()
@@ -1730,11 +1843,26 @@ mod tests {
             )
             .is_none()
         );
-        assert!(begin_job(&mut a, Effect::Sync { worktree_index: 99 }).is_none());
+        assert!(resolve_job(&a, Effect::Sync { worktree_index: 99 }).is_none());
         // A non-background effect also yields no job.
-        assert!(begin_job(&mut a, Effect::Refresh).is_none());
-        // None of those marked the app busy.
-        assert!(!a.is_busy());
+        assert!(resolve_job(&a, Effect::Refresh).is_none());
+    }
+
+    #[test]
+    fn spawn_job_refuses_conflicting_action_on_same_row() {
+        // Two jobs on the same row must not race: the second is refused with a
+        // status note and the registry keeps just the first (issue #46 overhaul).
+        use crate::tui::app::testutil::app as make_app;
+        let mut a = make_app(&[("main", true), ("feat/x", false)]);
+        let key = JobKey::Path(a.worktrees[1].path.clone());
+        a.begin_job(key.clone(), "Removing feat/x");
+        // Simulate the guard the loop's `spawn_job` applies before spawning.
+        let (_, resolved_key, label) = resolve_job(&a, Effect::Sync { worktree_index: 1 }).unwrap();
+        assert_eq!(resolved_key, key);
+        assert!(a.has_job(&resolved_key));
+        a.set_status(format!("{label} — already in progress"), StatusKind::Info);
+        assert_eq!(a.jobs.len(), 1);
+        assert!(a.status_message.as_deref().unwrap().contains("in progress"));
     }
 
     #[test]
