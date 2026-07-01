@@ -2016,6 +2016,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "kono-wt"
+version = "1.2.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "clap_complete",
+ "color-eyre",
+ "crossterm",
+ "directories",
+ "eyre",
+ "futures-util",
+ "gix",
+ "globset",
+ "insta",
+ "jiff",
+ "nucleo-matcher",
+ "predicates",
+ "ratatui",
+ "sendit",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3826,38 +3858,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wt"
-version = "1.2.0"
-dependencies = [
- "assert_cmd",
- "clap",
- "clap_complete",
- "color-eyre",
- "crossterm",
- "directories",
- "eyre",
- "futures-util",
- "gix",
- "globset",
- "insta",
- "jiff",
- "nucleo-matcher",
- "predicates",
- "ratatui",
- "sendit",
- "serde",
- "serde_json",
- "shell-words",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

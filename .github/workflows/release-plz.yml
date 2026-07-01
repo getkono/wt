@@ -1,9 +1,10 @@
 name: Release-plz
 
 # On every push to master, release-plz either opens/updates a "release PR" (version bump +
-# CHANGELOG) or, once that PR is merged, cuts a GitHub Release + `v{version}` tag. Cutting a
-# release then fans out to the build + Homebrew jobs below. crates.io publishing is disabled
-# (see release-plz.toml and RELEASING.md). Docs: https://release-plz.dev
+# CHANGELOG) or, once that PR is merged, cuts a GitHub Release + `v{version}` tag and
+# publishes the crate (`kono-wt`) to crates.io via Trusted Publishing (OIDC). Cutting a
+# release then fans out to the build + Homebrew jobs below. See release-plz.toml and
+# RELEASING.md. Docs: https://release-plz.dev
 on:
   push:
     branches:
@@ -24,6 +25,7 @@ jobs:
     permissions:
       contents: write # push tags, create the GitHub Release
       pull-requests: read
+      id-token: write # crates.io Trusted Publishing (OIDC) — no registry token secret
     # Surfaced to the binary/Homebrew jobs below so they only run when a release
     # was actually cut (not on every push to master).
     outputs:

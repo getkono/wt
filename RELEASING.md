@@ -28,8 +28,8 @@ and configured by [`release-plz.toml`](release-plz.toml).
    [`getkono/homebrew-tap`](https://github.com/getkono/homebrew-tap) as
    `Formula/wt.rb`.
 
-crates.io publishing is intentionally **off** (`publish = false`); see
-[Enabling crates.io later](#enabling-cratesio-later).
+The crate is published to crates.io as `kono-wt` (the binary stays `wt`); see
+[crates.io publishing](#cratesio-publishing).
 
 ## Required repository secrets
 
@@ -39,7 +39,7 @@ Add these under **Settings → Secrets and variables → Actions**:
 | --- | --- | --- |
 | `HOMEBREW_TAP_TOKEN` | **Yes**, for Homebrew | A token (fine-grained PAT or classic with `repo`/`contents:write`) that can **push to `getkono/homebrew-tap`**. Without it, the `update-tap` job logs a notice and skips — the release itself still succeeds. |
 | `RELEASE_PLZ_TOKEN` | Optional | A PAT used by release-plz instead of the built-in `GITHUB_TOKEN`. Needed only so that **CI runs on the release PR** (the built-in token can't trigger workflows) and so the Release shows the maintainer as author. Binaries and the tap work without it. |
-| `CARGO_REGISTRY_TOKEN` | Only when enabling crates.io | crates.io API token for `cargo publish`. Not used while `publish = false`. |
+| `CARGO_REGISTRY_TOKEN` | **No** | Not needed: the release job publishes to crates.io via [Trusted Publishing](#cratesio-publishing) (OIDC), so there is no long-lived registry token. |
 
 The previously documented `SENDIT_DEPLOY_KEY` is **no longer needed**: `sendit`
 is now fetched as a public HTTPS git dependency.
@@ -86,30 +86,30 @@ Check locally before pushing:
 mise run commit-check    # lint origin/master..HEAD
 ```
 
-## Enabling crates.io later
+## crates.io publishing
 
-Two things currently block publishing `wt` to crates.io:
+The crate is published as **`kono-wt`** — the bare `wt` name is an unrelated
+2020 placeholder at `0.0.0`. The `[package]` name is `kono-wt`, while explicit
+`[lib]` and `[[bin]]` sections keep both targets named `wt`, so `cargo install
+kono-wt` installs a `wt` binary and the public API is still imported as `wt::…`.
 
-1. **`sendit` is a git dependency.** crates.io rejects crates with git/path
-   dependencies. `sendit` (`getkono/sendit`) must first be published to
-   crates.io, and `wt`'s dependency changed from `{ git = … }` to a version
-   (`sendit = "x.y.z"`).
-2. **The crate name `wt` is taken** on crates.io (an unrelated 2020 placeholder
-   at `0.0.0`). The published *package* must be renamed (e.g. `kono-wt`) while
-   keeping the binary name `wt`:
-   ```toml
-   [package]
-   name = "kono-wt"
+Publishing is **on** (`publish = true` in `release-plz.toml`). The release job
+authenticates with crates.io via [Trusted Publishing](https://release-plz.dev/docs/extra/trusted-publishing)
+(OIDC): `release-plz.yml` grants the release job `id-token: write`, so there is
+no `CARGO_REGISTRY_TOKEN` secret. `semver_check` stays `false` — `kono-wt` is
+shipped only as a binary, so API checks would just add noise.
 
-   [[bin]]
-   name = "wt"
-   path = "src/main.rs"
+This was unblocked once `sendit` (`getkono/sendit`) was published to crates.io
+and `wt`'s dependency moved from `{ git = … }` to a registry version
+(`sendit = "x.y.z"`); crates.io rejects crates with git/path dependencies.
+
+One-time setup (already done for `kono-wt`, recorded here for reference):
+
+1. Publish the first version manually so the crate exists and is owned by the
+   maintainer (Trusted Publishing is configured against an existing crate):
+   ```bash
+   cargo publish -p kono-wt   # uses your local `cargo login` token
    ```
-
-Once both are resolved:
-
-1. Set `publish = true` in `release-plz.toml` (and remove `semver_check = false`
-   if you want API checks).
-2. Add the `CARGO_REGISTRY_TOKEN` secret, or switch the release job to crates.io
-   [Trusted Publishing](https://release-plz.dev/docs/extra/trusted-publishing)
-   (OIDC) by granting it `id-token: write`.
+2. On crates.io → `kono-wt` → **Trusted Publishing**, add the publisher
+   `getkono/wt` with the `release-plz.yml` workflow. From then on every release
+   PR merge publishes the new version automatically over OIDC.
