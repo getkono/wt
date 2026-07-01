@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "kono-wt"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "assert_cmd",
  "clap",

@@ -11,6 +11,13 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.2.0](https://github.com/getkono/wt/compare/v1.1.0...v1.2.0) - 2026-06-28
+
+### Added
+
+- *(tui)* enable sync on worktree-less branch rows
+- *(sync)* sync worktree-less branches by moving the ref
+
 ## [1.1.0](https://github.com/getkono/wt/releases/tag/v1.1.0) - 2026-06-27
 
 ### Added
