@@ -11,6 +11,20 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.4.0](https://github.com/getkono/wt/compare/v1.3.0...v1.4.0) - 2026-07-02
+
+### Added
+
+- *(tui)* richly explain the blocked exit
+
+### Fixed
+
+- *(tui)* block premature exit while background jobs run
+
+### Other
+
+- *(tui)* route the event-loop exit through App::exit_now
+
 ## [1.3.0](https://github.com/getkono/wt/compare/v1.2.0...v1.3.0) - 2026-07-01
 
 ### Added
