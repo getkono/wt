@@ -56,15 +56,36 @@ pub enum Mode {
     /// default (issue #50): initialize them recursively, or leave them. Defaults
     /// to yes.
     ConfirmInitSubmodules(InitSubmodulesState),
-    /// Confirm dialog shown when the user quits while background jobs are still
-    /// running: quit anyway (abandoning them) or cancel. Carries how many jobs
-    /// were in flight, for the prompt text.
-    ConfirmQuit {
-        /// The number of background jobs running when the quit was requested.
-        jobs: usize,
-    },
+    /// The single blocking overlay shown when an exit is requested (quit or
+    /// switch) while background jobs are still running (issue #46 overhaul). It
+    /// blocks the TUI and richly explains why: the pending [`ExitIntent`] is held
+    /// so the loop can complete it once the jobs drain, while the user can abandon
+    /// them (killing in-flight git subprocesses) or keep working.
+    ExitBlocked(ExitBlockedState),
     /// Help overlay.
     Help,
+}
+
+/// Why the TUI is trying to leave (issue #46 overhaul): the exit a user — or,
+/// defensively, a finished job — requested, held on [`Mode::ExitBlocked`] so a
+/// blocked exit can be replayed once the background jobs drain, or forced
+/// immediately if the user abandons them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitIntent {
+    /// Quit without switching (the `q` path).
+    Quit,
+    /// Switch into the worktree at this path (the Enter path).
+    Switch(PathBuf),
+}
+
+/// The state behind [`Mode::ExitBlocked`]: the pending exit to complete once the
+/// in-flight background jobs finish. Rendered as a blocking overlay listing the
+/// running jobs and the cost of abandoning them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitBlockedState {
+    /// What the user is trying to do, replayed when the jobs drain or forced when
+    /// the user abandons them.
+    pub intent: ExitIntent,
 }
 
 /// Which pane has focus.
@@ -470,6 +491,53 @@ impl App {
     /// Whether any background job is in flight (keeps the animation ticker awake).
     pub fn any_jobs(&self) -> bool {
         !self.jobs.is_empty()
+    }
+
+    /// The single exit gate every voluntary-exit path funnels through (issue #46
+    /// overhaul): pressing `q`, or Enter to switch into a worktree. With no
+    /// background jobs it commits `intent` immediately; with jobs in flight it
+    /// opens the blocking [`Mode::ExitBlocked`] overlay instead and returns
+    /// [`Effect::None`], so the loop keeps running (and finishing its jobs) until
+    /// they drain or the user decides.
+    pub fn request_exit(&mut self, intent: ExitIntent) -> Effect {
+        if self.any_jobs() {
+            self.mode = Mode::ExitBlocked(ExitBlockedState { intent });
+            Effect::None
+        } else {
+            self.commit_exit(intent)
+        }
+    }
+
+    /// Records a committed exit on the app and returns its exit [`Effect`]: a quit,
+    /// or a switch into the chosen worktree. Shared by the immediate path (no jobs)
+    /// and the deferred/abandon paths out of [`Mode::ExitBlocked`].
+    pub(crate) fn commit_exit(&mut self, intent: ExitIntent) -> Effect {
+        match intent {
+            ExitIntent::Quit => {
+                self.quit = true;
+                Effect::Quit
+            }
+            ExitIntent::Switch(path) => {
+                self.chosen = Some(path.clone());
+                Effect::Switch(path)
+            }
+        }
+    }
+
+    /// Whether the event loop should exit after a background job just finished —
+    /// the single break predicate the loop consults (issue #46 overhaul). A blocked
+    /// exit that has been waiting for its jobs completes once the last one drains;
+    /// otherwise a job that recorded a path to switch into still exits (defensive —
+    /// no job does today).
+    pub fn exit_now(&mut self) -> bool {
+        if let Mode::ExitBlocked(state) = &self.mode
+            && !self.any_jobs()
+        {
+            let intent = state.intent.clone();
+            self.commit_exit(intent);
+            return true;
+        }
+        self.chosen.is_some()
     }
 
     /// A compact status-bar summary of the in-flight jobs — the count and the
@@ -1017,6 +1085,56 @@ mod tests {
         a.mode = Mode::Checkout(Default::default());
         assert!(a.may_apply_mode(JobHome::Checkout));
         assert!(!a.may_apply_mode(JobHome::Create));
+    }
+
+    #[test]
+    fn may_apply_mode_is_false_while_exit_blocked() {
+        // Load-bearing invariant: `ExitBlocked` is NOT an idle mode, so a finished
+        // create job's follow-up (e.g. submodule init) is *queued* rather than
+        // opening a `ConfirmInitSubmodules` modal over the blocking overlay — which
+        // is what lets the loop keep waiting for that follow-up to drain instead of
+        // clobbering the overlay or exiting early (issue #46 overhaul).
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::ExitBlocked(ExitBlockedState {
+            intent: ExitIntent::Quit,
+        });
+        assert!(!a.may_apply_mode(JobHome::List));
+        assert!(!a.may_apply_mode(JobHome::Create));
+        assert!(!a.may_apply_mode(JobHome::Checkout));
+        assert!(!a.may_apply_mode(JobHome::PrPicker));
+    }
+
+    #[test]
+    fn request_exit_commits_immediately_when_idle() {
+        // No jobs: the gate commits the intent right away (the common case).
+        let mut a = app(&[("a", true)]);
+        assert_eq!(a.request_exit(ExitIntent::Quit), Effect::Quit);
+        assert!(a.quit);
+
+        let mut b = app(&[("a", true)]);
+        let path = PathBuf::from("/r/feat");
+        assert_eq!(
+            b.request_exit(ExitIntent::Switch(path.clone())),
+            Effect::Switch(path.clone())
+        );
+        assert_eq!(b.chosen, Some(path));
+    }
+
+    #[test]
+    fn request_exit_blocks_and_exit_now_drains() {
+        // Jobs in flight: the gate blocks (no commit) and holds the intent; the
+        // loop's `exit_now` predicate stays false until the last job drains, then
+        // commits the held intent exactly once.
+        let mut a = app(&[("a", true)]);
+        let key = JobKey::New("x".into());
+        a.begin_job(key.clone(), "Creating x");
+        assert_eq!(a.request_exit(ExitIntent::Quit), Effect::None);
+        assert!(matches!(a.mode, Mode::ExitBlocked(_)));
+        assert!(!a.quit);
+        assert!(!a.exit_now()); // still waiting
+        a.finish_job(&key);
+        assert!(a.exit_now()); // drained → commit
+        assert!(a.quit);
     }
 
     #[test]
