@@ -472,6 +472,14 @@ impl App {
         !self.jobs.is_empty()
     }
 
+    /// Whether the event loop should exit after a background job just finished.
+    /// The single break predicate the loop consults so every job-driven exit
+    /// funnels through one place (issue #46 overhaul): today that is only a job
+    /// that recorded a path to switch into.
+    pub fn exit_now(&mut self) -> bool {
+        self.chosen.is_some()
+    }
+
     /// A compact status-bar summary of the in-flight jobs — the count and the
     /// first job's label — so background work stays visible even when its row is
     /// scrolled off. `None` when idle.

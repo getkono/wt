@@ -225,7 +225,7 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
                     spawn_job(cx, app, effect, &job_tx);
                 }
                 tui.draw(app)?;
-                if app.chosen.is_some() {
+                if app.exit_now() {
                     break;
                 }
             }
