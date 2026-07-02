@@ -19,8 +19,8 @@ use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
-    App, CheckoutState, ComposeField, CreateState, CreateStep, InitSubmodulesState, Mode, Pane,
-    PrComposeState, PrPickerState, StaleBaseState,
+    App, CheckoutState, ComposeField, CreateState, CreateStep, ExitBlockedState, ExitIntent,
+    InitSubmodulesState, Mode, Pane, PrComposeState, PrPickerState, StaleBaseState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -64,7 +64,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::ConfirmInitSubmodules(state) => {
             modals::render_confirm_init_submodules(app, state, frame, area)
         }
-        Mode::ConfirmQuit { jobs } => modals::render_confirm_quit(app, *jobs, frame, area),
+        Mode::ExitBlocked(state) => modals::render_exit_blocked(app, state, frame, area),
         _ => {}
     }
 }
@@ -244,7 +244,10 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::ConfirmDeleteBranch { .. } => "DELETE",
         Mode::ConfirmStaleBase(_) => "CREATE",
         Mode::ConfirmInitSubmodules(_) => "SUBMODULES",
-        Mode::ConfirmQuit { .. } => "QUIT",
+        Mode::ExitBlocked(state) => match state.intent {
+            ExitIntent::Quit => "QUIT",
+            ExitIntent::Switch(_) => "SWITCH",
+        },
         Mode::Help => "HELP",
     }
 }
@@ -287,7 +290,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
         Mode::ConfirmStaleBase(_) => hint_pairs(hints::confirm_stale_base_hints()),
         Mode::ConfirmInitSubmodules(_) => hint_pairs(hints::confirm_init_submodules_hints()),
-        Mode::ConfirmQuit { .. } => hint_pairs(hints::confirm_quit_hints()),
+        Mode::ExitBlocked(_) => hint_pairs(hints::exit_blocked_hints()),
         Mode::Help => hint_pairs(hints::help_hints()),
     }
 }
@@ -1209,12 +1212,18 @@ mod tests {
     }
 
     #[test]
-    fn confirm_quit_modal_renders_over_mode() {
+    fn exit_blocked_modal_renders_over_mode() {
+        use crate::tui::app::{ExitBlockedState, ExitIntent, JobKey};
         let mut a = app(&[("main", true)]);
-        a.mode = crate::tui::app::Mode::ConfirmQuit { jobs: 2 };
+        a.begin_job(JobKey::New("feat".into()), "Creating feat");
+        a.begin_job(JobKey::New("other".into()), "Creating other");
+        a.mode = crate::tui::app::Mode::ExitBlocked(ExitBlockedState {
+            intent: ExitIntent::Quit,
+        });
         let text = render_to_text(&a, 100, 20);
-        assert!(text.contains("confirm quit"));
+        assert!(text.contains("finishing up"));
         assert!(text.contains("2 background jobs"));
-        assert!(text.contains("Quit anyway?"));
+        assert!(text.contains("abandon"));
+        assert!(text.contains("keep working"));
     }
 }

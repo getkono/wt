@@ -10,7 +10,9 @@ use crossterm::event::{
 };
 
 use crate::keys::{KeyAction, KeyChord};
-use crate::tui::app::{App, ComposeField, CreateState, CreateStep, MIN_HEIGHT, Mode, Pane};
+use crate::tui::app::{
+    App, ComposeField, CreateState, CreateStep, ExitIntent, MIN_HEIGHT, Mode, Pane,
+};
 
 /// The minimum/maximum list-pane width when resizing.
 const MIN_SIDEBAR: u16 = 10;
@@ -229,7 +231,7 @@ impl App {
             Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
             Mode::ConfirmStaleBase(_) => self.key_confirm_stale_base(key),
             Mode::ConfirmInitSubmodules(_) => self.key_confirm_init_submodules(key),
-            Mode::ConfirmQuit { .. } => self.key_confirm_quit(key),
+            Mode::ExitBlocked(_) => self.key_exit_blocked(key),
             Mode::Help => {
                 self.mode = Mode::List;
                 Effect::None
@@ -255,9 +257,12 @@ impl App {
                 if let Some(&index) = self.visible.get(self.selected) {
                     let wt = &self.worktrees[index];
                     if wt.has_worktree {
+                        // Switching abandons any in-flight background job on exit
+                        // (shutdown kills its git subprocess), so it goes through
+                        // the single exit gate: it blocks with an explanation while
+                        // jobs run, else switches immediately (issue #46 overhaul).
                         let path = wt.path.clone();
-                        self.chosen = Some(path.clone());
-                        return Effect::Switch(path);
+                        return self.request_exit(ExitIntent::Switch(path));
                     }
                     // A worktree-less branch row: confirm before creating a
                     // worktree and switching into it (issue #47).
@@ -346,16 +351,10 @@ impl App {
             KeyAction::Help => self.mode = Mode::Help,
             KeyAction::Quit => {
                 // Quitting while background jobs run would abandon them (killing
-                // in-flight git subprocesses), so confirm first (issue #46
-                // overhaul); with nothing running, quit immediately.
-                if self.any_jobs() {
-                    self.mode = Mode::ConfirmQuit {
-                        jobs: self.jobs.len(),
-                    };
-                } else {
-                    self.quit = true;
-                    return Effect::Quit;
-                }
+                // in-flight git subprocesses), so it goes through the single exit
+                // gate: it blocks with an explanation while jobs run, else quits
+                // immediately (issue #46 overhaul).
+                return self.request_exit(ExitIntent::Quit);
             }
             KeyAction::ToggleSidebar => self.show_sidebar = !self.show_sidebar,
             KeyAction::ResizeSidebarGrow => {
@@ -706,14 +705,30 @@ impl App {
         }
     }
 
-    /// Confirm-quit key handling (issue #46 overhaul): `y`/`Y` quits, abandoning
-    /// the running background jobs; any other key cancels back to the list.
-    fn key_confirm_quit(&mut self, key: KeyEvent) -> Effect {
-        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-            self.quit = true;
-            Effect::Quit
-        } else {
+    /// Blocked-exit key handling (issue #46 overhaul). The overlay is the wait
+    /// state; doing nothing lets the jobs finish and the loop auto-completes the
+    /// exit. `y`/`Y` — or the intent's own trigger key (`q` for quit, `Enter` for
+    /// switch) — abandons the running jobs and exits now; `Esc`/`n`/`N` keeps
+    /// working (the jobs continue in the background); any other key is ignored.
+    fn key_exit_blocked(&mut self, key: KeyEvent) -> Effect {
+        let Mode::ExitBlocked(state) = &self.mode else {
+            return Effect::None;
+        };
+        let intent = state.intent.clone();
+        let abandon = matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+            || match intent {
+                ExitIntent::Quit => matches!(key.code, KeyCode::Char('q')),
+                ExitIntent::Switch(_) => matches!(key.code, KeyCode::Enter),
+            };
+        if abandon {
+            self.commit_exit(intent)
+        } else if matches!(
+            key.code,
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N')
+        ) {
             self.mode = Mode::List;
+            Effect::None
+        } else {
             Effect::None
         }
     }
@@ -1050,25 +1065,75 @@ mod tests {
     }
 
     #[test]
-    fn quit_with_jobs_confirms_first() {
-        // Quitting while a background job runs opens the confirm dialog rather than
-        // abandoning it outright (issue #46 overhaul).
-        use crate::tui::app::JobKey;
+    fn quit_with_jobs_blocks_the_exit() {
+        // Quitting while a background job runs opens the blocking exit overlay
+        // rather than abandoning it outright (issue #46 overhaul).
+        use crate::tui::app::{ExitIntent, JobKey};
         let mut a = app(&[("a", true)]);
         a.begin_job(JobKey::New("feat".into()), "Creating feat");
         assert_eq!(a.handle_event(press(KeyCode::Char('q'))), Effect::None);
-        assert!(matches!(a.mode, Mode::ConfirmQuit { jobs: 1 }));
+        assert!(matches!(
+            a.mode,
+            Mode::ExitBlocked(ref s) if s.intent == ExitIntent::Quit
+        ));
         assert!(!a.quit);
-        // `y` quits and abandons the jobs; any other key cancels back to the list.
+        // `y` abandons the jobs and quits now.
         assert_eq!(a.handle_event(press(KeyCode::Char('y'))), Effect::Quit);
         assert!(a.quit);
-        // Cancel path.
+        // `q` (the quit trigger) is also an abandon alias.
         let mut b = app(&[("a", true)]);
         b.begin_job(JobKey::New("feat".into()), "Creating feat");
         b.handle_event(press(KeyCode::Char('q')));
-        assert_eq!(b.handle_event(press(KeyCode::Char('n'))), Effect::None);
-        assert_eq!(b.mode, Mode::List);
-        assert!(!b.quit);
+        assert_eq!(b.handle_event(press(KeyCode::Char('q'))), Effect::Quit);
+        assert!(b.quit);
+        // `Esc`/`n` keeps working: back to the list, jobs continue, no quit.
+        let mut c = app(&[("a", true)]);
+        c.begin_job(JobKey::New("feat".into()), "Creating feat");
+        c.handle_event(press(KeyCode::Char('q')));
+        assert_eq!(c.handle_event(press(KeyCode::Char('n'))), Effect::None);
+        assert_eq!(c.mode, Mode::List);
+        assert!(!c.quit);
+        assert!(c.any_jobs());
+    }
+
+    #[test]
+    fn switch_with_jobs_blocks_the_exit() {
+        // Enter-to-switch is the reported premature-exit path: switching abandons
+        // in-flight jobs on exit, so it now blocks the same way quitting does
+        // (issue #46 overhaul).
+        use crate::tui::app::{ExitIntent, JobKey};
+        let mut a = app(&[("main", true), ("feat", false)]);
+        a.selected = 1;
+        a.begin_job(JobKey::New("other".into()), "Creating other");
+        assert_eq!(a.handle_event(press(KeyCode::Enter)), Effect::None);
+        assert!(matches!(
+            a.mode,
+            Mode::ExitBlocked(ref s)
+                if s.intent == ExitIntent::Switch(std::path::PathBuf::from("/r/feat"))
+        ));
+        assert!(a.chosen.is_none()); // not committed while blocked
+        // Enter (the switch trigger) abandons and switches now.
+        assert_eq!(
+            a.handle_event(press(KeyCode::Enter)),
+            Effect::Switch(std::path::PathBuf::from("/r/feat"))
+        );
+        assert_eq!(a.chosen, Some(std::path::PathBuf::from("/r/feat")));
+    }
+
+    #[test]
+    fn blocked_exit_completes_when_jobs_drain() {
+        // The overlay is the wait state; once the last job finishes, `exit_now`
+        // (the loop's break predicate) commits the held intent (issue #46 overhaul).
+        use crate::tui::app::JobKey;
+        let mut a = app(&[("main", true), ("feat", false)]);
+        a.selected = 1;
+        let key = JobKey::New("other".into());
+        a.begin_job(key.clone(), "Creating other");
+        a.handle_event(press(KeyCode::Enter));
+        assert!(!a.exit_now()); // still waiting: a job is in flight
+        a.finish_job(&key);
+        assert!(a.exit_now()); // last job drained → commit the switch
+        assert_eq!(a.chosen, Some(std::path::PathBuf::from("/r/feat")));
     }
 
     #[test]

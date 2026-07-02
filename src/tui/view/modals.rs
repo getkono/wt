@@ -760,27 +760,41 @@ pub(super) fn render_confirm_init_submodules(
     );
 }
 
-/// Renders the confirm-quit dialog shown when the user quits while background
-/// jobs are still running (issue #46 overhaul): quitting abandons them (in-flight
-/// git subprocesses are killed, which can leave e.g. a partial submodule clone),
-/// so it asks first.
-pub(super) fn render_confirm_quit(app: &App, jobs: usize, frame: &mut Frame, area: Rect) {
+/// Renders the blocking exit overlay shown when an exit is requested (quit or
+/// switch) while background jobs are still running (issue #46 overhaul). The exit
+/// waits for the jobs to finish on its own; abandoning them kills their in-flight
+/// git subprocesses (which can leave e.g. a partial submodule clone), so it says
+/// so before offering the choice.
+pub(super) fn render_exit_blocked(
+    app: &App,
+    state: &ExitBlockedState,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let theme = Theme::with_palette(app.color, app.palette);
+    let jobs = app.jobs.len();
     let plural = if jobs == 1 { "job" } else { "jobs" };
+    let action = match &state.intent {
+        ExitIntent::Quit => "quitting".to_string(),
+        ExitIntent::Switch(path) => format!("switching into {}", path.display()),
+    };
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("{jobs} background {plural}"), theme.warning()),
-            Span::raw(" still running."),
+            Span::raw(format!("Finishing {jobs} background {plural} before ")),
+            Span::styled(action, theme.label()),
+            Span::raw("."),
         ]),
         Line::from(Span::styled(
-            "Quitting now abandons them and may leave partial work.",
+            "Abandoning now kills them and may leave partial work.",
             theme.hint_label(),
         )),
         Line::from(""),
         Line::from(vec![
-            Span::raw("Quit anyway? ["),
+            Span::raw("["),
             Span::styled("y", theme.warning()),
-            Span::raw("/N]"),
+            Span::raw("] abandon    ["),
+            Span::styled("Esc", theme.hint_label()),
+            Span::raw("] keep working"),
         ]),
     ];
 
@@ -789,7 +803,7 @@ pub(super) fn render_confirm_quit(app: &App, jobs: usize, frame: &mut Frame, are
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(Span::styled("confirm quit", theme.error())))
+            .block(Block::bordered().title(Span::styled("finishing up", theme.error())))
             .wrap(Wrap { trim: false }),
         rect,
     );

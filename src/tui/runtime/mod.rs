@@ -136,22 +136,28 @@ fn drive_tui(
 
 /// Resolves where the shell lands after a graceful TUI exit (issue #68).
 ///
-/// An explicit switch (`chosen`) is always honoured. Otherwise, when the
-/// directory the TUI was opened in was deleted during the session — typically by
-/// removing the current worktree from the dashboard — the user must not be left
-/// in a directory that no longer exists. In that case the shell is steered back
-/// to the repository root (the returned path, printed to stdout) with a friendly
-/// note on stderr; if the root is also gone, only the note is emitted and no
-/// navigation occurs. When the opened-in directory survives, nothing is printed
-/// and the user stays put.
+/// An explicit switch (`chosen`) into a directory that still exists is always
+/// honoured. A blocked exit that waited for its jobs may have switched into a
+/// worktree a *different* finished job then removed (issue #46 overhaul), so a
+/// `chosen` path that no longer exists falls through to the same recovery as a
+/// plain quit rather than landing the shell in a deleted directory. Otherwise,
+/// when the directory the TUI was opened in was deleted during the session —
+/// typically by removing the current worktree from the dashboard — the user must
+/// not be left in a directory that no longer exists. In that case the shell is
+/// steered back to the repository root (the returned path, printed to stdout) with
+/// a friendly note on stderr; if the root is also gone, only the note is emitted
+/// and no navigation occurs. When the opened-in directory survives, nothing is
+/// printed and the user stays put.
 fn finish_exit(
     cx: &mut Cx,
     opened_in: &Path,
     primary_root: &Path,
     chosen: Option<PathBuf>,
 ) -> Result<Option<PathBuf>> {
-    if chosen.is_some() {
-        return Ok(chosen);
+    if let Some(path) = chosen
+        && path.exists()
+    {
+        return Ok(Some(path));
     }
     if opened_in.exists() {
         return Ok(None);
@@ -1333,6 +1339,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_create_while_exit_blocked_queues_submodule_job_and_keeps_waiting() {
+        // The premature-exit fix end to end: a create job finishes while the exit
+        // is blocked and, under the `prompt` policy, its submodule-init follow-up
+        // must be *queued* (not opened as a modal over the overlay) so the loop
+        // keeps waiting for it to drain rather than switching prematurely
+        // (issue #46 overhaul). This depends on `ExitBlocked` not being an idle
+        // mode in `may_apply_mode`.
+        use crate::tui::app::{ExitBlockedState, ExitIntent, JobKey};
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let (t, session, mut app) = setup(&repo);
+        // Stand in for the loop state after the create job finished while blocked:
+        // the switch is pending, and the (now-finished) create job is cleared.
+        app.mode = Mode::ExitBlocked(ExitBlockedState {
+            intent: ExitIntent::Switch(session.primary_root.clone()),
+        });
+        apply_create(
+            &t.cx,
+            &mut app,
+            "feature",
+            None,
+            CreateOutcome::CreatedNeedsSubmodules {
+                dir: session.primary_root.clone(),
+                count: 1,
+                auto: false, // `prompt` policy — would normally open the modal
+            },
+            &session.primary_root,
+        );
+        // The overlay is preserved (no ConfirmInitSubmodules clobber)...
+        assert!(matches!(app.mode, Mode::ExitBlocked(_)));
+        // ...and the init was queued as a follow-up.
+        let queued = app.take_pending_jobs();
+        assert!(
+            queued
+                .iter()
+                .any(|e| matches!(e, Effect::InitSubmodules { .. }))
+        );
+        // Simulate the loop spawning that follow-up: while it runs, the exit keeps
+        // waiting; once it drains, the held switch commits.
+        let key = JobKey::Path(session.primary_root.clone());
+        app.begin_job(key.clone(), "Initializing 1 submodule(s)");
+        assert!(!app.exit_now());
+        app.finish_job(&key);
+        assert!(app.exit_now());
+        assert_eq!(app.chosen, Some(session.primary_root.clone()));
+    }
+
+    #[test]
     fn do_fetch_prs_populates_picker() {
         let repo = TestRepo::init();
         let (mut t, session, mut app) = setup(&repo);
@@ -1914,18 +1968,32 @@ mod tests {
 
     #[test]
     fn finish_exit_honors_explicit_switch() {
-        // An explicit switch is passed through untouched, even if the opened-in
-        // directory is gone.
+        // An explicit switch into a directory that still exists is passed through
+        // untouched, even if the opened-in directory is gone.
+        let chosen = tempfile::tempdir().unwrap();
         let mut t = test_cx(&[], "/work");
-        let chosen = PathBuf::from("/somewhere/else");
         let out = finish_exit(
             &mut t.cx,
             Path::new("/deleted"),
             Path::new("/deleted-root"),
-            Some(chosen.clone()),
+            Some(chosen.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(out, Some(chosen));
+        assert_eq!(out.as_deref(), Some(chosen.path()));
+        assert!(t.err.contents().is_empty());
+    }
+
+    #[test]
+    fn finish_exit_drops_chosen_that_was_removed() {
+        // A blocked exit that switched into a worktree a *different* finished job
+        // then removed must not land the shell in the deleted directory: the dead
+        // `chosen` is dropped and it falls through to the normal recovery — here the
+        // opened-in dir still exists, so stay put (issue #46 overhaul).
+        let opened = tempfile::tempdir().unwrap();
+        let gone_chosen = opened.path().join("wt-removed");
+        let mut t = test_cx(&[], "/work");
+        let out = finish_exit(&mut t.cx, opened.path(), opened.path(), Some(gone_chosen)).unwrap();
+        assert_eq!(out, None);
         assert!(t.err.contents().is_empty());
     }
 
