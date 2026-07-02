@@ -1212,18 +1212,58 @@ mod tests {
     }
 
     #[test]
-    fn exit_blocked_modal_renders_over_mode() {
+    fn exit_blocked_modal_lists_jobs_and_intent() {
         use crate::tui::app::{ExitBlockedState, ExitIntent, JobKey};
         let mut a = app(&[("main", true)]);
         a.begin_job(JobKey::New("feat".into()), "Creating feat");
-        a.begin_job(JobKey::New("other".into()), "Creating other");
+        a.begin_job(
+            JobKey::Path(std::path::PathBuf::from("/r/x")),
+            "Initializing 2 submodule(s)",
+        );
         a.mode = crate::tui::app::Mode::ExitBlocked(ExitBlockedState {
             intent: ExitIntent::Quit,
         });
         let text = render_to_text(&a, 100, 20);
         assert!(text.contains("finishing up"));
+        assert!(text.contains("Quitting"));
         assert!(text.contains("2 background jobs"));
+        // The live list names each job the user would abandon.
+        assert!(text.contains("Creating feat"));
+        assert!(text.contains("Initializing 2 submodule(s)"));
+        // ...and the cost + the choice.
+        assert!(text.contains("partial work"));
         assert!(text.contains("abandon"));
         assert!(text.contains("keep working"));
+    }
+
+    #[test]
+    fn exit_blocked_modal_shows_switch_destination_and_spinner() {
+        use crate::tui::app::{ExitBlockedState, ExitIntent, JobKey};
+        let mut a = app(&[("main", true)]);
+        a.nerd_fonts = true; // distinctive (braille) spinner glyph to assert on
+        a.begin_job(JobKey::New("feat".into()), "Creating feat");
+        a.spinner_frame = 2;
+        a.mode = crate::tui::app::Mode::ExitBlocked(ExitBlockedState {
+            intent: ExitIntent::Switch(std::path::PathBuf::from("/r/feat")),
+        });
+        let text = render_to_text(&a, 100, 20);
+        assert!(text.contains("Switching into"));
+        assert!(text.contains("/r/feat"));
+        // The animated spinner for the current frame renders next to the job.
+        assert!(text.contains(Glyphs::new(true).spinner_frame(2)));
+    }
+
+    #[test]
+    fn exit_blocked_modal_caps_long_job_list() {
+        use crate::tui::app::{ExitBlockedState, ExitIntent, JobKey};
+        let mut a = app(&[("main", true)]);
+        for i in 0..12 {
+            a.begin_job(JobKey::New(format!("j{i}")), format!("Job {i}"));
+        }
+        a.mode = crate::tui::app::Mode::ExitBlocked(ExitBlockedState {
+            intent: ExitIntent::Quit,
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("more")); // capped list ends with "… N more"
     }
 }

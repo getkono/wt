@@ -160,8 +160,8 @@ mod tests {
     use super::*;
     use crate::tui::app::testutil::app;
     use crate::tui::app::{
-        App, CheckoutState, ComposeField, CreateState, CreateStep, Mode, PrComposeState, PrItem,
-        PrPickerState, StaleBaseState,
+        App, CheckoutState, ComposeField, CreateState, CreateStep, ExitBlockedState, ExitIntent,
+        Mode, PrComposeState, PrItem, PrPickerState, StaleBaseState,
     };
     use crate::tui::event::Effect;
     use crate::tui::options::OptionList;
@@ -186,6 +186,7 @@ mod tests {
             confirm_create_hints(),
             confirm_delete_branch_hints(),
             confirm_stale_base_hints(),
+            exit_blocked_hints(),
             help_hints(),
         ];
         for table in tables {
@@ -297,6 +298,11 @@ mod tests {
                     can_fast_forward: true,
                 })
             }
+            "exit_blocked" => {
+                a.mode = Mode::ExitBlocked(ExitBlockedState {
+                    intent: ExitIntent::Quit,
+                })
+            }
             "help" => a.mode = Mode::Help,
             other => panic!("unknown mode {other}"),
         }
@@ -338,6 +344,7 @@ mod tests {
         assert_hints_live("confirm_create", confirm_create_hints());
         assert_hints_live("confirm_delete_branch", confirm_delete_branch_hints());
         assert_hints_live("confirm_stale_base", confirm_stale_base_hints());
+        assert_hints_live("exit_blocked", exit_blocked_hints());
         assert_hints_live("help", help_hints());
     }
 }

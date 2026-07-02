@@ -37,6 +37,10 @@ pub(super) fn render_help(app: &App, frame: &mut Frame, area: Rect) {
 /// The most option rows shown at once in an inline dropdown before it scrolls.
 const OPTION_ROWS: usize = 6;
 
+/// The most in-flight jobs listed in the blocked-exit overlay before it caps with
+/// a "N more" hint (jobs are usually few; this just bounds a pathological list).
+const EXIT_JOB_ROWS: usize = 8;
+
 /// Builds the inline option-dropdown lines for an open [`OptionList`] (issue
 /// #25): each match on its own line with the cursor row highlighted, windowed to
 /// [`OPTION_ROWS`] and capped with a "N more" hint. Shared by the create and
@@ -762,9 +766,9 @@ pub(super) fn render_confirm_init_submodules(
 
 /// Renders the blocking exit overlay shown when an exit is requested (quit or
 /// switch) while background jobs are still running (issue #46 overhaul). The exit
-/// waits for the jobs to finish on its own; abandoning them kills their in-flight
-/// git subprocesses (which can leave e.g. a partial submodule clone), so it says
-/// so before offering the choice.
+/// waits for the jobs to finish on its own, so the overlay explains what it is
+/// waiting for — the pending action, the live list of in-flight jobs with the
+/// animated spinner, and the cost of abandoning them — then offers the choice.
 pub(super) fn render_exit_blocked(
     app: &App,
     state: &ExitBlockedState,
@@ -772,31 +776,62 @@ pub(super) fn render_exit_blocked(
     area: Rect,
 ) {
     let theme = Theme::with_palette(app.color, app.palette);
+    let glyphs = Glyphs::new(app.nerd_fonts);
     let jobs = app.jobs.len();
     let plural = if jobs == 1 { "job" } else { "jobs" };
-    let action = match &state.intent {
-        ExitIntent::Quit => "quitting".to_string(),
-        ExitIntent::Switch(path) => format!("switching into {}", path.display()),
-    };
-    let lines = vec![
-        Line::from(vec![
-            Span::raw(format!("Finishing {jobs} background {plural} before ")),
-            Span::styled(action, theme.label()),
-            Span::raw("."),
+
+    // What the exit will do once the jobs drain (the held intent).
+    let mut lines = vec![match &state.intent {
+        ExitIntent::Quit => Line::from("Quitting once the background work finishes."),
+        ExitIntent::Switch(path) => Line::from(vec![
+            Span::raw("Switching into "),
+            Span::styled(path.display().to_string(), theme.label()),
+            Span::raw(" once the background work finishes."),
         ]),
-        Line::from(Span::styled(
-            "Abandoning now kills them and may leave partial work.",
+    }];
+    lines.push(Line::from(Span::styled(
+        format!("Waiting for {jobs} background {plural} to finish:"),
+        theme.hint_label(),
+    )));
+
+    // The live, animated list of exactly what would be abandoned. The shared
+    // spinner frame is ticked by the loop while any job runs, so these advance in
+    // place; the list is capped so a pathological count can't overflow the modal.
+    let spinner = glyphs.spinner_frame(app.spinner_frame);
+    for job in app.jobs.iter().take(EXIT_JOB_ROWS) {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(spinner.to_string(), theme.spinner()),
+            Span::raw(" "),
+            Span::styled(job.label.clone(), theme.label()),
+        ]));
+    }
+    if jobs > EXIT_JOB_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("  … {} more", jobs - EXIT_JOB_ROWS),
             theme.hint_label(),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("["),
-            Span::styled("y", theme.warning()),
-            Span::raw("] abandon    ["),
-            Span::styled("Esc", theme.hint_label()),
-            Span::raw("] keep working"),
-        ]),
-    ];
+        )));
+    }
+
+    // The cost of abandoning now, then the choice. Kept to two pre-wrapped lines
+    // (each within the modal's inner width) so the content-sized height is exact.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Abandoning now kills their git subprocesses and may leave",
+        theme.warning(),
+    )));
+    lines.push(Line::from(Span::styled(
+        "partial work (e.g. half-initialized submodules).",
+        theme.warning(),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("["),
+        Span::styled("y", theme.warning()),
+        Span::raw("] abandon    ["),
+        Span::styled("Esc", theme.hint_label()),
+        Span::raw("] keep working"),
+    ]));
 
     let height = lines.len() as u16 + 2;
     let rect = centered(area, 72, height);
