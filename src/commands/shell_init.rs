@@ -13,6 +13,13 @@
 //! `wt pr open` succeeds by printing a PR *URL*. Without the guard the wrapper
 //! would `cd` into that URL and fail with "no such file or directory" — so any
 //! non-directory stdout is reprinted instead (issue #40).
+//!
+//! `--start` (issue #89) cannot use the capture at all: it runs the user's
+//! command in the new worktree, and that command needs the real terminal. So the
+//! wrapper takes a separate branch — it points `$WT_CD_FILE` at a temp file and
+//! runs `wt` with stdio inherited. `wt` writes the worktree path into that file
+//! before running the command, and the wrapper `cd`s there once `wt` exits. The
+//! command's exit status is `wt`'s, and is propagated to the caller.
 
 use clap_complete::Shell;
 
@@ -42,6 +49,16 @@ wt() {
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
+          # --start runs a command in the new worktree, so it needs the real
+          # terminal: run wt with stdio inherited and take the path via a file.
+          --start|--start=*)
+            local __wt_cd __wt_code
+            __wt_cd="$(mktemp)"
+            WT_CD_FILE="$__wt_cd" command wt "$@"; __wt_code=$?
+            [ -s "$__wt_cd" ] && builtin cd -- "$(cat "$__wt_cd")"
+            rm -f "$__wt_cd"
+            return "$__wt_code"
+            ;;
           --json|--print-path|-h|--help|-V|--version) command wt "$@"; return $? ;;
         esac
       done
@@ -97,6 +114,16 @@ wt() {
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
+          # --start runs a command in the new worktree, so it needs the real
+          # terminal: run wt with stdio inherited and take the path via a file.
+          --start|--start=*)
+            local __wt_cd __wt_code
+            __wt_cd="$(mktemp)"
+            WT_CD_FILE="$__wt_cd" command wt "$@"; __wt_code=$?
+            [[ -s "$__wt_cd" ]] && builtin cd -- "$(cat "$__wt_cd")"
+            rm -f "$__wt_cd"
+            return $__wt_code
+            ;;
           --json|--print-path|-h|--help|-V|--version) command wt "$@"; return $? ;;
         esac
       done
@@ -136,6 +163,21 @@ const FISH: &str = r#"# wt shell integration (fish) — source this from your co
 function wt
     set -l cmd $argv[1]
     if test (count $argv) -eq 0; or contains -- "$cmd" switch sw checkout co new pr drop ui tui
+        # --start runs a command in the new worktree, so it needs the real
+        # terminal: run wt with stdio inherited and take the path via a file.
+        if contains -- --start $argv; or string match -q -- '--start=*' $argv
+            set -l __wt_cd (mktemp)
+            begin
+                set -lx WT_CD_FILE $__wt_cd
+                command wt $argv
+            end
+            set -l __wt_code $status
+            if test -s "$__wt_cd"
+                cd (cat $__wt_cd)
+            end
+            rm -f $__wt_cd
+            return $__wt_code
+        end
         if contains -- --json $argv; or contains -- --print-path $argv; or contains -- -h $argv; or contains -- --help $argv; or contains -- -V $argv; or contains -- --version $argv
             command wt $argv
             return $status
@@ -173,6 +215,21 @@ function wt {
     $nav = @('switch','sw','checkout','co','new','pr','drop','ui','tui')
     $exe = (Get-Command wt -CommandType Application | Select-Object -First 1).Source
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
+        # --start runs a command in the new worktree, so it needs the real
+        # terminal: run wt with stdio inherited and take the path via a file.
+        if ($args -contains '--start' -or ($args | Where-Object { $_ -like '--start=*' })) {
+            $cd = [System.IO.Path]::GetTempFileName()
+            try {
+                $env:WT_CD_FILE = $cd
+                & $exe @args
+            } finally {
+                Remove-Item Env:\WT_CD_FILE -ErrorAction SilentlyContinue
+            }
+            $dest = (Get-Content -LiteralPath $cd -Raw -ErrorAction SilentlyContinue)
+            if ($dest -and (Test-Path -LiteralPath $dest -PathType Container)) { Set-Location -LiteralPath $dest }
+            Remove-Item -LiteralPath $cd -ErrorAction SilentlyContinue
+            return
+        }
         if ($args -contains '--json' -or $args -contains '--print-path' -or $args -contains '-h' -or $args -contains '--help' -or $args -contains '-V' -or $args -contains '--version') { & $exe @args; return }
         $out = & $exe @args
         # Only cd into a real directory: `wt pr open` succeeds by printing a PR
@@ -203,6 +260,25 @@ const ELVISH: &str = r#"# wt shell integration (elvish) — source this from you
 fn wt {|@a|
     var nav = [switch sw checkout co new pr drop ui tui]
     if (or (== (count $a) 0) (and (> (count $a) 0) (has-value $nav $a[0]))) {
+        # --start runs a command in the new worktree, so it needs the real
+        # terminal: run wt with stdio inherited and take the path via a file.
+        var starting = $false
+        for x $a {
+            if (or (eq $x --start) (str:has-prefix $x --start=)) { set starting = $true }
+        }
+        if $starting {
+            var name = ((external mktemp) | str:trim-space (one))
+            try {
+                set-env WT_CD_FILE $name
+                (external wt) $@a
+            } finally {
+                unset-env WT_CD_FILE
+            }
+            var dest = ((external cat) $name | slurp | str:trim-space (one))
+            (external rm) -f $name
+            if (not-eq $dest "") { cd $dest }
+            return
+        }
         if (or (has-value $a --json) (has-value $a --print-path) (has-value $a -h) (has-value $a --help) (has-value $a -V) (has-value $a --version)) {
             (external wt) $@a
             return
@@ -266,6 +342,32 @@ mod tests {
             assert!(
                 s.contains("--print-path"),
                 "no --print-path passthrough for {shell:?}"
+            );
+        }
+    }
+
+    /// Issue #89: `--start` must never go through the stdout capture — the command
+    /// it runs needs the real terminal. Every wrapper takes the `$WT_CD_FILE`
+    /// branch instead, and it must be tested *before* the `--json` bypass so the
+    /// two never race for the same invocation.
+    #[test]
+    fn every_wrapper_routes_start_through_the_cd_file() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let s = snippet(shell);
+            assert!(s.contains("--start"), "no --start branch for {shell:?}");
+            assert!(s.contains("--start="), "no --start=VAL form for {shell:?}");
+            assert!(s.contains("WT_CD_FILE"), "no WT_CD_FILE for {shell:?}");
+            let start = s.find("--start").expect("--start");
+            let json = s.find("--json").expect("--json");
+            assert!(
+                start < json,
+                "--start must be matched before the --json bypass for {shell:?}"
             );
         }
     }
