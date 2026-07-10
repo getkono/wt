@@ -40,6 +40,10 @@ pub(crate) struct GlobalFlags {
     /// Emit machine-readable JSON (only where the command supports it).
     #[arg(long, global = true)]
     pub(crate) json: bool,
+    /// Assume `yes` for every confirmation prompt. Does not bypass the safety
+    /// guards that `--force` overrides (dirty worktrees, unpushed work).
+    #[arg(short = 'y', long, global = true)]
+    pub(crate) yes: bool,
     /// Control ANSI color: `auto` (default), `always`, or `never`.
     #[arg(long, global = true, value_name = "WHEN")]
     pub(crate) color: Option<ColorChoice>,
@@ -483,6 +487,7 @@ pub(crate) fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
     cx.color_flag = cli.global.color;
     cx.no_pager = cli.global.no_pager;
     cx.verbose = cli.global.verbose;
+    cx.assume_yes = cli.global.yes;
 
     if cli.global.json && !cli.command_supports_json() {
         return Err(Error::usage(format!(
@@ -754,6 +759,19 @@ mod tests {
             parse(&["--color", "never", "list"]).unwrap().global.color,
             Some(ColorChoice::Never)
         );
+        assert!(parse(&["-y", "prune"]).unwrap().global.yes);
+        assert!(parse(&["prune", "--yes"]).unwrap().global.yes);
+        assert!(!parse(&["prune"]).unwrap().global.yes);
+    }
+
+    #[test]
+    fn yes_flag_reaches_cx_through_dispatch() {
+        let mut t = test_cx(&[], "/tmp");
+        assert!(!t.cx.assume_yes);
+        // `root` outside a repo fails, but dispatch has already applied the
+        // global flags by then.
+        let _ = super::dispatch(argv(&["-y", "root"]), &mut t.cx);
+        assert!(t.cx.assume_yes);
     }
 
     #[test]
