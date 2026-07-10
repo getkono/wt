@@ -162,6 +162,10 @@ pub(crate) struct CheckoutArgs {
     /// Discard uncommitted changes and switch anyway.
     #[arg(long)]
     pub(crate) force: bool,
+    /// Run `<COMMAND>` in the worktree once the checkout is complete. `wt` exits
+    /// with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// Initialize git submodules after checking out (overrides config).
     #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
     pub(crate) init_submodules: bool,
@@ -292,6 +296,10 @@ pub(crate) struct PrArgs {
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
+    /// Run `<COMMAND>` in the PR worktree once it is fully initialized. `wt` exits
+    /// with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// The `list` sub-form: print open PRs without checking any out.
     #[command(subcommand)]
     pub(crate) sub: Option<PrSub>,
@@ -449,6 +457,8 @@ impl Cli {
     fn start_command(&self) -> Option<&str> {
         match &self.command {
             Some(Command::New(a)) => a.start.as_deref(),
+            Some(Command::Checkout(a)) => a.start.as_deref(),
+            Some(Command::Pr(a)) => a.start.as_deref(),
             _ => None,
         }
     }
@@ -800,6 +810,8 @@ mod tests {
         for args in [
             vec!["new", "b", "--start", "claude", "--json"],
             vec!["--json", "new", "b", "--start", "claude"],
+            vec!["--json", "checkout", "b", "--start", "claude"],
+            vec!["--json", "pr", "7", "--start", "claude"],
         ] {
             let mut t = test_cx(&[], "/tmp");
             let code = crate::run(argv(&args), &mut t.cx);

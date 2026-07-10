@@ -156,7 +156,7 @@ fn pr_checkout(
             json,
             no_switch: args.no_switch,
             note,
-            start: None,
+            start: args.start.as_deref(),
         },
     )
 }
@@ -321,6 +321,7 @@ mod tests {
             target: target.map(str::to_string),
             no_switch: false,
             no_hooks: true,
+            start: None,
             sub,
         }
     }
@@ -350,6 +351,31 @@ mod tests {
         repo.git(&["reset", "-q", "--hard", "HEAD~1"]);
         repo.git(&["remote", "add", "origin", repo.root().to_str().unwrap()]);
         repo
+    }
+
+    /// `--start` runs in the PR worktree with the full `WT_*` context: unlike
+    /// `new`/`checkout`, a PR worktree knows both its base ref and its PR number.
+    #[test]
+    fn start_runs_in_the_pr_worktree_with_pr_context() {
+        let repo = repo_with_pr(123);
+        let cd_dir = tempfile::tempdir().unwrap();
+        let cd_file = cd_dir.path().join("cd");
+        let mut t = crate::testutil::test_cx(
+            &[("WT_CD_FILE", cd_file.to_str().unwrap())],
+            repo.root().to_str().unwrap(),
+        );
+        t.cx.gh = Arc::new(FakeGh::with_view(view(123, "pr-feature", "main")));
+        let mut a = pr_args(Some("123"), None);
+        a.start = Some("printf '%s %s' \"$WT_PR_NUMBER\" \"$WT_BASE_REF\" > ctx.txt".into());
+        let code = super::run(&mut t.cx, &RealHookRunner, &a, false).unwrap();
+
+        assert_eq!(code, 0);
+        assert!(t.out.contents().is_empty(), "stdout is the command's");
+        let target = std::fs::read_to_string(&cd_file).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&target).join("ctx.txt")).unwrap(),
+            "123 main"
+        );
     }
 
     #[test]
