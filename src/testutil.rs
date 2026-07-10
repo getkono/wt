@@ -458,6 +458,7 @@ pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
             no_track: false,
             no_switch: true,
             no_hooks: true,
+            start: None,
             copy_from: None,
             init_submodules: false,
             no_init_submodules: false,

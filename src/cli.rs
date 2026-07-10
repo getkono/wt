@@ -127,6 +127,10 @@ pub(crate) struct NewArgs {
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
+    /// Run `<COMMAND>` in the new worktree once it is fully initialized. `wt`
+    /// exits with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// Override the source worktree for the copy step.
     #[arg(long = "copy-from", value_name = "QUERY")]
     pub(crate) copy_from: Option<String>,
@@ -441,6 +445,14 @@ impl Cli {
         }
     }
 
+    /// The `--start` command, if the parsed subcommand takes one (issue #89).
+    fn start_command(&self) -> Option<&str> {
+        match &self.command {
+            Some(Command::New(a)) => a.start.as_deref(),
+            _ => None,
+        }
+    }
+
     /// A short label for the parsed command, for diagnostics.
     fn command_label(&self) -> &'static str {
         match &self.command {
@@ -491,6 +503,13 @@ pub(crate) fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
             "--json is not supported by `wt {}`",
             cli.command_label()
         )));
+    }
+    // Both own stdout: `--json` writes the worktree row there, `--start` hands it
+    // to the command it runs. Checked here rather than with clap's
+    // `conflicts_with`, which does not see a global `--json` given before the
+    // subcommand (`wt --json new b --start cmd`).
+    if cli.global.json && cli.start_command().is_some() {
+        return Err(Error::usage("--start cannot be combined with --json"));
     }
 
     route(cli, cx)
@@ -761,6 +780,36 @@ mod tests {
         assert!(parse(&["-y", "prune"]).unwrap().global.yes);
         assert!(parse(&["prune", "--yes"]).unwrap().global.yes);
         assert!(!parse(&["prune"]).unwrap().global.yes);
+    }
+
+    #[test]
+    fn start_takes_the_whole_command_as_one_value() {
+        // The command keeps its own flags; `--no-switch` still binds to `wt`.
+        let cli = parse(&["new", "b", "--start", "claude --plan", "--no-switch"]).unwrap();
+        let Some(Command::New(args)) = cli.command else {
+            panic!("expected new")
+        };
+        assert_eq!(args.start.as_deref(), Some("claude --plan"));
+        assert!(args.no_switch);
+    }
+
+    /// `--json` writes the worktree row to stdout; `--start` hands stdout to the
+    /// command it runs. Rejected whichever side of the subcommand `--json` is on.
+    #[test]
+    fn start_is_rejected_with_json() {
+        for args in [
+            vec!["new", "b", "--start", "claude", "--json"],
+            vec!["--json", "new", "b", "--start", "claude"],
+        ] {
+            let mut t = test_cx(&[], "/tmp");
+            let code = crate::run(argv(&args), &mut t.cx);
+            assert_eq!(code, 2, "expected usage error for {args:?}");
+            assert!(
+                t.err.contents().contains("--start cannot be combined"),
+                "{}",
+                t.err.contents()
+            );
+        }
     }
 
     #[test]

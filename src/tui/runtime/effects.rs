@@ -18,6 +18,9 @@ pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
         no_track: false,
         no_switch: true,
         no_hooks: false,
+        // `--start` is CLI-only: the TUI's `CapturingHookRunner` would swallow the
+        // command's output, and there is no shell wrapper to `cd` afterwards.
+        start: None,
         copy_from: None,
         init_submodules: false,
         no_init_submodules: true,
