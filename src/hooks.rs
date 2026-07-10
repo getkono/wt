@@ -1,9 +1,11 @@
-//! Post-create and pre-remove hooks (spec §8). Hooks run via `sh -c` (Unix) or
-//! `cmd /C` (Windows) with the new worktree as the working directory and the
-//! `WT_*` variables in the environment.
+//! Post-create and pre-remove hooks (spec §8), and the `--start` command
+//! (issue #89). All three run via `sh -c` (Unix) or `cmd /C` (Windows) with the
+//! worktree as the working directory and the `WT_*` variables in the environment.
 //!
-//! Execution policy: a failed `post_create` is a non-fatal warning; a failed
-//! `pre_remove` aborts the removal unless `--force` (then it is a warning).
+//! Execution policy differs per caller: a failed `post_create` is a non-fatal
+//! warning; a failed `pre_remove` aborts the removal unless `--force` (then it is
+//! a warning); a failed `--start` command propagates its exit code, since it is
+//! the user's foreground command rather than a side effect of `wt`'s own work.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -121,6 +123,19 @@ pub fn run_post_create(
     }
 }
 
+/// Runs the `--start` command in `ctx.worktree_path`, returning its exit status
+/// as a process exit code (issue #89).
+///
+/// Unlike [`run_post_create`], the status is propagated rather than downgraded to
+/// a warning: `--start` is the user's own foreground command, so `wt` exits with
+/// whatever it exited with, the way `sh -c` does. A status that does not fit in a
+/// `u8` — notably death by signal, which [`HookRunner::run`] reports as `-1` —
+/// becomes `1`.
+pub fn run_start(runner: &dyn HookRunner, command: &str, ctx: &HookContext) -> Result<u8> {
+    let code = runner.run(command, ctx)?;
+    Ok(u8::try_from(code).unwrap_or(1))
+}
+
 /// Runs the `pre_remove` hook (spec §8). A non-zero exit aborts the removal
 /// unless `force` is set, in which case it is reported as a warning and removal
 /// proceeds. `no_hooks` or an absent command is a no-op.
@@ -184,6 +199,46 @@ mod tests {
             *self.last.lock().unwrap() = Some(command.to_string());
             Ok(self.code)
         }
+    }
+
+    /// `--start` runs in the worktree with the `WT_*` variables set, exactly like
+    /// a hook, and its exit code becomes `wt`'s.
+    #[test]
+    fn run_start_executes_in_the_worktree_and_propagates_the_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = run_start(
+            &RealHookRunner,
+            "pwd > where.txt && printf '%s' \"$WT_BRANCH\" > branch.txt",
+            &ctx(dir.path()),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("branch.txt")).unwrap(),
+            "feature/x"
+        );
+        let where_ran = std::fs::read_to_string(dir.path().join("where.txt")).unwrap();
+        // `pwd` may resolve /var -> /private/var on macOS; compare canonical forms.
+        assert_eq!(
+            std::fs::canonicalize(where_ran.trim()).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+
+        assert_eq!(
+            run_start(&RealHookRunner, "exit 3", &ctx(dir.path())).unwrap(),
+            3
+        );
+    }
+
+    /// A signal death is reported as `-1`, which cannot be an exit code.
+    #[test]
+    fn run_start_maps_an_unrepresentable_status_to_one() {
+        let runner = FakeRunner {
+            code: -1,
+            last: Mutex::new(None),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(run_start(&runner, "whatever", &ctx(dir.path())).unwrap(), 1);
     }
 
     #[test]
