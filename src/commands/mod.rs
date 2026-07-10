@@ -153,8 +153,23 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// Prompts on stderr and reads a yes/no confirmation (default no).
+/// Echoes `prompt` on stderr followed by the answer `-y`/`--yes` supplies, so a
+/// non-interactive run still shows what was auto-accepted. Returns `true` when
+/// [`Cx::assume_yes`] is set, in which case stdin is never read.
+fn auto_yes(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if !cx.assume_yes {
+        return Ok(false);
+    }
+    cx.err.line(&format!("{prompt}y (--yes)"))?;
+    Ok(true)
+}
+
+/// Prompts on stderr and reads a yes/no confirmation (default no). `--yes`
+/// answers it without reading stdin.
 pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if auto_yes(cx, prompt)? {
+        return Ok(true);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -164,9 +179,12 @@ pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
 
 /// Prompts on stderr and reads a yes/no confirmation (default *yes*): an empty
 /// line or EOF counts as yes, so only an explicit `n`/`no` declines. Callers must
-/// gate this on an interactive terminal — a non-interactive EOF would otherwise
-/// silently accept.
+/// gate this on an interactive terminal or on `--yes` — a non-interactive EOF
+/// would otherwise silently accept.
 pub(crate) fn confirm_default_yes(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if auto_yes(cx, prompt)? {
+        return Ok(true);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -189,7 +207,15 @@ pub(crate) enum Choice {
 /// Prompts on stderr for an update/proceed/cancel choice (issue #56). Anything
 /// other than an explicit update/proceed — including an empty line or EOF — is
 /// `Cancel`, so a non-interactive run defaults to the safe choice.
+///
+/// `--yes` answers [`Update`](Choice::Update): updating the base is the
+/// affirmative reply to "the base is behind; update it?", and it is what lets a
+/// scripted `wt new` proceed at all — without a flag the EOF would `Cancel`.
 pub(crate) fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
+    if cx.assume_yes {
+        cx.err.line(&format!("{prompt}u (--yes)"))?;
+        return Ok(Choice::Update);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -233,7 +259,9 @@ pub(crate) fn maybe_init_submodules(
 /// or an `always`/`never` policy decides without a prompt, deferring to
 /// [`maybe_init_submodules`]. `prompt` is the caller's interactivity gate (the
 /// CLI passes `true`; the TUI passes `false` and handles its own modal), so a
-/// prompt only fires for `prompt && stderr.is_tty()`. Non-fatal throughout.
+/// prompt only fires for `prompt && stderr.is_tty()`. `--yes` answers it too —
+/// the prompt defaults to yes, so a scripted `wt new -y` initializes submodules
+/// where a bare non-interactive `wt new` leaves them alone. Non-fatal throughout.
 pub(crate) fn maybe_init_submodules_interactive(
     cx: &mut Cx,
     git: &dyn GitCli,
@@ -246,8 +274,9 @@ pub(crate) fn maybe_init_submodules_interactive(
     if flag_override.is_some() || !matches!(policy, SubmoduleInit::Prompt) {
         return maybe_init_submodules(cx, git, dir, policy, flag_override);
     }
-    // The Prompt default: only ask interactively; non-interactively leave them be.
-    if !(prompt && cx.err.is_tty()) {
+    // The Prompt default: ask interactively, or take `--yes` as the answer;
+    // otherwise leave them be.
+    if !(cx.assume_yes || (prompt && cx.err.is_tty())) {
         return Ok(());
     }
     let pending = crate::git::submodule::uninitialized(git, dir)?;
@@ -572,6 +601,32 @@ mod tests {
                 "answer {answer:?}"
             );
         }
+    }
+
+    /// `--yes` answers the prompt affirmatively *without consuming stdin*: the
+    /// canned "n" must still be queued afterwards. A prompt helper that read the
+    /// line and then ignored it would desynchronize every subsequent prompt.
+    #[test]
+    fn assume_yes_answers_prompts_without_reading_stdin() {
+        use crate::commands::{Choice, choose, confirm, confirm_default_yes};
+        use crate::testutil::CannedInput;
+
+        let mut t = test_cx(&[], "/work");
+        t.cx.assume_yes = true;
+        t.cx.input = Box::new(CannedInput::new(&["n", "n", "c"]));
+
+        assert!(confirm(&mut t.cx, "remove? ").unwrap());
+        assert!(confirm_default_yes(&mut t.cx, "init? ").unwrap());
+        assert_eq!(choose(&mut t.cx, "stale? ").unwrap(), Choice::Update);
+
+        // None of the three canned answers were consumed.
+        assert_eq!(t.cx.input.read_line().unwrap(), "n\n");
+
+        // Each prompt is still echoed, with the answer `--yes` supplied.
+        let err = t.err.contents();
+        assert!(err.contains("remove? y (--yes)"), "{err}");
+        assert!(err.contains("init? y (--yes)"), "{err}");
+        assert!(err.contains("stale? u (--yes)"), "{err}");
     }
 
     #[test]

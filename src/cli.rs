@@ -272,7 +272,7 @@ pub(crate) struct PruneArgs {
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
-    /// Remove without confirmation and include dirty worktrees.
+    /// Include dirty worktrees and force-delete unmerged branches (implies `--yes`).
     #[arg(long)]
     pub(crate) force: bool,
 }
