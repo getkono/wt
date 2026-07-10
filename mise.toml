@@ -8,7 +8,7 @@ hk = "1.48.0"                          # git hook manager (replaces lefthook); k
 pkl = "latest"                         # config language hk.pkl is written in
 "cargo:convco" = "0.6.4"               # Conventional Commits linter for the commit-msg hook + CI (built from source; not in mise's registry)
 "aqua:taiki-e/cargo-llvm-cov" = "latest"   # coverage (needs the llvm-tools-preview component)
-"github:sourcefrog/cargo-mutants" = "latest" # mutation testing (prebuilt GitHub release binaries)
+"cargo:cargo-mutants"         = "27.1.0"
 
 # After `mise install`, wire hk's git hooks through mise so they resolve hk and
 # convco without requiring shell activation. Skipped in CI, where the hooks
