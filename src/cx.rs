@@ -142,12 +142,16 @@ pub struct Cx {
     /// The `-v`/`--verbose` count: extra diagnostics to stderr (set during
     /// dispatch). `0` is the default (quiet).
     pub verbose: u8,
+    /// The `-y`/`--yes` flag (set during dispatch): auto-answer confirmation
+    /// prompts. Only prompts — the `--force` safety guards are unaffected.
+    pub assume_yes: bool,
 }
 
 impl Cx {
     /// Builds a context from injected streams, environment, working dir, the
     /// `git`/`gh`/`agent` handles, and the input source. The global flag fields
-    /// (`color_flag`, `no_pager`) default off and are set during dispatch.
+    /// (`color_flag`, `no_pager`, `verbose`, `assume_yes`) default off and are
+    /// set during dispatch.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         out: Stream,
@@ -171,6 +175,7 @@ impl Cx {
             color_flag: None,
             no_pager: false,
             verbose: 0,
+            assume_yes: false,
         }
     }
 

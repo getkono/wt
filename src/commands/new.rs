@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::NewArgs;
 use crate::commands::{
-    emit_worktree, maybe_init_submodules_interactive, open_session, render_target, resolve_target,
-    rollback_worktree, same_path,
+    Nav, finish_worktree, maybe_init_submodules_interactive, open_session, render_target,
+    resolve_target, rollback_worktree, same_path,
 };
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
@@ -118,12 +118,21 @@ pub(crate) fn run_core(
         let preview = render_target(&session.config, &root, &branch, &slug, &cx.env)?;
         if same_path(&existing.path, &preview) {
             let path = existing.path.clone();
-            return emit_worktree(
+            // Idempotent: the worktree is already initialized, so `--start` runs
+            // here too — `wt new x --start cmd` behaves the same whether or not
+            // the worktree happens to exist.
+            let ctx = hook_context(&path, &branch, &root, &base_ref);
+            return finish_worktree(
                 cx,
+                hooks,
                 &path,
-                json,
-                args.no_switch,
-                "worktree already exists at",
+                &ctx,
+                Nav {
+                    json,
+                    no_switch: args.no_switch,
+                    note: "worktree already exists at",
+                    start: args.start.as_deref(),
+                },
             );
         }
         return Err(Error::operation(format!(
@@ -181,13 +190,7 @@ pub(crate) fn run_core(
     crate::commands::log_copy_outcome(cx, &copy_outcome);
 
     // The post-create hook: a failure is a warning, not a rollback (§8).
-    let ctx = HookContext {
-        worktree_path: target.clone(),
-        branch: branch.clone(),
-        repo_root: root.clone(),
-        base_ref: base_ref.clone(),
-        pr_number: None,
-    };
+    let ctx = hook_context(&target, &branch, &root, &base_ref);
     run_post_create(
         hooks,
         cx,
@@ -208,7 +211,34 @@ pub(crate) fn run_core(
         prompt,
     )?;
 
-    emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
+    finish_worktree(
+        cx,
+        hooks,
+        &target,
+        &ctx,
+        Nav {
+            json,
+            no_switch: args.no_switch,
+            note: "created worktree at",
+            start: args.start.as_deref(),
+        },
+    )
+}
+
+/// The `WT_*` context for the `post_create` hook and the `--start` command.
+fn hook_context(
+    target: &Path,
+    branch: &str,
+    root: &Path,
+    base_ref: &Option<String>,
+) -> HookContext {
+    HookContext {
+        worktree_path: target.to_path_buf(),
+        branch: branch.to_string(),
+        repo_root: root.to_path_buf(),
+        base_ref: base_ref.clone(),
+        pr_number: None,
+    }
 }
 
 /// Records metadata and runs the copy step (rolled back on error), returning the
@@ -368,6 +398,7 @@ mod tests {
             no_track: false,
             no_switch: false,
             no_hooks: true,
+            start: None,
             copy_from: None,
             init_submodules: false,
             no_init_submodules: false,
@@ -378,6 +409,84 @@ mod tests {
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
         let code = super::run(&mut t.cx, &RealHookRunner, a, json).unwrap();
         (code, t.out.contents(), t.err.contents())
+    }
+
+    /// `--start` runs in the new worktree, *after* the post-create hook, with the
+    /// `WT_*` context set. stdout stays clean — it belongs to the command — and the
+    /// path is handed to the shell through `$WT_CD_FILE`.
+    #[test]
+    fn start_runs_in_the_worktree_after_the_hook() {
+        let repo = TestRepo::init();
+        repo.write(
+            ".wt.toml",
+            "[hooks]\npost_create = \"echo hook >> order.txt\"\n",
+        );
+        repo.commit_all("config");
+
+        let cd_dir = tempfile::tempdir().unwrap();
+        let cd_file = cd_dir.path().join("cd");
+        let mut t = crate::testutil::test_cx(
+            &[("WT_CD_FILE", cd_file.to_str().unwrap())],
+            repo.root().to_str().unwrap(),
+        );
+        let mut a = args("feat/x");
+        a.no_hooks = false;
+        a.start = Some("echo \"start $WT_BRANCH\" >> order.txt".into());
+        let code = super::run(&mut t.cx, &RealHookRunner, &a, false).unwrap();
+
+        assert_eq!(code, 0);
+        assert!(t.out.contents().is_empty(), "stdout is the command's");
+        assert!(t.err.contents().contains("created worktree at"));
+
+        let target = std::fs::read_to_string(&cd_file).unwrap();
+        assert!(Path::new(&target).is_dir());
+        // The hook ran first, then `--start`, both inside the new worktree.
+        let order = std::fs::read_to_string(Path::new(&target).join("order.txt")).unwrap();
+        assert_eq!(order, "hook\nstart feat/x\n");
+    }
+
+    /// A failing `--start` command becomes `wt`'s exit code, and the worktree is
+    /// still handed to the shell — you land in it to debug.
+    #[test]
+    fn start_propagates_its_exit_code_and_still_hands_over_the_path() {
+        let repo = TestRepo::init();
+        let cd_dir = tempfile::tempdir().unwrap();
+        let cd_file = cd_dir.path().join("cd");
+        let mut t = crate::testutil::test_cx(
+            &[("WT_CD_FILE", cd_file.to_str().unwrap())],
+            repo.root().to_str().unwrap(),
+        );
+        let mut a = args("feat/x");
+        a.start = Some("exit 7".into());
+        let code = super::run(&mut t.cx, &RealHookRunner, &a, false).unwrap();
+
+        assert_eq!(code, 7);
+        assert!(Path::new(&std::fs::read_to_string(&cd_file).unwrap()).is_dir());
+    }
+
+    /// `wt new x --start cmd` behaves the same whether or not the worktree already
+    /// exists: the command runs on the idempotent path too.
+    #[test]
+    fn start_runs_on_the_already_exists_path() {
+        let repo = TestRepo::init();
+        let mut first = args("feat/x");
+        first.no_switch = true;
+        run(&repo, &first, false);
+
+        let cd_dir = tempfile::tempdir().unwrap();
+        let cd_file = cd_dir.path().join("cd");
+        let mut t = crate::testutil::test_cx(
+            &[("WT_CD_FILE", cd_file.to_str().unwrap())],
+            repo.root().to_str().unwrap(),
+        );
+        let mut a = args("feat/x");
+        a.start = Some("echo ran > marker.txt".into());
+        let code = super::run(&mut t.cx, &RealHookRunner, &a, false).unwrap();
+
+        assert_eq!(code, 0);
+        assert!(t.err.contents().contains("worktree already exists at"));
+        let target = std::fs::read_to_string(&cd_file).unwrap();
+        assert!(Path::new(&target).join("marker.txt").exists());
     }
 
     #[test]

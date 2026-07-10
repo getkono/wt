@@ -40,6 +40,10 @@ pub(crate) struct GlobalFlags {
     /// Emit machine-readable JSON (only where the command supports it).
     #[arg(long, global = true)]
     pub(crate) json: bool,
+    /// Assume `yes` for every confirmation prompt. Does not bypass the safety
+    /// guards that `--force` overrides (dirty worktrees, unpushed work).
+    #[arg(short = 'y', long, global = true)]
+    pub(crate) yes: bool,
     /// Control ANSI color: `auto` (default), `always`, or `never`.
     #[arg(long, global = true, value_name = "WHEN")]
     pub(crate) color: Option<ColorChoice>,
@@ -123,6 +127,10 @@ pub(crate) struct NewArgs {
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
+    /// Run `<COMMAND>` in the new worktree once it is fully initialized. `wt`
+    /// exits with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// Override the source worktree for the copy step.
     #[arg(long = "copy-from", value_name = "QUERY")]
     pub(crate) copy_from: Option<String>,
@@ -154,6 +162,10 @@ pub(crate) struct CheckoutArgs {
     /// Discard uncommitted changes and switch anyway.
     #[arg(long)]
     pub(crate) force: bool,
+    /// Run `<COMMAND>` in the worktree once the checkout is complete. `wt` exits
+    /// with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// Initialize git submodules after checking out (overrides config).
     #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
     pub(crate) init_submodules: bool,
@@ -268,7 +280,7 @@ pub(crate) struct PruneArgs {
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
-    /// Remove without confirmation and include dirty worktrees.
+    /// Include dirty worktrees and force-delete unmerged branches (implies `--yes`).
     #[arg(long)]
     pub(crate) force: bool,
 }
@@ -284,6 +296,10 @@ pub(crate) struct PrArgs {
     /// Skip the post-create hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
+    /// Run `<COMMAND>` in the PR worktree once it is fully initialized. `wt` exits
+    /// with the command's status. Requires shell integration to also `cd`.
+    #[arg(long, value_name = "COMMAND")]
+    pub(crate) start: Option<String>,
     /// The `list` sub-form: print open PRs without checking any out.
     #[command(subcommand)]
     pub(crate) sub: Option<PrSub>,
@@ -302,7 +318,7 @@ pub(crate) enum PrSub {
 #[derive(Debug, Args)]
 pub(crate) struct PrOpenArgs {
     /// PR title. On an interactive terminal it seeds the compose form;
-    /// non-interactively (or with `-y`) it is used directly.
+    /// non-interactively (or with the global `-y`) it is used directly.
     #[arg(long)]
     pub(crate) title: Option<String>,
     /// PR body text.
@@ -325,9 +341,6 @@ pub(crate) struct PrOpenArgs {
     /// `agent.effort`; default `medium`).
     #[arg(long, value_name = "LEVEL")]
     pub(crate) effort: Option<String>,
-    /// Skip the compose form and submit non-interactively.
-    #[arg(short = 'y', long)]
-    pub(crate) yes: bool,
     /// Override the base/trunk branch to target.
     #[arg(long, value_name = "REF")]
     pub(crate) base: Option<String>,
@@ -440,6 +453,16 @@ impl Cli {
         }
     }
 
+    /// The `--start` command, if the parsed subcommand takes one (issue #89).
+    fn start_command(&self) -> Option<&str> {
+        match &self.command {
+            Some(Command::New(a)) => a.start.as_deref(),
+            Some(Command::Checkout(a)) => a.start.as_deref(),
+            Some(Command::Pr(a)) => a.start.as_deref(),
+            _ => None,
+        }
+    }
+
     /// A short label for the parsed command, for diagnostics.
     fn command_label(&self) -> &'static str {
         match &self.command {
@@ -483,12 +506,20 @@ pub(crate) fn dispatch(args: Vec<String>, cx: &mut Cx) -> Result<u8> {
     cx.color_flag = cli.global.color;
     cx.no_pager = cli.global.no_pager;
     cx.verbose = cli.global.verbose;
+    cx.assume_yes = cli.global.yes;
 
     if cli.global.json && !cli.command_supports_json() {
         return Err(Error::usage(format!(
             "--json is not supported by `wt {}`",
             cli.command_label()
         )));
+    }
+    // Both own stdout: `--json` writes the worktree row there, `--start` hands it
+    // to the command it runs. Checked here rather than with clap's
+    // `conflicts_with`, which does not see a global `--json` given before the
+    // subcommand (`wt --json new b --start cmd`).
+    if cli.global.json && cli.start_command().is_some() {
+        return Err(Error::usage("--start cannot be combined with --json"));
     }
 
     route(cli, cx)
@@ -531,7 +562,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::New(args)) => {
             crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
-        Some(Command::Checkout(args)) => crate::commands::checkout::run(cx, &args, json),
+        Some(Command::Checkout(args)) => {
+            crate::commands::checkout::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
         Some(Command::Sync(args)) => crate::commands::sync::run(cx, &args, json),
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),
@@ -754,6 +787,51 @@ mod tests {
             parse(&["--color", "never", "list"]).unwrap().global.color,
             Some(ColorChoice::Never)
         );
+        assert!(parse(&["-y", "prune"]).unwrap().global.yes);
+        assert!(parse(&["prune", "--yes"]).unwrap().global.yes);
+        assert!(!parse(&["prune"]).unwrap().global.yes);
+    }
+
+    #[test]
+    fn start_takes_the_whole_command_as_one_value() {
+        // The command keeps its own flags; `--no-switch` still binds to `wt`.
+        let cli = parse(&["new", "b", "--start", "claude --plan", "--no-switch"]).unwrap();
+        let Some(Command::New(args)) = cli.command else {
+            panic!("expected new")
+        };
+        assert_eq!(args.start.as_deref(), Some("claude --plan"));
+        assert!(args.no_switch);
+    }
+
+    /// `--json` writes the worktree row to stdout; `--start` hands stdout to the
+    /// command it runs. Rejected whichever side of the subcommand `--json` is on.
+    #[test]
+    fn start_is_rejected_with_json() {
+        for args in [
+            vec!["new", "b", "--start", "claude", "--json"],
+            vec!["--json", "new", "b", "--start", "claude"],
+            vec!["--json", "checkout", "b", "--start", "claude"],
+            vec!["--json", "pr", "7", "--start", "claude"],
+        ] {
+            let mut t = test_cx(&[], "/tmp");
+            let code = crate::run(argv(&args), &mut t.cx);
+            assert_eq!(code, 2, "expected usage error for {args:?}");
+            assert!(
+                t.err.contents().contains("--start cannot be combined"),
+                "{}",
+                t.err.contents()
+            );
+        }
+    }
+
+    #[test]
+    fn yes_flag_reaches_cx_through_dispatch() {
+        let mut t = test_cx(&[], "/tmp");
+        assert!(!t.cx.assume_yes);
+        // `root` outside a repo fails, but dispatch has already applied the
+        // global flags by then.
+        let _ = super::dispatch(argv(&["-y", "root"]), &mut t.cx);
+        assert!(t.cx.assume_yes);
     }
 
     #[test]

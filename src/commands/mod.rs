@@ -28,6 +28,7 @@ use crate::cx::{Cx, Env};
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
+use crate::hooks::{HookContext, HookRunner};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
 use crate::template::{self, TemplateVars};
@@ -153,8 +154,23 @@ pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// Prompts on stderr and reads a yes/no confirmation (default no).
+/// Echoes `prompt` on stderr followed by the answer `-y`/`--yes` supplies, so a
+/// non-interactive run still shows what was auto-accepted. Returns `true` when
+/// [`Cx::assume_yes`] is set, in which case stdin is never read.
+fn auto_yes(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if !cx.assume_yes {
+        return Ok(false);
+    }
+    cx.err.line(&format!("{prompt}y (--yes)"))?;
+    Ok(true)
+}
+
+/// Prompts on stderr and reads a yes/no confirmation (default no). `--yes`
+/// answers it without reading stdin.
 pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if auto_yes(cx, prompt)? {
+        return Ok(true);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -164,9 +180,12 @@ pub(crate) fn confirm(cx: &mut Cx, prompt: &str) -> Result<bool> {
 
 /// Prompts on stderr and reads a yes/no confirmation (default *yes*): an empty
 /// line or EOF counts as yes, so only an explicit `n`/`no` declines. Callers must
-/// gate this on an interactive terminal — a non-interactive EOF would otherwise
-/// silently accept.
+/// gate this on an interactive terminal or on `--yes` — a non-interactive EOF
+/// would otherwise silently accept.
 pub(crate) fn confirm_default_yes(cx: &mut Cx, prompt: &str) -> Result<bool> {
+    if auto_yes(cx, prompt)? {
+        return Ok(true);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -189,7 +208,15 @@ pub(crate) enum Choice {
 /// Prompts on stderr for an update/proceed/cancel choice (issue #56). Anything
 /// other than an explicit update/proceed — including an empty line or EOF — is
 /// `Cancel`, so a non-interactive run defaults to the safe choice.
+///
+/// `--yes` answers [`Update`](Choice::Update): updating the base is the
+/// affirmative reply to "the base is behind; update it?", and it is what lets a
+/// scripted `wt new` proceed at all — without a flag the EOF would `Cancel`.
 pub(crate) fn choose(cx: &mut Cx, prompt: &str) -> Result<Choice> {
+    if cx.assume_yes {
+        cx.err.line(&format!("{prompt}u (--yes)"))?;
+        return Ok(Choice::Update);
+    }
     cx.err.text(prompt)?;
     cx.err.flush()?;
     let line = cx.input.read_line()?;
@@ -233,7 +260,9 @@ pub(crate) fn maybe_init_submodules(
 /// or an `always`/`never` policy decides without a prompt, deferring to
 /// [`maybe_init_submodules`]. `prompt` is the caller's interactivity gate (the
 /// CLI passes `true`; the TUI passes `false` and handles its own modal), so a
-/// prompt only fires for `prompt && stderr.is_tty()`. Non-fatal throughout.
+/// prompt only fires for `prompt && stderr.is_tty()`. `--yes` answers it too —
+/// the prompt defaults to yes, so a scripted `wt new -y` initializes submodules
+/// where a bare non-interactive `wt new` leaves them alone. Non-fatal throughout.
 pub(crate) fn maybe_init_submodules_interactive(
     cx: &mut Cx,
     git: &dyn GitCli,
@@ -246,8 +275,9 @@ pub(crate) fn maybe_init_submodules_interactive(
     if flag_override.is_some() || !matches!(policy, SubmoduleInit::Prompt) {
         return maybe_init_submodules(cx, git, dir, policy, flag_override);
     }
-    // The Prompt default: only ask interactively; non-interactively leave them be.
-    if !(prompt && cx.err.is_tty()) {
+    // The Prompt default: ask interactively, or take `--yes` as the answer;
+    // otherwise leave them be.
+    if !(cx.assume_yes || (prompt && cx.err.is_tty())) {
         return Ok(());
     }
     let pending = crate::git::submodule::uninitialized(git, dir)?;
@@ -426,9 +456,82 @@ pub(crate) fn log_copy_outcome(cx: &mut Cx, outcome: &crate::copy::CopyOutcome) 
     }
 }
 
+/// How a navigation command hands its worktree back to the user (spec §5/§7).
+pub(crate) struct Nav<'a> {
+    /// Emit the worktree as a JSON row on stdout instead of a path.
+    pub(crate) json: bool,
+    /// Do not hand the path to the shell wrapper; report on stderr instead.
+    pub(crate) no_switch: bool,
+    /// The stderr note describing what happened, e.g. `"created worktree at"`.
+    pub(crate) note: &'a str,
+    /// The `--start` command to run inside the worktree, if any (issue #89).
+    pub(crate) start: Option<&'a str>,
+}
+
+/// Finishes a navigation command: emits the result and, with `--start`, runs the
+/// user's command inside the fully initialized worktree (issue #89).
+///
+/// Without `--start` this is [`emit_worktree`] verbatim. With it, stdout belongs
+/// to the started command — it inherits `wt`'s stdio so an interactive tool gets a
+/// real terminal — so the path cannot be printed there. It travels to the shell
+/// wrapper through `$WT_CD_FILE` instead; see [`hand_path_to_shell`].
+///
+/// The path is handed over *before* the command runs, so a command that fails, or
+/// that the user interrupts, still leaves the shell in the new worktree. The
+/// command's exit code becomes `wt`'s.
+///
+/// `--start` and `--json` are mutually exclusive at the `clap` layer, so a
+/// `Nav` never has both.
+pub(crate) fn finish_worktree(
+    cx: &mut Cx,
+    runner: &dyn HookRunner,
+    target: &Path,
+    hook_ctx: &HookContext,
+    nav: Nav<'_>,
+) -> Result<u8> {
+    let Some(command) = nav.start else {
+        return emit_worktree(cx, target, nav.json, nav.no_switch, nav.note);
+    };
+    if !nav.no_switch {
+        hand_path_to_shell(cx, target)?;
+    }
+    cx.err.line(&format!("{} {}", nav.note, target.display()))?;
+    crate::hooks::run_start(runner, command, hook_ctx)
+}
+
+/// Writes `target` to the file named by `$WT_CD_FILE` so the shell wrapper can
+/// `cd` there once `wt` exits (issue #89).
+///
+/// `wt` cannot change its parent shell's directory, which is why the wrapper
+/// normally captures the path from stdout. Under `--start` stdout is the started
+/// command's, so the wrapper passes a temp file instead. Nothing is written when
+/// the variable is unset — `wt` was invoked without shell integration, and running
+/// the command in the worktree is all a bare binary can do.
+///
+/// The exception is a *stale* wrapper: one that does not know `--start` still
+/// captures stdout, which we detect as "stdout is not a terminal but stderr is".
+/// That would silently swallow the command's output, so say so.
+fn hand_path_to_shell(cx: &mut Cx, target: &Path) -> Result<()> {
+    match cx.env.get("WT_CD_FILE").filter(|p| !p.is_empty()) {
+        Some(cd_file) => Ok(std::fs::write(
+            cd_file,
+            target.to_string_lossy().as_bytes(),
+        )?),
+        None => {
+            if cx.err.is_tty() && !cx.out.is_tty() {
+                cx.err.line(
+                    "warning: --start cannot return you to the worktree; your shell \
+                     integration predates it. Re-run `wt shell-init <shell>`.",
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Emits a navigation result: JSON object, the bare path (for `cd`), or a stderr
 /// note when `--no-switch` (spec §5/§7).
-pub(crate) fn emit_worktree(
+fn emit_worktree(
     cx: &mut Cx,
     target: &Path,
     json: bool,
@@ -448,11 +551,227 @@ pub(crate) fn emit_worktree(
 
 #[cfg(test)]
 mod tests {
-    use super::{Resolution, resolve_query_with};
+    use super::{Nav, Resolution, finish_worktree, resolve_query_with};
     use crate::cx::Stream;
+    use crate::error::Result;
+    use crate::hooks::{HookContext, HookRunner};
     use crate::model::Worktree;
     use crate::testutil::{SharedBuf, test_cx};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// A runner that records the command it was handed and returns a fixed code.
+    struct FakeRunner {
+        code: i32,
+        last: Mutex<Option<String>>,
+    }
+    impl FakeRunner {
+        fn new(code: i32) -> Self {
+            Self {
+                code,
+                last: Mutex::new(None),
+            }
+        }
+    }
+    impl HookRunner for FakeRunner {
+        fn run(&self, command: &str, _ctx: &HookContext) -> Result<i32> {
+            *self.last.lock().unwrap() = Some(command.to_string());
+            Ok(self.code)
+        }
+    }
+
+    fn hook_ctx(dir: &Path) -> HookContext {
+        HookContext {
+            worktree_path: dir.to_path_buf(),
+            branch: "feat/x".into(),
+            repo_root: dir.to_path_buf(),
+            base_ref: None,
+            pr_number: None,
+        }
+    }
+
+    /// Without `--start`, the path goes to stdout for the shell wrapper to `cd`.
+    #[test]
+    fn finish_worktree_without_start_prints_the_path() {
+        let mut t = test_cx(&[], "/work");
+        let target = PathBuf::from("/work/wt");
+        let code = finish_worktree(
+            &mut t.cx,
+            &FakeRunner::new(0),
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: false,
+                note: "created worktree at",
+                start: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(t.out.contents(), "/work/wt\n");
+        assert!(t.err.contents().is_empty());
+    }
+
+    /// `--no-switch` reports on stderr and leaves stdout clean.
+    #[test]
+    fn finish_worktree_without_start_honors_no_switch() {
+        let mut t = test_cx(&[], "/work");
+        let target = PathBuf::from("/work/wt");
+        finish_worktree(
+            &mut t.cx,
+            &FakeRunner::new(0),
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: true,
+                note: "created worktree at",
+                start: None,
+            },
+        )
+        .unwrap();
+        assert!(t.out.contents().is_empty());
+        assert_eq!(t.err.contents(), "created worktree at /work/wt\n");
+    }
+
+    /// With `--start`, stdout belongs to the command: the path travels through
+    /// `$WT_CD_FILE` and the command's exit code becomes `wt`'s.
+    #[test]
+    fn finish_worktree_with_start_writes_the_cd_file_and_propagates_the_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd_file = dir.path().join("cd");
+        let mut t = test_cx(&[("WT_CD_FILE", cd_file.to_str().unwrap())], "/work");
+        let target = dir.path().to_path_buf();
+
+        let runner = FakeRunner::new(3);
+        let code = finish_worktree(
+            &mut t.cx,
+            &runner,
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: false,
+                note: "created worktree at",
+                start: Some("claude"),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(code, 3);
+        assert_eq!(runner.last.lock().unwrap().as_deref(), Some("claude"));
+        assert_eq!(
+            std::fs::read_to_string(&cd_file).unwrap(),
+            target.to_string_lossy()
+        );
+        assert!(t.out.contents().is_empty(), "stdout is the command's");
+        assert!(t.err.contents().contains("created worktree at"));
+    }
+
+    /// The cd file is written *before* the command runs, so a command that fails
+    /// (or that the user interrupts) still leaves the shell in the worktree.
+    #[test]
+    fn finish_worktree_hands_over_the_path_even_when_the_command_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd_file = dir.path().join("cd");
+        let mut t = test_cx(&[("WT_CD_FILE", cd_file.to_str().unwrap())], "/work");
+        let target = dir.path().to_path_buf();
+        let code = finish_worktree(
+            &mut t.cx,
+            &FakeRunner::new(1),
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: false,
+                note: "created worktree at",
+                start: Some("false"),
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(cd_file.exists());
+    }
+
+    /// `--start --no-switch` runs the command but does not move the shell.
+    #[test]
+    fn finish_worktree_with_start_and_no_switch_skips_the_cd_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd_file = dir.path().join("cd");
+        let mut t = test_cx(&[("WT_CD_FILE", cd_file.to_str().unwrap())], "/work");
+        let target = dir.path().to_path_buf();
+        let runner = FakeRunner::new(0);
+        finish_worktree(
+            &mut t.cx,
+            &runner,
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: true,
+                note: "created worktree at",
+                start: Some("echo hi"),
+            },
+        )
+        .unwrap();
+        assert!(!cd_file.exists());
+        assert_eq!(runner.last.lock().unwrap().as_deref(), Some("echo hi"));
+    }
+
+    /// No `$WT_CD_FILE` and no terminal on stdout means a shell wrapper captured
+    /// it but does not know `--start`. Warn rather than silently swallow output.
+    #[test]
+    fn finish_worktree_warns_when_the_shell_wrapper_is_stale() {
+        let err = SharedBuf::new();
+        let mut t = test_cx(&[], "/work");
+        t.cx.err = Stream::new(Box::new(err.clone()), true); // stderr is a TTY
+        let target = PathBuf::from("/work/wt");
+        finish_worktree(
+            &mut t.cx,
+            &FakeRunner::new(0),
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: false,
+                note: "created worktree at",
+                start: Some("claude"),
+            },
+        )
+        .unwrap();
+        assert!(
+            err.contents().contains("wt shell-init"),
+            "{}",
+            err.contents()
+        );
+    }
+
+    /// Run straight from a terminal (no shell integration at all), there is nothing
+    /// to warn about: running the command in the worktree is all `wt` can do.
+    #[test]
+    fn finish_worktree_is_quiet_without_shell_integration_on_a_tty() {
+        let out = SharedBuf::new();
+        let err = SharedBuf::new();
+        let mut t = test_cx(&[], "/work");
+        t.cx.out = Stream::new(Box::new(out.clone()), true);
+        t.cx.err = Stream::new(Box::new(err.clone()), true);
+        let target = PathBuf::from("/work/wt");
+        finish_worktree(
+            &mut t.cx,
+            &FakeRunner::new(0),
+            &target,
+            &hook_ctx(&target),
+            Nav {
+                json: false,
+                no_switch: false,
+                note: "created worktree at",
+                start: Some("claude"),
+            },
+        )
+        .unwrap();
+        assert!(!err.contents().contains("shell-init"), "{}", err.contents());
+    }
 
     /// A worktree row carrying a branch (and its slug), as the resolver matches on.
     fn wt(branch: &str) -> Worktree {
@@ -572,6 +891,32 @@ mod tests {
                 "answer {answer:?}"
             );
         }
+    }
+
+    /// `--yes` answers the prompt affirmatively *without consuming stdin*: the
+    /// canned "n" must still be queued afterwards. A prompt helper that read the
+    /// line and then ignored it would desynchronize every subsequent prompt.
+    #[test]
+    fn assume_yes_answers_prompts_without_reading_stdin() {
+        use crate::commands::{Choice, choose, confirm, confirm_default_yes};
+        use crate::testutil::CannedInput;
+
+        let mut t = test_cx(&[], "/work");
+        t.cx.assume_yes = true;
+        t.cx.input = Box::new(CannedInput::new(&["n", "n", "c"]));
+
+        assert!(confirm(&mut t.cx, "remove? ").unwrap());
+        assert!(confirm_default_yes(&mut t.cx, "init? ").unwrap());
+        assert_eq!(choose(&mut t.cx, "stale? ").unwrap(), Choice::Update);
+
+        // None of the three canned answers were consumed.
+        assert_eq!(t.cx.input.read_line().unwrap(), "n\n");
+
+        // Each prompt is still echoed, with the answer `--yes` supplied.
+        let err = t.err.contents();
+        assert!(err.contains("remove? y (--yes)"), "{err}");
+        assert!(err.contains("init? y (--yes)"), "{err}");
+        assert!(err.contains("stale? u (--yes)"), "{err}");
     }
 
     #[test]

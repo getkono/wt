@@ -434,6 +434,31 @@ mod tests {
         assert!(!repo.git(&["worktree", "list"]).contains("merged-wt"));
     }
 
+    /// `--yes` answers the prompt but is not `--force`: a dirty worktree is still
+    /// skipped. Keeping the two separable is what makes `-y` safe in a script.
+    #[test]
+    fn assume_yes_skips_prompt_but_not_the_dirty_guard() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "clean-wt");
+        make_wt(&repo, "dirty-wt");
+        std::fs::write(wt_dir(&repo, "dirty-wt").join("README.md"), "dirty\n").unwrap();
+
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.assume_yes = true;
+        // No CannedInput: reading stdin at all would return "" and abort.
+        super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
+
+        assert!(t.err.contents().contains("Proceed? [y/N] y (--yes)"));
+        assert!(
+            t.err
+                .contents()
+                .contains("skipping dirty worktree dirty-wt")
+        );
+        let list = repo.git(&["worktree", "list"]);
+        assert!(!list.contains("clean-wt"), "{list}");
+        assert!(list.contains("dirty-wt"), "{list}");
+    }
+
     #[test]
     fn confirmation_no_aborts() {
         let repo = TestRepo::init();

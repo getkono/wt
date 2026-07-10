@@ -124,6 +124,25 @@ These are the things worth knowing up front; the rest is discoverable from
   `npm install`, `direnv allow`) runs inside the new worktree; `hooks.pre_remove`
   runs before removal. Hooks receive `WT_WORKTREE_PATH`, `WT_BRANCH`,
   `WT_REPO_ROOT`, and friends in their environment.
+- **Hand the new worktree straight to a tool.** `--start <command>` runs a command
+  inside the worktree once it is fully set up — after the copy step, the
+  `post_create` hook, and submodule init — and leaves your shell there afterwards:
+
+  ```bash
+  wt new feat/login -y --start "claude --permission-mode plan"
+  wt pr 42 --start "claude"          # check a PR out and review it
+  ```
+
+  It works on `wt new`, `wt checkout`, and `wt pr`. The command gets a real
+  terminal, so interactive tools work, and `wt` exits with the command's status.
+  It sees the same `WT_*` variables hooks do (`$WT_BRANCH`, `$WT_PR_NUMBER`, …) —
+  `wt` does not interpolate `{branch}`-style placeholders, which would collide
+  with shell braces. The `cd` afterwards needs the shell integration from step 2;
+  re-run `wt shell-init <shell>` if you set it up before `--start` existed.
+- **Say yes to everything.** `-y`/`--yes` is a global flag that answers every
+  confirmation prompt, so `wt` can run unattended. It is not `--force`: the
+  safety guards on `remove`, `drop`, and `prune` — dirty worktrees, unpushed
+  commits, unmerged branches — still hold, and still need `--force` to override.
 - **Configuration lives in two places.** A per-repo `.wt.toml` at the repo root and
   a global user config, managed with `wt config get|set|list|edit` (`--global` for
   the user config); precedence is flags > repo > global. `wt init` is an optional
