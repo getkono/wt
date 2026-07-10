@@ -11,6 +11,23 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.5.0](https://github.com/getkono/wt/compare/v1.4.0...v1.5.0) - 2026-07-10
+
+### Added
+
+- *(checkout,pr)* support --start
+- *(shell-init)* cd into the worktree after --start via $WT_CD_FILE
+- *(new)* add --start to run a command in the new worktree
+- *(hooks)* add run_start to execute a command in a worktree
+- *(commands)* auto-answer prompts under --yes
+- *(cli)* add a global -y/--yes flag
+
+### Other
+
+- document --yes, --start, and WT_CD_FILE
+- *(commands)* funnel nav commands through finish_worktree
+- *(pr)* drop `pr open -y` in favor of the global flag
+
 ## [1.4.0](https://github.com/getkono/wt/compare/v1.3.0...v1.4.0) - 2026-07-02
 
 ### Added
