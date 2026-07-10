@@ -12,7 +12,7 @@ use std::path::Path;
 
 use crate::cli::CheckoutArgs;
 use crate::commands::{
-    Session, emit_worktree, maybe_init_submodules_interactive, open_session, same_path,
+    Nav, Session, finish_worktree, maybe_init_submodules_interactive, open_session, same_path,
 };
 use crate::cx::Cx;
 use crate::error::{Error, Result};
@@ -22,6 +22,7 @@ use crate::git::{
     branch_ref, is_ancestor, ops, remote_branches, resolve_hex, status_of, upstream_of,
     validate_branch_name,
 };
+use crate::hooks::{HookContext, HookRunner};
 use crate::worktree_service::enumerate_worktrees;
 
 /// What the post-checkout origin sync did, for the caller's messaging.
@@ -40,7 +41,12 @@ pub(crate) enum SyncOutcome {
 /// Switches the current worktree to `branch`, syncing it with origin, then emits
 /// the worktree path so the shell wrapper `cd`s into it (a no-op for the common
 /// current-worktree case; the right behavior when `-C` targeted another).
-pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
+pub(crate) fn run(
+    cx: &mut Cx,
+    hooks: &dyn HookRunner,
+    args: &CheckoutArgs,
+    json: bool,
+) -> Result<u8> {
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
@@ -60,12 +66,27 @@ pub(crate) fn run(cx: &mut Cx, args: &CheckoutArgs, json: bool) -> Result<u8> {
         true,
     )?;
     log_sync_outcome(cx, &args.branch, outcome);
-    emit_worktree(
+    // Checkout has no `post_create` hook, but `--start` still needs the `WT_*`
+    // context. There is no base ref: the branch was checked out, not created.
+    let ctx = HookContext {
+        worktree_path: worktree_dir.clone(),
+        branch: args.branch.clone(),
+        repo_root: session.primary_root.clone(),
+        base_ref: None,
+        pr_number: None,
+    };
+    let note = format!("checked out {} in", args.branch);
+    finish_worktree(
         cx,
+        hooks,
         &worktree_dir,
-        json,
-        args.no_switch,
-        &format!("checked out {} in", args.branch),
+        &ctx,
+        Nav {
+            json,
+            no_switch: args.no_switch,
+            note: &note,
+            start: None,
+        },
     )
 }
 
@@ -542,7 +563,7 @@ mod tests {
         let mut t = test_cx(&[], repo.root().to_str().unwrap());
         let mut a = args("topic");
         a.no_switch = true;
-        let code = super::run(&mut t.cx, &a, false).unwrap();
+        let code = super::run(&mut t.cx, &crate::hooks::RealHookRunner, &a, false).unwrap();
         assert_eq!(code, 0);
         assert!(t.out.contents().is_empty());
         assert!(t.err.contents().contains("checked out topic in"));
@@ -553,7 +574,13 @@ mod tests {
         let repo = TestRepo::init();
         repo.git(&["branch", "topic"]);
         let mut t = test_cx(&[], repo.root().to_str().unwrap());
-        let code = super::run(&mut t.cx, &args("topic"), true).unwrap();
+        let code = super::run(
+            &mut t.cx,
+            &crate::hooks::RealHookRunner,
+            &args("topic"),
+            true,
+        )
+        .unwrap();
         assert_eq!(code, 0);
         let v: serde_json::Value = serde_json::from_str(t.out.contents().trim()).unwrap();
         assert_eq!(v["branch"], serde_json::json!("topic"));
@@ -565,7 +592,13 @@ mod tests {
         let repo = TestRepo::init();
         repo.git(&["branch", "topic"]);
         let mut t = test_cx(&[], repo.root().to_str().unwrap());
-        let code = super::run(&mut t.cx, &args("topic"), false).unwrap();
+        let code = super::run(
+            &mut t.cx,
+            &crate::hooks::RealHookRunner,
+            &args("topic"),
+            false,
+        )
+        .unwrap();
         assert_eq!(code, 0);
         // The worktree path is printed (so the shell wrapper cd's into it).
         let out = t.out.contents();
@@ -614,7 +647,13 @@ mod tests {
         let (repo, _bare) = repo_behind_origin("feat");
         let mut t = test_cx(&[], repo.root().to_str().unwrap());
         t.cx.verbose = 1;
-        super::run(&mut t.cx, &args("feat"), false).unwrap();
+        super::run(
+            &mut t.cx,
+            &crate::hooks::RealHookRunner,
+            &args("feat"),
+            false,
+        )
+        .unwrap();
         assert!(t.err.contents().contains("fast-forwarded"));
     }
 

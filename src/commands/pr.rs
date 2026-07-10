@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::{PrArgs, PrSub};
 use crate::commands::{
-    Session, emit_worktree, maybe_init_submodules_interactive, open_session, resolve_target,
+    Nav, Session, finish_worktree, maybe_init_submodules_interactive, open_session, resolve_target,
     rollback_worktree,
 };
 use crate::config::wtconfig;
@@ -106,6 +106,16 @@ fn pr_list(cx: &mut Cx, gh: &dyn GhClient, dir: &Path, json: bool) -> Result<u8>
     Ok(0)
 }
 
+/// A PR worktree, ready to be navigated into.
+pub(crate) struct PrCheckout {
+    /// The worktree's absolute path.
+    pub(crate) path: PathBuf,
+    /// Whether the worktree already existed (vs. was created here).
+    pub(crate) existed: bool,
+    /// The `WT_*` context for the `post_create` hook and `--start`.
+    pub(crate) ctx: HookContext,
+}
+
 /// `pr <target>` — fetch the PR head, create a worktree for it, then emit the
 /// navigation result (path/JSON/note).
 #[allow(clippy::too_many_arguments)]
@@ -120,7 +130,7 @@ fn pr_checkout(
     args: &PrArgs,
     json: bool,
 ) -> Result<u8> {
-    let (path, existed) = checkout_pr_worktree(
+    let checkout = checkout_pr_worktree(
         cx,
         git,
         gh,
@@ -132,18 +142,28 @@ fn pr_checkout(
         // The CLI may prompt before initializing submodules; the TUI passes false.
         true,
     )?;
-    let note = if existed {
+    let note = if checkout.existed {
         "worktree already exists at"
     } else {
         "checked out PR worktree at"
     };
-    emit_worktree(cx, &path, json, args.no_switch, note)
+    finish_worktree(
+        cx,
+        hooks,
+        &checkout.path,
+        &checkout.ctx,
+        Nav {
+            json,
+            no_switch: args.no_switch,
+            note,
+            start: None,
+        },
+    )
 }
 
 /// Checks out `target` (a PR number, URL, or head branch) into a worktree,
-/// recording its PR metadata (§7). Returns the worktree path and whether the
-/// worktree already existed (vs. was created here). Does not emit output — the
-/// caller decides how to surface the path (CLI navigation result, or TUI
+/// recording its PR metadata (§7). Does not emit output — the caller decides how
+/// to surface the [`PrCheckout`] (CLI navigation result, or TUI
 /// switch). `prompt` enables the interactive submodule confirmation (issue #50):
 /// the CLI passes `true`; the TUI passes `false`.
 #[allow(clippy::too_many_arguments)]
@@ -157,7 +177,7 @@ pub(crate) fn checkout_pr_worktree(
     target: &str,
     no_hooks: bool,
     prompt: bool,
-) -> Result<(PathBuf, bool)> {
+) -> Result<PrCheckout> {
     let view = gh.view_pr(dir, target)?;
     let root = session.primary_root.clone();
     let branch = view.head_ref_name.clone();
@@ -177,7 +197,12 @@ pub(crate) fn checkout_pr_worktree(
         wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
         wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
         wtconfig::write_base_ref(git, &root, &branch, &base)?;
-        return Ok((path, true));
+        let ctx = pr_hook_context(&path, &branch, &root, &base, number);
+        return Ok(PrCheckout {
+            path,
+            existed: true,
+            ctx,
+        });
     }
 
     // Fetch the PR head (works for fork PRs too via the pull/<n>/head ref).
@@ -243,13 +268,7 @@ pub(crate) fn checkout_pr_worktree(
     };
     crate::commands::log_copy_outcome(cx, &copy_outcome);
 
-    let ctx = HookContext {
-        worktree_path: worktree_path.clone(),
-        branch: branch.clone(),
-        repo_root: root.clone(),
-        base_ref: Some(base),
-        pr_number: Some(number),
-    };
+    let ctx = pr_hook_context(&worktree_path, &branch, &root, &base, number);
     run_post_create(
         hooks,
         cx,
@@ -270,7 +289,23 @@ pub(crate) fn checkout_pr_worktree(
         prompt,
     )?;
 
-    Ok((worktree_path, false))
+    Ok(PrCheckout {
+        path: worktree_path,
+        existed: false,
+        ctx,
+    })
+}
+
+/// The `WT_*` context for a PR worktree's `post_create` hook and `--start`
+/// command: unlike `wt new`, the base ref and PR number are always known.
+fn pr_hook_context(path: &Path, branch: &str, root: &Path, base: &str, number: u64) -> HookContext {
+    HookContext {
+        worktree_path: path.to_path_buf(),
+        branch: branch.to_string(),
+        repo_root: root.to_path_buf(),
+        base_ref: Some(base.to_string()),
+        pr_number: Some(number),
+    }
 }
 
 #[cfg(test)]

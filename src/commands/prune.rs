@@ -449,7 +449,11 @@ mod tests {
         super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
 
         assert!(t.err.contents().contains("Proceed? [y/N] y (--yes)"));
-        assert!(t.err.contents().contains("skipping dirty worktree dirty-wt"));
+        assert!(
+            t.err
+                .contents()
+                .contains("skipping dirty worktree dirty-wt")
+        );
         let list = repo.git(&["worktree", "list"]);
         assert!(!list.contains("clean-wt"), "{list}");
         assert!(list.contains("dirty-wt"), "{list}");

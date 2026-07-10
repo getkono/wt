@@ -533,7 +533,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::New(args)) => {
             crate::commands::new::run(cx, &crate::hooks::RealHookRunner, &args, json)
         }
-        Some(Command::Checkout(args)) => crate::commands::checkout::run(cx, &args, json),
+        Some(Command::Checkout(args)) => {
+            crate::commands::checkout::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
         Some(Command::Sync(args)) => crate::commands::sync::run(cx, &args, json),
         Some(Command::List(args)) => crate::commands::list::run(cx, &args, json),
         Some(Command::Switch(args)) => crate::commands::switch::run(cx, &args),

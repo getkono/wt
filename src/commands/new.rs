@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::NewArgs;
 use crate::commands::{
-    emit_worktree, maybe_init_submodules_interactive, open_session, render_target, resolve_target,
-    rollback_worktree, same_path,
+    Nav, finish_worktree, maybe_init_submodules_interactive, open_session, render_target,
+    resolve_target, rollback_worktree, same_path,
 };
 use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
@@ -118,12 +118,21 @@ pub(crate) fn run_core(
         let preview = render_target(&session.config, &root, &branch, &slug, &cx.env)?;
         if same_path(&existing.path, &preview) {
             let path = existing.path.clone();
-            return emit_worktree(
+            // Idempotent: the worktree is already initialized, so `--start` runs
+            // here too — `wt new x --start cmd` behaves the same whether or not
+            // the worktree happens to exist.
+            let ctx = hook_context(&path, &branch, &root, &base_ref);
+            return finish_worktree(
                 cx,
+                hooks,
                 &path,
-                json,
-                args.no_switch,
-                "worktree already exists at",
+                &ctx,
+                Nav {
+                    json,
+                    no_switch: args.no_switch,
+                    note: "worktree already exists at",
+                    start: None,
+                },
             );
         }
         return Err(Error::operation(format!(
@@ -181,13 +190,7 @@ pub(crate) fn run_core(
     crate::commands::log_copy_outcome(cx, &copy_outcome);
 
     // The post-create hook: a failure is a warning, not a rollback (§8).
-    let ctx = HookContext {
-        worktree_path: target.clone(),
-        branch: branch.clone(),
-        repo_root: root.clone(),
-        base_ref: base_ref.clone(),
-        pr_number: None,
-    };
+    let ctx = hook_context(&target, &branch, &root, &base_ref);
     run_post_create(
         hooks,
         cx,
@@ -208,7 +211,34 @@ pub(crate) fn run_core(
         prompt,
     )?;
 
-    emit_worktree(cx, &target, json, args.no_switch, "created worktree at")
+    finish_worktree(
+        cx,
+        hooks,
+        &target,
+        &ctx,
+        Nav {
+            json,
+            no_switch: args.no_switch,
+            note: "created worktree at",
+            start: None,
+        },
+    )
+}
+
+/// The `WT_*` context for the `post_create` hook and the `--start` command.
+fn hook_context(
+    target: &Path,
+    branch: &str,
+    root: &Path,
+    base_ref: &Option<String>,
+) -> HookContext {
+    HookContext {
+        worktree_path: target.to_path_buf(),
+        branch: branch.to_string(),
+        repo_root: root.to_path_buf(),
+        base_ref: base_ref.clone(),
+        pr_number: None,
+    }
 }
 
 /// Records metadata and runs the copy step (rolled back on error), returning the

@@ -156,6 +156,7 @@ pub(super) fn run_checkout_pr_command(
         // No inline prompt on a TUI background job; the policy decides.
         false,
     )
+    .map(|c| (c.path, c.existed))
     .map_err(|e| e.to_string())
 }
 
