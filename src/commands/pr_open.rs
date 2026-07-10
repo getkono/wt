@@ -27,9 +27,9 @@ use crate::git::{origin_head_branch, resolve_hex, upstream_of};
 use crate::tui::ComposeSeed;
 
 /// Dispatches `wt pr open`: gather context, then either open the TUI compose form
-/// (interactive) or submit directly (non-interactive / `--yes`), and emit the
-/// result. Spec §5: the human summary goes to stderr, the bare URL (or JSON) to
-/// stdout.
+/// (interactive) or submit directly (non-interactive / the global `--yes`), and
+/// emit the result. Spec §5: the human summary goes to stderr, the bare URL (or
+/// JSON) to stdout.
 pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
     let git = cx.git.clone();
     let gh = cx.gh.clone();
@@ -55,7 +55,8 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
     let opts = resolve_agent_options(args, &session.config)?;
 
     // Gate on the stderr TTY (where the TUI draws), matching the rest of `wt`.
-    let interactive = cx.err.is_tty() && !args.yes;
+    let yes = cx.assume_yes;
+    let interactive = cx.err.is_tty() && !yes;
     if interactive {
         let seed = ComposeSeed {
             title: args.title.clone().unwrap_or_default(),
@@ -84,7 +85,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
                 "a PR title is required: pass --title (or run interactively)",
             ));
         }
-        let action = resolve_direct_action(ctx.existing_pr.as_ref(), args)?;
+        let action = resolve_direct_action(ctx.existing_pr.as_ref(), args, yes)?;
         let spec = sendit::PrSpec {
             title,
             body,
@@ -131,8 +132,9 @@ fn read_flag_body(args: &PrOpenArgs) -> Result<Option<String>> {
 
 /// The action shown in (and submitted from) the compose form: an unforced
 /// conflict defaults to updating the existing PR — the friendly GUI default.
+/// Only reached when interactive, i.e. `--yes` was not given.
 fn action_for_form(existing: Option<&sendit::ExistingPr>, args: &PrOpenArgs) -> sendit::PrAction {
-    match sendit::resolve_action(existing, args.update, args.new, args.yes) {
+    match sendit::resolve_action(existing, args.update, args.new, false) {
         sendit::ActionChoice::Create => sendit::PrAction::Create,
         sendit::ActionChoice::Update(number) => sendit::PrAction::Update { number },
         sendit::ActionChoice::Conflict(pr) => sendit::PrAction::Update { number: pr.number },
@@ -141,11 +143,13 @@ fn action_for_form(existing: Option<&sendit::ExistingPr>, args: &PrOpenArgs) -> 
 
 /// The action for a non-interactive submit: an unforced conflict is an error
 /// (the caller must pass `--update` or `--new`), since there is no prompt.
+/// `yes` is the global `-y`/`--yes`.
 fn resolve_direct_action(
     existing: Option<&sendit::ExistingPr>,
     args: &PrOpenArgs,
+    yes: bool,
 ) -> Result<sendit::PrAction> {
-    match sendit::resolve_action(existing, args.update, args.new, args.yes) {
+    match sendit::resolve_action(existing, args.update, args.new, yes) {
         sendit::ActionChoice::Create => Ok(sendit::PrAction::Create),
         sendit::ActionChoice::Update(number) => Ok(sendit::PrAction::Update { number }),
         sendit::ActionChoice::Conflict(pr) => Err(Error::usage(format!(
@@ -784,7 +788,6 @@ mod tests {
             ai: false,
             model: None,
             effort: None,
-            yes: false,
             base: None,
             update: false,
             new: false,
@@ -857,6 +860,32 @@ mod tests {
         );
         let err = run(&mut t.cx, &open_args(Some("T")), false).unwrap_err();
         assert!(matches!(err, Error::Usage(_)));
+    }
+
+    /// The global `-y` resolves the same conflict by updating the open PR, which
+    /// is what the removed per-command `pr open -y` used to do.
+    #[test]
+    fn run_direct_conflict_under_assume_yes_updates() {
+        let (repo, _bare) = repo_with_remote();
+        repo.git(&["push", "-u", "origin", "feat"]);
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = std::sync::Arc::new(
+            FakeGh::sender("https://github.com/o/r/pull/5\n")
+                .with_default_branch("main")
+                .with_existing_pr(OpenPr {
+                    number: 5,
+                    url: "https://github.com/o/r/pull/5".into(),
+                    state: "OPEN".into(),
+                    is_draft: false,
+                }),
+        );
+        t.cx.assume_yes = true;
+        // Same args that error above; only `-y` differs.
+        let code = run(&mut t.cx, &open_args(Some("T")), true).unwrap();
+        assert_eq!(code, 0);
+        let v: serde_json::Value = serde_json::from_str(t.out.contents().trim()).unwrap();
+        assert_eq!(v["number"], serde_json::json!(5));
+        assert_eq!(v["action"], serde_json::json!("update"));
     }
 
     #[test]

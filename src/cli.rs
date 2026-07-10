@@ -306,7 +306,7 @@ pub(crate) enum PrSub {
 #[derive(Debug, Args)]
 pub(crate) struct PrOpenArgs {
     /// PR title. On an interactive terminal it seeds the compose form;
-    /// non-interactively (or with `-y`) it is used directly.
+    /// non-interactively (or with the global `-y`) it is used directly.
     #[arg(long)]
     pub(crate) title: Option<String>,
     /// PR body text.
@@ -329,9 +329,6 @@ pub(crate) struct PrOpenArgs {
     /// `agent.effort`; default `medium`).
     #[arg(long, value_name = "LEVEL")]
     pub(crate) effort: Option<String>,
-    /// Skip the compose form and submit non-interactively.
-    #[arg(short = 'y', long)]
-    pub(crate) yes: bool,
     /// Override the base/trunk branch to target.
     #[arg(long, value_name = "REF")]
     pub(crate) base: Option<String>,
