@@ -648,7 +648,7 @@ mod tests {
         // The AI-fill controls and the selected model/effort are shown.
         assert!(text.contains("Ctrl-A"));
         assert!(text.contains("model:"));
-        assert!(text.contains("Sonnet 4.6")); // the default model label
+        assert!(text.contains("Haiku 4.5")); // the default model label
         assert!(text.contains("effort:"));
     }
 

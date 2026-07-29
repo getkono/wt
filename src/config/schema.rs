@@ -358,8 +358,8 @@ mod tests {
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
         assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
-        assert_eq!(c.agent_model, AgentModel::Sonnet);
-        assert_eq!(c.agent_effort, Effort::Medium);
+        assert_eq!(c.agent_model, AgentModel::Haiku);
+        assert_eq!(c.agent_effort, Effort::Low);
         assert_eq!(c.agent_command, "claude");
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());

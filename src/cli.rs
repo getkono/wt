@@ -376,11 +376,11 @@ pub(crate) struct PrOpenArgs {
     #[arg(long)]
     pub(crate) ai: bool,
     /// Model for `--ai` drafting: `opus`, `sonnet`, or `haiku` (overrides
-    /// `agent.model`; default `sonnet`).
+    /// `agent.model`; default `haiku`).
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
     /// Effort for `--ai` drafting: `low`, `medium`, or `high` (overrides
-    /// `agent.effort`; default `medium`).
+    /// `agent.effort`; default `low`).
     #[arg(long, value_name = "LEVEL")]
     pub(crate) effort: Option<String>,
     /// Override the base/trunk branch to target.

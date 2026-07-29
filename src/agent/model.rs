@@ -17,10 +17,10 @@ use serde::Serialize;
 pub enum AgentModel {
     /// Most capable, highest latency (Claude Opus).
     Opus,
-    /// Balanced capability and speed (Claude Sonnet) — the default.
-    #[default]
+    /// Balanced capability and speed (Claude Sonnet).
     Sonnet,
-    /// Fastest and lightest (Claude Haiku).
+    /// Fastest and lightest (Claude Haiku) — the default.
+    #[default]
     Haiku,
 }
 
@@ -87,10 +87,10 @@ impl AgentModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
-    /// Quick, minimal deliberation.
-    Low,
-    /// Balanced effort — the default (no directive).
+    /// Quick, minimal deliberation — the default.
     #[default]
+    Low,
+    /// Balanced effort (no directive).
     Medium,
     /// Maximum deliberation and care.
     High,
@@ -236,9 +236,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_sonnet_and_medium() {
+    fn defaults_are_haiku_and_low() {
         let opts = AgentOptions::default();
-        assert_eq!(opts.model, AgentModel::Sonnet);
-        assert_eq!(opts.effort, Effort::Medium);
+        assert_eq!(opts.model, AgentModel::Haiku);
+        assert_eq!(opts.effort, Effort::Low);
     }
 }

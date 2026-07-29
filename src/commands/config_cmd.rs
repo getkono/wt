@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn agent_model_and_effort_roundtrip_and_validate() {
         let repo = TestRepo::init();
-        // Default value is the resolved Sonnet/medium.
+        // Default value is the resolved Haiku/low.
         let (_, out, _) = run(
             &repo,
             &[],
@@ -395,7 +395,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(out.trim(), "sonnet");
+        assert_eq!(out.trim(), "haiku");
         // Set + get a valid model.
         run(
             &repo,
@@ -424,7 +424,7 @@ mod tests {
             &ConfigArgs {
                 action: ConfigAction::Set {
                     key: "agent.effort".into(),
-                    value: "max".into(),
+                    value: "extreme".into(),
                 },
                 global: false,
             },

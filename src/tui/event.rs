@@ -1694,24 +1694,24 @@ mod tests {
         // Tab to the model field (title → body → model).
         a.handle_event(press(KeyCode::Tab));
         a.handle_event(press(KeyCode::Tab));
-        // Down advances like next(); Up reverses like prev() (defaults: Sonnet).
+        // Down advances like next(); Up reverses like prev() (default: Haiku).
         a.handle_event(press(KeyCode::Down));
         a.handle_event(press(KeyCode::Up));
         // Typing on an option field is ignored (no stray character lands).
         a.handle_event(press(KeyCode::Char('z')));
         if let Mode::PrCompose(s) = &a.mode {
             assert_eq!(s.field, ComposeField::Model);
-            assert_eq!(s.model, AgentModel::Sonnet);
+            assert_eq!(s.model, AgentModel::Haiku);
             assert_eq!(s.title, "");
         } else {
             panic!("expected compose mode");
         }
-        // Tab to effort; Down advances it like next() (default: Medium).
+        // Tab to effort; Down advances it like next() (default: Low).
         a.handle_event(press(KeyCode::Tab));
         a.handle_event(press(KeyCode::Down));
         if let Mode::PrCompose(s) = &a.mode {
             assert_eq!(s.field, ComposeField::Effort);
-            assert_eq!(s.effort, Effort::Medium.next());
+            assert_eq!(s.effort, Effort::Low.next());
         }
     }
 
@@ -1789,12 +1789,12 @@ mod tests {
         use crate::tui::app::PrComposeState;
         let mut a = app(&[("a", true)]);
         a.mode = Mode::PrCompose(PrComposeState::default());
-        // Defaults are Sonnet / Medium; cycling advances and never types a char.
+        // Defaults are Haiku / Low; cycling advances and never types a char.
         a.handle_event(ctrl('m'));
         a.handle_event(ctrl('e'));
         if let Mode::PrCompose(s) = &a.mode {
-            assert_eq!(s.model, AgentModel::Sonnet.next());
-            assert_eq!(s.effort, Effort::Medium.next());
+            assert_eq!(s.model, AgentModel::Haiku.next());
+            assert_eq!(s.effort, Effort::Low.next());
             assert_eq!(s.title, "");
         } else {
             panic!("expected compose mode");
