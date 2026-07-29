@@ -783,7 +783,7 @@ pub(crate) fn do_draft_pr_ai(
     // Read the live model/effort from the form before borrowing it mutably.
     let opts = match &app.mode {
         Mode::PrCompose(state) => crate::agent::AgentOptions {
-            model: state.model,
+            model: state.model.clone(),
             effort: state.effort,
         },
         _ => crate::agent::AgentOptions::default(),

@@ -317,12 +317,12 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
                 "unknown --model {m:?}; expected one of: opus, sonnet, haiku"
             ))
         })?,
-        None => config.agent_model,
+        None => config.agent_model.clone(),
     };
     let effort = match &args.effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
             Error::usage(format!(
-                "unknown --effort {e:?}; expected one of: low, medium, high"
+                "unknown --effort {e:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
         None => config.agent_effort,
@@ -772,7 +772,7 @@ mod tests {
             Err(Error::Usage(_))
         ));
         let mut args = open_args(None);
-        args.effort = Some("max".into());
+        args.effort = Some("extreme".into());
         assert!(matches!(
             resolve_agent_options(&args, &Config::default()),
             Err(Error::Usage(_))

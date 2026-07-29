@@ -170,7 +170,7 @@ pub(crate) struct IssueArgs {
     /// Model for AI generation: `opus`, `sonnet`, or `haiku`.
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
-    /// Effort for AI generation: `low`, `medium`, or `high`.
+    /// Effort for AI generation: `low`, `medium`, `high`, `xhigh`, or `max`.
     #[arg(long, value_name = "LEVEL")]
     pub(crate) effort: Option<String>,
     /// Prepare the worktree without launching the coding agent.
@@ -379,7 +379,7 @@ pub(crate) struct PrOpenArgs {
     /// `agent.model`; default `haiku`).
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
-    /// Effort for `--ai` drafting: `low`, `medium`, or `high` (overrides
+    /// Effort for `--ai` drafting: `low`, `medium`, `high`, `xhigh`, or `max` (overrides
     /// `agent.effort`; default `low`).
     #[arg(long, value_name = "LEVEL")]
     pub(crate) effort: Option<String>,

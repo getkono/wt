@@ -162,8 +162,9 @@ fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
             }
             "effort" => {
                 let text = as_string(file, &key, val)?;
-                let effort = Effort::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: low, medium, high"))?;
+                let effort = Effort::parse(&text).ok_or_else(|| {
+                    cfg_err(file, &key, "expected one of: low, medium, high, xhigh, max")
+                })?;
                 layer.agent_effort = Some(effort);
             }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
@@ -414,9 +415,9 @@ mod tests {
         let (key, reason) = config_reason(parse("[agent]\nmodel = \"gpt\"").unwrap_err());
         assert_eq!(key, "agent.model");
         assert!(reason.contains("opus, sonnet, haiku"));
-        let (key, reason) = config_reason(parse("[agent]\neffort = \"max\"").unwrap_err());
+        let (key, reason) = config_reason(parse("[agent]\neffort = \"extreme\"").unwrap_err());
         assert_eq!(key, "agent.effort");
-        assert!(reason.contains("low, medium, high"));
+        assert!(reason.contains("low, medium, high, xhigh, max"));
         let (key, _) = config_reason(parse("[agent]\nwiggle = true").unwrap_err());
         assert_eq!(key, "agent.wiggle");
     }

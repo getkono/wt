@@ -229,7 +229,7 @@ impl FakeAgent {
 
     /// The [`AgentOptions`] passed to the most recent `run`, if any.
     pub(crate) fn last_opts(&self) -> Option<AgentOptions> {
-        *self.last_opts.lock().expect("lock")
+        self.last_opts.lock().expect("lock").clone()
     }
 
     /// The prompt passed to the most recent `run`, if any.
@@ -260,7 +260,7 @@ impl AgentClient for FakeAgent {
         _dir: &Path,
         opts: &AgentOptions,
     ) -> crate::error::Result<AgentRun> {
-        *self.last_opts.lock().expect("lock") = Some(*opts);
+        *self.last_opts.lock().expect("lock") = Some(opts.clone());
         *self.last_prompt.lock().expect("lock") = Some(prompt.to_string());
         match &self.behavior {
             AgentBehavior::Draft(result) => Ok(AgentRun {

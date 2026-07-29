@@ -101,6 +101,8 @@ fn generate_with(
             Effort::Low => ReasoningEffort::Low,
             Effort::Medium => ReasoningEffort::Medium,
             Effort::High => ReasoningEffort::High,
+            Effort::XHigh => ReasoningEffort::XHigh,
+            Effort::Max => ReasoningEffort::Max,
         }),
         timeout: None,
     });

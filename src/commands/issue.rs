@@ -13,7 +13,7 @@ use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::gh::IssueView;
-use crate::git::{local_branches, validate_branch_name};
+use crate::git::{all_branches, default_base_ref, local_branches, validate_branch_name};
 use crate::hooks::HookRunner;
 use crate::slug::slugify;
 use crate::worktree_service::build_worktrees;
@@ -74,6 +74,8 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
     if !cx.assume_yes {
         options = edit_generation_options(cx, options)?;
     }
+    let branch_choices = all_branches(session.repo.gix()).unwrap_or_default();
+    let suggested_base = suggested_base(session.repo.gix(), args.from.as_deref());
     let linked = linked_branch(session.repo.gix(), issue.number)?;
 
     let (branch, brief) = if let Some(branch) = linked {
@@ -110,7 +112,7 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         issue,
         branch,
         brief,
-        base: args.from.clone(),
+        base: suggested_base,
         command: args
             .agent_command
             .clone()
@@ -120,7 +122,7 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
     };
     validate_setup(&setup)?;
     if !cx.assume_yes {
-        edit_setup(cx, &mut setup)?;
+        edit_setup(cx, &mut setup, &branch_choices)?;
         validate_setup(&setup)?;
     }
 
@@ -171,12 +173,12 @@ pub(crate) fn resolve_agent_options(
                 "unknown --model {value:?}; expected one of: opus, sonnet, haiku"
             ))
         })?,
-        None => config.agent_model,
+        None => config.agent_model.clone(),
     };
     let effort = match &args.effort {
         Some(value) => Effort::parse(value).ok_or_else(|| {
             Error::usage(format!(
-                "unknown --effort {value:?}; expected one of: low, medium, high"
+                "unknown --effort {value:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
         None => config.agent_effort,
@@ -470,6 +472,14 @@ fn existing_worktree_for_branch(cx: &Cx, branch: &str) -> Result<Option<PathBuf>
         .map(|worktree| worktree.path))
 }
 
+/// Resolves the issue workflow's reviewed base: an explicit `--from` wins,
+/// otherwise use the same up-to-date `origin/HEAD` tracking ref as the TUI.
+fn suggested_base(repo: &gix::Repository, requested: Option<&str>) -> Option<String> {
+    requested
+        .map(str::to_string)
+        .or_else(|| default_base_ref(repo))
+}
+
 /// Validates editable setup values before approval/mutation.
 fn validate_setup(setup: &IssueSetup) -> Result<()> {
     validate_plan(
@@ -491,18 +501,9 @@ fn validate_setup(setup: &IssueSetup) -> Result<()> {
 
 /// Plain-terminal editor used for targeted CLI invocations. Blank input keeps
 /// each generated/default value; the final mutation still has its own approval.
-fn edit_setup(cx: &mut Cx, setup: &mut IssueSetup) -> Result<()> {
+fn edit_setup(cx: &mut Cx, setup: &mut IssueSetup, branches: &[String]) -> Result<()> {
     setup.branch = prompt_value(cx, "branch", &setup.branch)?;
-    setup.base = match prompt_value(
-        cx,
-        "base",
-        setup.base.as_deref().unwrap_or("(repository default)"),
-    )?
-    .as_str()
-    {
-        "(repository default)" | "" => None,
-        value => Some(value.to_string()),
-    };
+    setup.base = prompt_base(cx, setup.base.as_deref(), branches)?;
     setup.brief = prompt_value(cx, "brief", &setup.brief)?;
     setup.command = prompt_value(cx, "agent command", &setup.command)?;
     let launch = prompt_value(
@@ -516,19 +517,136 @@ fn edit_setup(cx: &mut Cx, setup: &mut IssueSetup) -> Result<()> {
 
 /// Prompts for the LLM generation options before requesting branch/brief text.
 fn edit_generation_options(cx: &mut Cx, mut options: AgentOptions) -> Result<AgentOptions> {
-    let model = prompt_value(cx, "generation model", options.model.id())?;
-    options.model = AgentModel::parse(&model).ok_or_else(|| {
-        Error::usage(format!(
-            "unknown model {model:?}; expected one of: opus, sonnet, haiku"
-        ))
-    })?;
-    let effort = prompt_value(cx, "generation effort", options.effort.id())?;
+    const MODELS: &[&str] = &["haiku", "sonnet", "opus"];
+    let model = match prompt_choice(cx, "generation model", options.model.id(), MODELS)? {
+        PromptSelection::Choice(model) => model,
+        PromptSelection::Custom => prompt_value(cx, "custom generation model", options.model.id())?,
+    };
+    options.model = AgentModel::parse(&model)
+        .or_else(|| AgentModel::custom(&model))
+        .ok_or_else(|| Error::usage("generation model must not be empty"))?;
+
+    const EFFORTS: &[&str] = &["low", "medium", "high"];
+    let effort = match prompt_choice(cx, "generation effort", options.effort.id(), EFFORTS)? {
+        PromptSelection::Choice(effort) => effort,
+        PromptSelection::Custom => {
+            prompt_value(cx, "custom generation effort", options.effort.id())?
+        }
+    };
     options.effort = Effort::parse(&effort).ok_or_else(|| {
         Error::usage(format!(
-            "unknown effort {effort:?}; expected one of: low, medium, high"
+            "unknown effort {effort:?}; expected one of: low, medium, high, xhigh, max"
         ))
     })?;
     Ok(options)
+}
+
+/// Prompts for the base from local and remote-tracking branches, while retaining
+/// escapes for the repository default and a ref that is not in the list.
+fn prompt_base(cx: &mut Cx, current: Option<&str>, branches: &[String]) -> Result<Option<String>> {
+    const REPOSITORY_DEFAULT: &str = "(repository default)";
+    let mut choices = vec![REPOSITORY_DEFAULT.to_string()];
+    choices.extend(
+        branches
+            .iter()
+            .filter(|branch| !branch.trim().is_empty())
+            .cloned(),
+    );
+    choices.dedup();
+    let current = current.unwrap_or(REPOSITORY_DEFAULT);
+    match prompt_choice_owned(cx, "base branch", current, &choices)? {
+        PromptSelection::Choice(value) if value == REPOSITORY_DEFAULT => Ok(None),
+        PromptSelection::Choice(value) => Ok(Some(value)),
+        PromptSelection::Custom => {
+            let value = prompt_value(
+                cx,
+                "custom base ref",
+                current.strip_prefix(REPOSITORY_DEFAULT).unwrap_or(current),
+            )?;
+            Ok((!value.trim().is_empty()).then_some(value))
+        }
+    }
+}
+
+/// The result of a multiple-choice prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSelection {
+    /// One of the displayed fixed choices.
+    Choice(String),
+    /// The user asked for a free-form follow-up prompt.
+    Custom,
+}
+
+/// Displays fixed choices plus a final "type your own" escape hatch.
+fn prompt_choice(
+    cx: &mut Cx,
+    label: &str,
+    current: &str,
+    choices: &[&str],
+) -> Result<PromptSelection> {
+    let choices = choices
+        .iter()
+        .map(|choice| (*choice).to_string())
+        .collect::<Vec<_>>();
+    prompt_choice_owned(cx, label, current, &choices)
+}
+
+/// Owned-string implementation shared by fixed generation choices and refs
+/// discovered from Git.
+fn prompt_choice_owned(
+    cx: &mut Cx,
+    label: &str,
+    current: &str,
+    choices: &[String],
+) -> Result<PromptSelection> {
+    cx.err.line(&format!("{label}:"))?;
+    let current_index = choices.iter().position(|choice| choice == current);
+    for (index, choice) in choices.iter().enumerate() {
+        let marker = if current_index == Some(index) {
+            " (current)"
+        } else {
+            ""
+        };
+        cx.err.line(&format!("  {}) {choice}{marker}", index + 1))?;
+    }
+    let custom_index = choices.len() + 1;
+    let custom_marker = if current_index.is_none() {
+        format!(" (current: {current})")
+    } else {
+        String::new()
+    };
+    cx.err
+        .line(&format!("  {custom_index}) type your own{custom_marker}"))?;
+    let default = current_index.map_or(custom_index, |index| index + 1);
+    cx.err.text(&format!("select [{default}]: "))?;
+    cx.err.flush()?;
+    let value = cx.input.read_line()?;
+    let selected = if value.trim().is_empty() {
+        default
+    } else {
+        value.trim().parse::<usize>().map_err(|_| {
+            Error::usage(format!(
+                "{label} selection must be a number from 1 to {custom_index}"
+            ))
+        })?
+    };
+    if selected == 0 || selected > custom_index {
+        return Err(Error::usage(format!(
+            "{label} selection must be a number from 1 to {custom_index}"
+        )));
+    }
+    if selected == custom_index {
+        return Ok(PromptSelection::Custom);
+    }
+    choices
+        .get(selected - 1)
+        .cloned()
+        .map(PromptSelection::Choice)
+        .ok_or_else(|| {
+            Error::usage(format!(
+                "{label} selection must be a number from 1 to {custom_index}"
+            ))
+        })
 }
 
 /// Prompts for one editable value; a blank answer keeps the current value.
@@ -548,7 +666,7 @@ fn prompt_value(cx: &mut Cx, label: &str, current: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::gh::{IssueLabel, IssueMilestone, IssueType};
-    use crate::testutil::{FakeAgent, FakeGh, TestRepo, test_cx, wt_dir};
+    use crate::testutil::{CannedInput, FakeAgent, FakeGh, TestRepo, test_cx, wt_dir};
     use std::sync::Arc;
 
     fn issue() -> IssueView {
@@ -639,6 +757,96 @@ mod tests {
         .unwrap();
         assert_eq!(generated.branch, "fix/42-selected");
         assert_eq!(generated.brief, "Implement and test it.");
+    }
+
+    #[test]
+    fn generation_options_are_selected_from_numbered_choices() {
+        let mut test = test_cx(&[], "/work");
+        test.cx.input = Box::new(CannedInput::new(&["2", "3"]));
+        let options = edit_generation_options(&mut test.cx, AgentOptions::default()).unwrap();
+
+        assert_eq!(options.model, AgentModel::Sonnet);
+        assert_eq!(options.effort, Effort::High);
+        let prompt = test.err.contents();
+        assert!(prompt.contains("generation model:"));
+        assert!(prompt.contains("1) haiku (current)"));
+        assert!(prompt.contains("4) type your own"));
+        assert!(prompt.contains("generation effort:"));
+    }
+
+    #[test]
+    fn generation_options_accept_custom_model_and_extended_effort() {
+        let mut test = test_cx(&[], "/work");
+        test.cx.input = Box::new(CannedInput::new(&["4", "claude-future", "4", "max"]));
+        let options = edit_generation_options(&mut test.cx, AgentOptions::default()).unwrap();
+
+        assert_eq!(options.model, AgentModel::Custom("claude-future".into()));
+        assert_eq!(options.effort, Effort::Max);
+    }
+
+    #[test]
+    fn base_choice_lists_local_and_remote_refs_and_keeps_current() {
+        let mut test = test_cx(&[], "/work");
+        test.cx.input = Box::new(CannedInput::new(&[""]));
+        let branches = vec!["main".into(), "origin/dev".into(), "origin/main".into()];
+        let base = prompt_base(&mut test.cx, Some("origin/main"), &branches).unwrap();
+
+        assert_eq!(base.as_deref(), Some("origin/main"));
+        let prompt = test.err.contents();
+        assert!(prompt.contains("1) (repository default)"));
+        assert!(prompt.contains("origin/dev"));
+        assert!(prompt.contains("origin/main (current)"));
+        assert!(prompt.contains("type your own"));
+    }
+
+    #[test]
+    fn base_choice_accepts_repository_default_and_custom_ref() {
+        let branches = vec!["main".into(), "origin/main".into()];
+        let mut default = test_cx(&[], "/work");
+        default.cx.input = Box::new(CannedInput::new(&["1"]));
+        assert_eq!(
+            prompt_base(&mut default.cx, Some("origin/main"), &branches).unwrap(),
+            None
+        );
+
+        let mut custom = test_cx(&[], "/work");
+        custom.cx.input = Box::new(CannedInput::new(&["4", "release/v2"]));
+        assert_eq!(
+            prompt_base(&mut custom.cx, Some("origin/main"), &branches).unwrap(),
+            Some("release/v2".into())
+        );
+    }
+
+    #[test]
+    fn suggested_base_prefers_flag_then_origin_head() {
+        let repo = TestRepo::init();
+        let head = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["update-ref", "refs/remotes/origin/main", head.trim()]);
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let discovered = crate::git::discover::Repo::discover(repo.root()).unwrap();
+
+        assert_eq!(
+            suggested_base(discovered.gix(), None).as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            suggested_base(discovered.gix(), Some("release/v2")).as_deref(),
+            Some("release/v2")
+        );
+    }
+
+    #[test]
+    fn numbered_choice_rejects_invalid_selection() {
+        for selected in ["0", "9", "nope"] {
+            let mut test = test_cx(&[], "/work");
+            test.cx.input = Box::new(CannedInput::new(&[selected]));
+            let error = prompt_choice(&mut test.cx, "model", "haiku", &["haiku"]).unwrap_err();
+            assert!(error.to_string().contains("number from 1 to 2"));
+        }
     }
 
     #[test]

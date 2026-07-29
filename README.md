@@ -105,10 +105,12 @@ These are the things worth knowing up front; the rest is discoverable from
   conventional `type/123-slug` branch and concise implementation brief. You can
   edit every setup value and must explicitly approve before `wt` creates or
   reuses the linked worktree, records the issue metadata, and launches `claude`
-  there. Use `--no-launch` to prepare only, `--agent-command` (or
-  `agent.command`) to choose another foreground tool, and global `-y` to accept
-  defaults non-interactively. In the dashboard, press `i` to pick an open issue;
-  the dashboard returns and focuses its worktree when the agent exits.
+  there. Interactive setup presents model and effort choices plus a custom-entry
+  escape hatch, and lists local and remote-tracking branches for the base. Use
+  `--no-launch` to prepare only, `--agent-command` (or `agent.command`) to choose
+  another foreground tool, and global `-y` to accept defaults non-interactively.
+  In the dashboard, press `i` to pick an open issue; the dashboard returns and
+  focuses its worktree when the agent exits.
 - **See every branch, not just worktrees.** The TUI lists your worktrees first,
   then — dimmed beneath them — any local branch that has no worktree, each with how
   far it is ahead/behind its base. Select one and press `Enter` to create a
