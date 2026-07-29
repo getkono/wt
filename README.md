@@ -31,7 +31,7 @@ cargo install kono-wt                               # installs `wt` to ~/.cargo/
 #### From source
 
 You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on your
-`PATH`, and — only for PR commands — the [`gh` CLI](https://cli.github.com).
+`PATH`, and — for PR and issue commands — the [`gh` CLI](https://cli.github.com).
 
 ```bash
 cargo install --git https://github.com/getkono/wt   # latest from master
@@ -59,27 +59,27 @@ wt shell-init fish | source
 wt shell-init powershell | Out-String | Invoke-Expression
 ```
 
-**Without it, `switch`, `new`, `pr`, and the TUI just print a path instead of
+**Without it, `switch`, `new`, `pr`, `issue`, and the TUI just print a path instead of
 moving you.** Supported shells: bash, zsh, fish, powershell, elvish. On anything
 else, `wt switch --print-path` lets you build your own `cd` alias.
 
 This is also the recommended way to get tab completion. The `shell-init` snippet
 installs *dynamic* completions that suggest live values — real worktree names,
-branches, and PR numbers (via `wt __complete`) — not just the static command and
+branches, PR numbers, and issue numbers (via `wt __complete`) — not just the static command and
 flag list. Because you need to source it for navigation anyway, it's the single
 step that sets up everything; there's no separate completions install. (A static,
 values-unaware script is still available via `wt completions <shell>` if you want
 to manage it yourself.)
 
-### 3. Authenticate `gh` (only for PR commands)
+### 3. Authenticate `gh` (for PR and issue commands)
 
 ```bash
 gh auth login
 ```
 
-Everything except `wt pr` works fully offline. If `gh` is missing or
-unauthenticated, only the PR commands fail (with an actionable message); the rest
-keep working.
+Everything except `wt pr` and `wt issue` works fully offline. If `gh` is missing
+or unauthenticated, those commands fail with an actionable message; the rest keep
+working.
 
 ### 4. Open it
 
@@ -90,6 +90,7 @@ sorting, and filtering are all discoverable from there. For example:
 ```bash
 wt new feature/login   # create the branch + worktree and switch into it
 wt switch              # fuzzy-pick a worktree to jump to
+wt issue 123           # generate a branch/brief, approve, then open an agent
 ```
 
 Run `wt --help` (or `wt <command> --help`) for the complete command surface.
@@ -99,6 +100,15 @@ Run `wt --help` (or `wt <command> --help`) for the complete command surface.
 These are the things worth knowing up front; the rest is discoverable from
 `--help` and the TUI.
 
+- **Open an agent for an issue.** `wt issue 123` fetches the issue's title, body,
+  labels, type, and milestone, then uses the configured text agent to propose a
+  conventional `type/123-slug` branch and concise implementation brief. You can
+  edit every setup value and must explicitly approve before `wt` creates or
+  reuses the linked worktree, records the issue metadata, and launches `claude`
+  there. Use `--no-launch` to prepare only, `--agent-command` (or
+  `agent.command`) to choose another foreground tool, and global `-y` to accept
+  defaults non-interactively. In the dashboard, press `i` to pick an open issue;
+  the dashboard returns and focuses its worktree when the agent exits.
 - **See every branch, not just worktrees.** The TUI lists your worktrees first,
   then — dimmed beneath them — any local branch that has no worktree, each with how
   far it is ahead/behind its base. Select one and press `Enter` to create a

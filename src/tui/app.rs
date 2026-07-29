@@ -29,6 +29,8 @@ pub enum Mode {
     Create(CreateState),
     /// PR picker overlay.
     PrPicker(PrPickerState),
+    /// GitHub issue picker used to open an agent worktree.
+    IssuePicker(IssuePickerState),
     /// PR compose form (`wt pr open`): edit a title + body, then submit.
     PrCompose(PrComposeState),
     /// Branch picker for checking out a branch in the selected worktree.
@@ -295,6 +297,36 @@ pub struct PrPickerState {
     /// The selected PR index.
     pub selected: usize,
     /// An error (e.g. gh unavailable).
+    pub error: Option<String>,
+}
+
+/// One GitHub issue shown in the issue picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueItem {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Comma-separated label names.
+    pub labels: String,
+    /// GitHub issue type, when configured by the repository.
+    pub issue_type: Option<String>,
+    /// Milestone title, when assigned.
+    pub milestone: Option<String>,
+    /// Issue creation timestamp.
+    pub created_at: String,
+}
+
+/// The dashboard issue-picker state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssuePickerState {
+    /// Whether issues are still loading.
+    pub loading: bool,
+    /// The loaded open issues.
+    pub issues: Vec<IssueItem>,
+    /// The selected issue index.
+    pub selected: usize,
+    /// An error from GitHub CLI.
     pub error: Option<String>,
 }
 

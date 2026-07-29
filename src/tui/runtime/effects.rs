@@ -311,6 +311,44 @@ pub(super) fn apply_prs(app: &mut App, result: std::result::Result<Vec<PrItem>, 
     }
 }
 
+/// Lists open issues and maps their approved picker metadata into [`IssueItem`]s.
+pub(super) fn fetch_issues_result(
+    gh: &dyn crate::gh::GhClient,
+    dir: &Path,
+) -> std::result::Result<Vec<IssueItem>, String> {
+    gh.list_open_issues(dir)
+        .map(|issues| {
+            issues
+                .into_iter()
+                .map(|issue| IssueItem {
+                    number: issue.number,
+                    title: issue.title,
+                    labels: issue
+                        .labels
+                        .into_iter()
+                        .map(|label| label.name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    issue_type: issue.issue_type.map(|kind| kind.name),
+                    milestone: issue.milestone.map(|milestone| milestone.title),
+                    created_at: issue.created_at,
+                })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Folds a finished issue fetch into the picker if it is still open.
+pub(super) fn apply_issues(app: &mut App, result: std::result::Result<Vec<IssueItem>, String>) {
+    if let Mode::IssuePicker(state) = &mut app.mode {
+        state.loading = false;
+        match result {
+            Ok(issues) => state.issues = issues,
+            Err(error) => state.error = Some(error),
+        }
+    }
+}
+
 // The `do_*` helpers below run the shell action synchronously (job then apply,
 // no `spawn_blocking`), keeping the original handler surface for unit tests; the
 // event loop instead spawns the job and applies the outcome asynchronously so it

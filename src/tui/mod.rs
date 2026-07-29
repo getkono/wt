@@ -17,5 +17,6 @@ pub mod view;
 pub use app::{App, Mode, Pane};
 pub use event::Effect;
 pub use options::OptionList;
+pub(crate) use runtime::run_issue_picker;
 pub(crate) use runtime::run_pr_compose;
 pub use runtime::{ComposeSeed, run_pr_picker, run_tui};

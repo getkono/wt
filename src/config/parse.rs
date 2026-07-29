@@ -145,6 +145,15 @@ fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
     for (sub, val) in as_table(file, "agent", value)? {
         let key = format!("agent.{sub}");
         match sub.as_str() {
+            "command" => {
+                let text = as_string(file, &key, val)?;
+                let parsed = shell_words::split(&text)
+                    .map_err(|error| cfg_err(file, &key, format!("invalid command: {error}")))?;
+                if parsed.is_empty() {
+                    return Err(cfg_err(file, &key, "command must not be empty"));
+                }
+                layer.agent_command = Some(text);
+            }
             "model" => {
                 let text = as_string(file, &key, val)?;
                 let model = AgentModel::parse(&text)
@@ -305,6 +314,7 @@ mod tests {
             init = "always"
 
             [agent]
+            command = "claude --permission-mode plan"
             model = "opus"
             effort = "high"
 
@@ -337,6 +347,10 @@ mod tests {
         assert_eq!(layer.submodules_init, Some(SubmoduleInit::Always));
         assert_eq!(layer.agent_model, Some(AgentModel::Opus));
         assert_eq!(layer.agent_effort, Some(Effort::High));
+        assert_eq!(
+            layer.agent_command.as_deref(),
+            Some("claude --permission-mode plan")
+        );
         assert_eq!(layer.list_show_untracked, Some(false));
         assert_eq!(layer.list_columns, Some(vec![Column::Branch, Column::Pr]));
         assert_eq!(layer.ui_nerd_fonts, Some(true));

@@ -22,7 +22,7 @@ use crate::git::discover::Repo;
 use crate::hooks::CapturingHookRunner;
 use crate::model::{SortSpec, Worktree};
 use crate::tui::app::{
-    App, AppConfig, InitSubmodulesState, JobHome, JobKey, Mode, PrComposeState, PrItem,
+    App, AppConfig, InitSubmodulesState, IssueItem, JobHome, JobKey, Mode, PrComposeState, PrItem,
     StaleBaseState, StatusKind,
 };
 use crate::tui::event::{CreateDecision, Effect};
@@ -77,6 +77,45 @@ pub fn run_pr_picker(cx: &mut Cx) -> Result<Option<PathBuf>> {
         ..Default::default()
     });
     drive_tui(cx, &session, app, Effect::FetchPrs, &opened_in)
+}
+
+/// Runs the standalone issue picker used by `wt issue` with no target.
+///
+/// This lightweight picker deliberately stays on the ordinary terminal so the
+/// selected issue can flow into the same editable review/approval prompts as an
+/// explicit target. The dashboard has its own modal issue picker.
+pub(crate) fn run_issue_picker(
+    cx: &mut Cx,
+    hooks: &dyn crate::hooks::HookRunner,
+    args: &crate::cli::IssueArgs,
+) -> Result<u8> {
+    let git = cx.git.clone();
+    let gh = cx.gh.clone();
+    let session = open_session(cx, git.as_ref())?;
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let issues = gh.list_open_issues(&dir)?;
+    if issues.is_empty() {
+        cx.err.line("no open GitHub issues")?;
+        return Ok(0);
+    }
+    cx.err.line("open GitHub issues:")?;
+    for issue in &issues {
+        cx.err
+            .line(&format!("  #{}  {}", issue.number, issue.title))?;
+    }
+    cx.err.text("issue number (blank to cancel): ")?;
+    cx.err.flush()?;
+    let selected = cx.input.read_line()?;
+    let selected = selected.trim();
+    if selected.is_empty() {
+        return Ok(0);
+    }
+    let mut selected_args = args.clone();
+    selected_args.target = Some(selected.to_string());
+    crate::commands::issue::run(cx, hooks, &selected_args)
 }
 
 /// Centres the session's git operations on the primary worktree root (issue #68):
@@ -198,9 +237,10 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
     // per-row spinners while any job is in flight (issue #46 overhaul).
     let (job_tx, mut job_rx) = mpsc::channel::<(JobKey, JobOutcome)>(64);
     let (pr_tx, mut pr_rx) = mpsc::channel::<PrFetch>(4);
+    let (issue_tx, mut issue_rx) = mpsc::channel::<IssueFetch>(4);
 
     if initial != Effect::None {
-        if dispatch_effect(cx, session, app, &mut tui, initial, &pr_tx)? {
+        if dispatch_effect(cx, session, app, &mut tui, initial, &pr_tx, &issue_tx)? {
             return Ok(());
         }
         tui.draw(app)?;
@@ -240,6 +280,11 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
                 apply_prs(app, fetch);
                 tui.draw(app)?;
             }
+            // An issue fetch finished: fold it into the picker if it remains open.
+            Some(fetch) = issue_rx.recv() => {
+                apply_issues(app, fetch);
+                tui.draw(app)?;
+            }
             maybe = events.next() => {
                 let Some(Ok(event)) = maybe else { continue };
                 // Input is never gated: the user can act while jobs run.
@@ -247,7 +292,7 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
                 if is_background_action(&effect) {
                     spawn_job(cx, app, effect, &job_tx);
                     tui.draw(app)?;
-                } else if dispatch_effect(cx, session, app, &mut tui, effect, &pr_tx)? {
+                } else if dispatch_effect(cx, session, app, &mut tui, effect, &pr_tx, &issue_tx)? {
                     break;
                 } else {
                     tui.draw(app)?;
@@ -271,6 +316,7 @@ fn dispatch_effect(
     tui: &mut Tui,
     effect: Effect,
     pr_tx: &mpsc::Sender<PrFetch>,
+    issue_tx: &mpsc::Sender<IssueFetch>,
 ) -> Result<bool> {
     match effect {
         Effect::None => Ok(false),
@@ -287,6 +333,61 @@ fn dispatch_effect(
             // Fetch off-thread so opening the picker never freezes on the gh
             // network call; the picker shows its loading state until it arrives.
             spawn_fetch_prs(cx, session, pr_tx);
+            Ok(false)
+        }
+        Effect::FetchIssues => {
+            spawn_fetch_issues(cx, session, issue_tx);
+            Ok(false)
+        }
+        Effect::OpenIssue(number) => {
+            app.mode = Mode::List;
+            tui.suspend()?;
+            let args = crate::cli::IssueArgs {
+                target: Some(number.to_string()),
+                branch: None,
+                from: None,
+                agent_command: None,
+                model: None,
+                effort: None,
+                no_launch: false,
+                no_switch: true,
+                no_hooks: false,
+                copy_from: None,
+                init_submodules: false,
+                no_init_submodules: false,
+            };
+            let result = commands::issue::run(cx, &crate::hooks::RealHookRunner, &args);
+            tui.resume()?;
+            match result {
+                Ok(0) => {
+                    do_refresh(cx, app, &session.primary_root);
+                    let linked = app.worktrees.iter().position(|worktree| {
+                        worktree
+                            .issue
+                            .as_ref()
+                            .is_some_and(|issue| issue.number == number)
+                    });
+                    if let Some(index) = linked {
+                        if let Some(visible) = app.visible.iter().position(|&item| item == index) {
+                            app.selected = visible;
+                        }
+                        app.set_status(
+                            format!("issue #{number} worktree ready"),
+                            StatusKind::Success,
+                        );
+                    } else {
+                        app.set_status(
+                            format!("issue #{number} workflow cancelled"),
+                            StatusKind::Info,
+                        );
+                    }
+                }
+                Ok(code) => app.set_status(
+                    format!("agent for issue #{number} exited with status {code}"),
+                    StatusKind::Error,
+                ),
+                Err(error) => app.set_status(error.to_string(), StatusKind::Error),
+            }
             Ok(false)
         }
         Effect::OpenEditor(path) => {
@@ -670,6 +771,8 @@ fn spawn_job(cx: &Cx, app: &mut App, effect: Effect, tx: &mpsc::Sender<(JobKey, 
 
 /// The payload of an async PR fetch: the picker items, or the error to surface.
 type PrFetch = std::result::Result<Vec<PrItem>, String>;
+/// The payload of an async issue fetch.
+type IssueFetch = std::result::Result<Vec<IssueItem>, String>;
 
 /// Spawns a background task to fetch open PRs (a `gh` network call) and stream the
 /// result into the picker, so opening it never freezes the loop.
@@ -682,6 +785,19 @@ fn spawn_fetch_prs(cx: &Cx, session: &Session, tx: &mpsc::Sender<PrFetch>) {
     let tx = tx.clone();
     tokio::task::spawn_blocking(move || {
         let _ = tx.blocking_send(fetch_prs_result(gh.as_ref(), &dir));
+    });
+}
+
+/// Spawns a background task to fetch open GitHub issues.
+fn spawn_fetch_issues(cx: &Cx, session: &Session, tx: &mpsc::Sender<IssueFetch>) {
+    let gh = cx.gh.clone();
+    let dir = session
+        .repo
+        .current_workdir()
+        .unwrap_or_else(|| session.primary_root.clone());
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = tx.blocking_send(fetch_issues_result(gh.as_ref(), &dir));
     });
 }
 
@@ -1424,6 +1540,36 @@ mod tests {
         } else {
             panic!("expected pr picker");
         }
+    }
+
+    #[test]
+    fn fetch_and_apply_issues_populates_picker_context() {
+        let repo = TestRepo::init();
+        let (mut test, _session, mut app) = setup(&repo);
+        test.cx.gh =
+            StdArc::new(
+                FakeGh::default().with_issue_list(vec![crate::gh::IssueSummary {
+                    number: 17,
+                    title: "Open agent".into(),
+                    state: "OPEN".into(),
+                    labels: vec![crate::gh::IssueLabel { name: "bug".into() }],
+                    issue_type: Some(crate::gh::IssueType { name: "Bug".into() }),
+                    milestone: Some(crate::gh::IssueMilestone { title: "v2".into() }),
+                    created_at: "2024-01-15T10:30:00Z".into(),
+                    url: "https://github.com/o/r/issues/17".into(),
+                }]),
+            );
+        app.mode = Mode::IssuePicker(Default::default());
+        let result = fetch_issues_result(test.cx.gh.as_ref(), repo.root());
+        apply_issues(&mut app, result);
+        let Mode::IssuePicker(state) = &app.mode else {
+            panic!("expected issue picker");
+        };
+        assert!(!state.loading);
+        assert_eq!(state.issues[0].number, 17);
+        assert_eq!(state.issues[0].labels, "bug");
+        assert_eq!(state.issues[0].issue_type.as_deref(), Some("Bug"));
+        assert_eq!(state.issues[0].milestone.as_deref(), Some("v2"));
     }
 
     #[test]

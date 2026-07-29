@@ -80,6 +80,7 @@ pub(super) fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
                 ]));
             }
         }
+        detail_issue(&mut lines, worktree, &theme);
     } else {
         lines.push(Line::from(vec![
             Span::styled("status: ", theme.label()),
@@ -170,6 +171,7 @@ fn render_branch_detail(
             Span::raw(pr.title.clone()),
         ]));
     }
+    detail_issue(&mut lines, worktree, theme);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -177,6 +179,23 @@ fn render_branch_detail(
             .scroll((app.detail_scroll, 0)),
         area,
     );
+}
+
+/// Appends the linked issue number/title/URL when present.
+fn detail_issue(lines: &mut Vec<Line<'static>>, worktree: &Worktree, theme: &Theme) {
+    if let Some(issue) = &worktree.issue {
+        lines.push(Line::from(vec![
+            Span::styled("issue:  ", theme.label()),
+            Span::styled(format!("#{} ", issue.number), theme.accent()),
+            Span::raw(issue.title.clone()),
+        ]));
+        if !issue.url.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(issue.url.clone(), theme.url()),
+            ]));
+        }
+    }
 }
 
 /// Appends the "Last 5 commits" lines (short hash, subject, relative time) to

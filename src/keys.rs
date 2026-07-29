@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// A TUI action that can be bound to a key (spec §10/§11). The 24 variants match
+/// A TUI action that can be bound to a key (spec §10/§11). The variants match
 /// the action names accepted by `ui.keybindings`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyAction {
@@ -42,6 +42,8 @@ pub enum KeyAction {
     Remove,
     /// Open the PR picker.
     PrCheckout,
+    /// Open an agent for a GitHub issue.
+    OpenIssue,
     /// Check out a branch in the selected worktree (syncs with origin).
     Checkout,
     /// Sync (pull then push) the selected worktree's branch.
@@ -68,7 +70,7 @@ pub enum KeyAction {
 
 impl KeyAction {
     /// All actions, in the order documented in §11.
-    pub const ALL: [KeyAction; 25] = [
+    pub const ALL: [KeyAction; 26] = [
         KeyAction::NavigateUp,
         KeyAction::NavigateDown,
         KeyAction::PageUp,
@@ -83,6 +85,7 @@ impl KeyAction {
         KeyAction::New,
         KeyAction::Remove,
         KeyAction::PrCheckout,
+        KeyAction::OpenIssue,
         KeyAction::Checkout,
         KeyAction::Sync,
         KeyAction::OpenEditor,
@@ -113,6 +116,7 @@ impl KeyAction {
             KeyAction::New => "new",
             KeyAction::Remove => "remove",
             KeyAction::PrCheckout => "pr-checkout",
+            KeyAction::OpenIssue => "open-issue",
             KeyAction::Checkout => "checkout",
             KeyAction::Sync => "sync",
             KeyAction::OpenEditor => "open-editor",
@@ -153,6 +157,7 @@ impl KeyAction {
             KeyAction::New => "new",
             KeyAction::Remove => "remove",
             KeyAction::PrCheckout => "pr picker",
+            KeyAction::OpenIssue => "open issue",
             KeyAction::Checkout => "checkout",
             KeyAction::Sync => "sync",
             KeyAction::OpenEditor => "open in editor",
@@ -416,6 +421,7 @@ impl Keymap {
             (KeyAction::New, KeyChord::key(KeyCode::Char('n'))),
             (KeyAction::Remove, KeyChord::key(KeyCode::Char('d'))),
             (KeyAction::PrCheckout, KeyChord::key(KeyCode::Char('p'))),
+            (KeyAction::OpenIssue, KeyChord::key(KeyCode::Char('i'))),
             (KeyAction::Checkout, KeyChord::key(KeyCode::Char('c'))),
             (KeyAction::Sync, KeyChord::key(KeyCode::Char('y'))),
             (KeyAction::OpenEditor, KeyChord::key(KeyCode::Char('o'))),
@@ -497,7 +503,7 @@ mod tests {
 
     #[test]
     fn action_names_round_trip_and_are_unique() {
-        assert_eq!(KeyAction::ALL.len(), 25);
+        assert_eq!(KeyAction::ALL.len(), 26);
         let mut names = std::collections::HashSet::new();
         for action in KeyAction::ALL {
             assert_eq!(KeyAction::parse(action.name()), Some(action));

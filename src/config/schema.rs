@@ -73,6 +73,8 @@ pub struct Config {
     /// Default effort for the AI PR auto-fill; overridable by `--effort` or the
     /// TUI's `Ctrl-E` key.
     pub agent_effort: Effort,
+    /// Foreground coding-agent command for `wt issue`.
+    pub agent_command: String,
     /// Show `?` in the dirty column for untracked files.
     pub list_show_untracked: bool,
     /// Ordered list of columns to display in `wt list`.
@@ -106,6 +108,7 @@ impl Default for Config {
             submodules_init: SubmoduleInit::default(),
             agent_model: AgentModel::default(),
             agent_effort: Effort::default(),
+            agent_command: "claude".to_string(),
             list_show_untracked: true,
             list_columns: Column::ALL.to_vec(),
             ui_nerd_fonts: false,
@@ -160,6 +163,9 @@ impl Config {
         }
         if let Some(v) = layer.agent_effort {
             self.agent_effort = v;
+        }
+        if let Some(v) = layer.agent_command {
+            self.agent_command = v;
         }
         if let Some(v) = layer.list_show_untracked {
             self.list_show_untracked = v;
@@ -241,6 +247,8 @@ pub struct ConfigLayer {
     pub agent_model: Option<AgentModel>,
     /// `agent.effort`.
     pub agent_effort: Option<Effort>,
+    /// `agent.command`.
+    pub agent_command: Option<String>,
     /// `list.show_untracked`.
     pub list_show_untracked: Option<bool>,
     /// `list.columns`.
@@ -352,6 +360,7 @@ mod tests {
         assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
         assert_eq!(c.agent_model, AgentModel::Sonnet);
         assert_eq!(c.agent_effort, Effort::Medium);
+        assert_eq!(c.agent_command, "claude");
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());
         assert!(!c.ui_nerd_fonts);

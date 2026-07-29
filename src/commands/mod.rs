@@ -7,6 +7,7 @@ pub mod completions;
 pub mod config_cmd;
 pub mod drop;
 pub mod init;
+pub mod issue;
 pub mod list;
 pub mod new;
 pub mod path;
@@ -511,7 +512,7 @@ pub(crate) fn finish_worktree(
 /// The exception is a *stale* wrapper: one that does not know `--start` still
 /// captures stdout, which we detect as "stdout is not a terminal but stderr is".
 /// That would silently swallow the command's output, so say so.
-fn hand_path_to_shell(cx: &mut Cx, target: &Path) -> Result<()> {
+pub(crate) fn hand_path_to_shell(cx: &mut Cx, target: &Path) -> Result<()> {
     match cx.env.get("WT_CD_FILE").filter(|p| !p.is_empty()) {
         Some(cd_file) => Ok(std::fs::write(
             cd_file,
@@ -531,7 +532,7 @@ fn hand_path_to_shell(cx: &mut Cx, target: &Path) -> Result<()> {
 
 /// Emits a navigation result: JSON object, the bare path (for `cd`), or a stderr
 /// note when `--no-switch` (spec §5/§7).
-fn emit_worktree(
+pub(crate) fn emit_worktree(
     cx: &mut Cx,
     target: &Path,
     json: bool,

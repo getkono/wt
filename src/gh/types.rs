@@ -1,8 +1,93 @@
 //! `gh` JSON shapes and their mapping to the domain model (spec §4).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::PrState;
+
+/// A GitHub issue label.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueLabel {
+    /// Label name.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A GitHub issue type.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueType {
+    /// Issue type name.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A GitHub issue milestone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueMilestone {
+    /// Milestone title.
+    #[serde(default)]
+    pub title: String,
+}
+
+/// An open issue as returned by `gh issue list --json ...`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueSummary {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue state (`OPEN`/`CLOSED`).
+    pub state: String,
+    /// Labels attached to the issue.
+    #[serde(default)]
+    pub labels: Vec<IssueLabel>,
+    /// Optional organization-defined issue type.
+    #[serde(rename = "issueType", default)]
+    pub issue_type: Option<IssueType>,
+    /// Optional milestone.
+    #[serde(default)]
+    pub milestone: Option<IssueMilestone>,
+    /// ISO-8601 creation time.
+    #[serde(rename = "createdAt", default)]
+    pub created_at: String,
+    /// Issue web URL.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// A full issue as returned by `gh issue view <target> --json ...`.
+///
+/// This intentionally carries the token-efficient issue context used by the
+/// agent workflow; comments and project bookkeeping are not requested.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueView {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue body.
+    #[serde(default)]
+    pub body: String,
+    /// Issue state (`OPEN`/`CLOSED`).
+    pub state: String,
+    /// Labels attached to the issue.
+    #[serde(default)]
+    pub labels: Vec<IssueLabel>,
+    /// Optional organization-defined issue type.
+    #[serde(rename = "issueType", default)]
+    pub issue_type: Option<IssueType>,
+    /// Optional milestone.
+    #[serde(default)]
+    pub milestone: Option<IssueMilestone>,
+    /// ISO-8601 creation time.
+    #[serde(rename = "createdAt", default)]
+    pub created_at: String,
+    /// ISO-8601 update time.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: String,
+    /// Issue web URL.
+    #[serde(default)]
+    pub url: String,
+}
 
 /// A PR author (`{ "login": ... }`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -139,6 +224,30 @@ mod tests {
         assert_eq!(prs[0].author.login, "alice");
         assert_eq!(prs[0].pr_state(), PrState::Open);
         assert_eq!(prs[1].pr_state(), PrState::Draft); // open + draft
+    }
+
+    #[test]
+    fn parses_issue_list_and_view_json() {
+        let list = r#"[{"number":12,"title":"Add agent","state":"OPEN",
+            "labels":[{"name":"enhancement","color":"abc"}],
+            "issueType":{"name":"Feature"},"milestone":{"title":"v2"},
+            "createdAt":"2026-01-01T00:00:00Z","url":"https://example/12"}]"#;
+        let issues: Vec<IssueSummary> = serde_json::from_str(list).unwrap();
+        assert_eq!(issues[0].number, 12);
+        assert_eq!(issues[0].labels[0].name, "enhancement");
+        assert_eq!(
+            issues[0].issue_type.as_ref().map(|kind| kind.name.as_str()),
+            Some("Feature")
+        );
+
+        let view = r#"{"number":12,"title":"Add agent","body":"Details",
+            "state":"OPEN","labels":[],"issueType":null,"milestone":null,
+            "createdAt":"2026-01-01T00:00:00Z",
+            "updatedAt":"2026-01-02T00:00:00Z","url":"https://example/12"}"#;
+        let issue: IssueView = serde_json::from_str(view).unwrap();
+        assert_eq!(issue.body, "Details");
+        assert!(issue.issue_type.is_none());
+        assert!(issue.milestone.is_none());
     }
 
     #[test]

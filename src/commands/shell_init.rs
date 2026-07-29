@@ -45,7 +45,16 @@ pub(crate) fn run(cx: &mut Cx, args: &ShellInitArgs) -> Result<u8> {
 const BASH: &str = r#"# wt shell integration (bash) — source this from your ~/.bashrc
 wt() {
   case "${1-}" in
-    switch|sw|checkout|co|new|pr|drop|ui|tui|"")
+    switch|sw|checkout|co|new|pr|issue|drop|ui|tui|"")
+      # Issue review and its coding agent both need inherited terminal stdio.
+      if [ "${1-}" = issue ]; then
+        local __wt_cd __wt_code
+        __wt_cd="$(mktemp)"
+        WT_CD_FILE="$__wt_cd" command wt "$@"; __wt_code=$?
+        [ -s "$__wt_cd" ] && builtin cd -- "$(cat "$__wt_cd")"
+        rm -f "$__wt_cd"
+        return "$__wt_code"
+      fi
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
@@ -99,9 +108,13 @@ _wt_complete() {
       if [ "$COMP_CWORD" -eq 2 ]; then
         COMPREPLY=($(command wt __complete pr-numbers "$cur" 2>/dev/null)); return
       fi ;;
+    issue)
+      if [ "$COMP_CWORD" -eq 2 ]; then
+        COMPREPLY=($(command wt __complete issue-numbers "$cur" 2>/dev/null)); return
+      fi ;;
   esac
   if [ "$COMP_CWORD" -eq 1 ]; then
-    COMPREPLY=($(compgen -W "new checkout co list ls switch sw remove rm drop prune pr status path root init config completions shell-init ui tui" -- "$cur"))
+    COMPREPLY=($(compgen -W "new checkout co list ls switch sw remove rm drop prune pr issue status path root init config completions shell-init ui tui" -- "$cur"))
   fi
 }
 complete -F _wt_complete wt
@@ -110,7 +123,16 @@ complete -F _wt_complete wt
 const ZSH: &str = r#"# wt shell integration (zsh) — source this from your ~/.zshrc
 wt() {
   case "${1-}" in
-    switch|sw|checkout|co|new|pr|drop|ui|tui|"")
+    switch|sw|checkout|co|new|pr|issue|drop|ui|tui|"")
+      # Issue review and its coding agent both need inherited terminal stdio.
+      if [[ "${1-}" = issue ]]; then
+        local __wt_cd __wt_code
+        __wt_cd="$(mktemp)"
+        WT_CD_FILE="$__wt_cd" command wt "$@"; __wt_code=$?
+        [[ -s "$__wt_cd" ]] && builtin cd -- "$(cat "$__wt_cd")"
+        rm -f "$__wt_cd"
+        return $__wt_code
+      fi
       local __wt_arg
       for __wt_arg in "$@"; do
         case "$__wt_arg" in
@@ -153,8 +175,10 @@ _wt() {
       compadd -- ${(f)"$(command wt __complete all-branches "${words[CURRENT]}" 2>/dev/null)"}; return ;;
     pr)
       compadd -- ${(f)"$(command wt __complete pr-numbers "${words[CURRENT]}" 2>/dev/null)"}; return ;;
+    issue)
+      compadd -- ${(f)"$(command wt __complete issue-numbers "${words[CURRENT]}" 2>/dev/null)"}; return ;;
   esac
-  compadd -- new checkout co list ls switch sw remove rm drop prune pr status path root init config completions shell-init ui tui
+  compadd -- new checkout co list ls switch sw remove rm drop prune pr issue status path root init config completions shell-init ui tui
 }
 compdef _wt wt
 "#;
@@ -162,10 +186,10 @@ compdef _wt wt
 const FISH: &str = r#"# wt shell integration (fish) — source this from your config.fish
 function wt
     set -l cmd $argv[1]
-    if test (count $argv) -eq 0; or contains -- "$cmd" switch sw checkout co new pr drop ui tui
+    if test (count $argv) -eq 0; or contains -- "$cmd" switch sw checkout co new pr issue drop ui tui
         # --start runs a command in the new worktree, so it needs the real
         # terminal: run wt with stdio inherited and take the path via a file.
-        if contains -- --start $argv; or string match -q -- '--start=*' $argv
+        if test "$cmd" = issue; or contains -- --start $argv; or string match -q -- '--start=*' $argv
             set -l __wt_cd (mktemp)
             begin
                 set -lx WT_CD_FILE $__wt_cd
@@ -206,18 +230,20 @@ complete -c wt -n '__fish_seen_subcommand_from checkout co' \
     -a '(command wt __complete all-branches 2>/dev/null)'
 complete -c wt -n '__fish_seen_subcommand_from pr' \
     -a '(command wt __complete pr-numbers 2>/dev/null)'
+complete -c wt -n '__fish_seen_subcommand_from issue' \
+    -a '(command wt __complete issue-numbers 2>/dev/null)'
 complete -c wt -n '__fish_use_subcommand' \
-    -a 'new checkout co list switch remove drop prune pr status path root init config completions shell-init ui tui'
+    -a 'new checkout co list switch remove drop prune pr issue status path root init config completions shell-init ui tui'
 "#;
 
 const POWERSHELL: &str = r#"# wt shell integration (PowerShell) — add to your $PROFILE
 function wt {
-    $nav = @('switch','sw','checkout','co','new','pr','drop','ui','tui')
+    $nav = @('switch','sw','checkout','co','new','pr','issue','drop','ui','tui')
     $exe = (Get-Command wt -CommandType Application | Select-Object -First 1).Source
     if ($args.Count -eq 0 -or $nav -contains $args[0]) {
         # --start runs a command in the new worktree, so it needs the real
         # terminal: run wt with stdio inherited and take the path via a file.
-        if ($args -contains '--start' -or ($args | Where-Object { $_ -like '--start=*' })) {
+        if ($args[0] -eq 'issue' -or $args -contains '--start' -or ($args | Where-Object { $_ -like '--start=*' })) {
             $cd = [System.IO.Path]::GetTempFileName()
             try {
                 $env:WT_CD_FILE = $cd
@@ -251,18 +277,19 @@ Register-ArgumentCompleter -CommandName wt -Native -ScriptBlock {
         '^new$' { & $exe __complete branches $wordToComplete }
         '^(checkout|co)$' { & $exe __complete all-branches $wordToComplete }
         '^pr$'  { & $exe __complete pr-numbers $wordToComplete }
-        default { 'new','checkout','co','list','switch','remove','drop','prune','pr','status','path','root','init','config','completions','shell-init','ui','tui' | Where-Object { $_ -like "$wordToComplete*" } }
+        '^issue$' { & $exe __complete issue-numbers $wordToComplete }
+        default { 'new','checkout','co','list','switch','remove','drop','prune','pr','issue','status','path','root','init','config','completions','shell-init','ui','tui' | Where-Object { $_ -like "$wordToComplete*" } }
     }
 }
 "#;
 
 const ELVISH: &str = r#"# wt shell integration (elvish) — source this from your rc.elv
 fn wt {|@a|
-    var nav = [switch sw checkout co new pr drop ui tui]
+    var nav = [switch sw checkout co new pr issue drop ui tui]
     if (or (== (count $a) 0) (and (> (count $a) 0) (has-value $nav $a[0]))) {
         # --start runs a command in the new worktree, so it needs the real
         # terminal: run wt with stdio inherited and take the path via a file.
-        var starting = $false
+        var starting = (and (> (count $a) 0) (eq $a[0] issue))
         for x $a {
             if (or (eq $x --start) (str:has-prefix $x --start=)) { set starting = $true }
         }
@@ -368,6 +395,30 @@ mod tests {
             assert!(
                 start < json,
                 "--start must be matched before the --json bypass for {shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_wrapper_gives_issue_an_inherited_terminal() {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
+            let snippet = snippet(shell);
+            assert!(snippet.contains("issue"), "no issue route for {shell:?}");
+            assert!(
+                snippet.contains("WT_CD_FILE"),
+                "no issue path handoff for {shell:?}"
+            );
+        }
+        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell] {
+            assert!(
+                snippet(shell).contains("__complete issue-numbers"),
+                "no dynamic issue completion for {shell:?}"
             );
         }
     }

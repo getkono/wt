@@ -20,7 +20,8 @@ use crate::output::render::branch_display;
 use crate::time::{now_unix, parse_iso8601, relative};
 use crate::tui::app::{
     App, CheckoutState, ComposeField, CreateState, CreateStep, ExitBlockedState, ExitIntent,
-    InitSubmodulesState, Mode, Pane, PrComposeState, PrPickerState, StaleBaseState,
+    InitSubmodulesState, IssuePickerState, Mode, Pane, PrComposeState, PrPickerState,
+    StaleBaseState,
 };
 use crate::tui::glyphs::Glyphs;
 use crate::tui::hints::{self, Hint};
@@ -53,6 +54,7 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Help => modals::render_help(app, frame, area),
         Mode::Create(state) => modals::render_create(app, state, frame, area),
         Mode::PrPicker(state) => modals::render_pr_picker(app, state, frame, area),
+        Mode::IssuePicker(state) => modals::render_issue_picker(app, state, frame, area),
         Mode::PrCompose(state) => modals::render_pr_compose(app, state, frame, area),
         Mode::Checkout(state) => modals::render_checkout(app, state, frame, area),
         Mode::ConfirmRemove(index) => modals::render_confirm(app, *index, frame, area),
@@ -237,6 +239,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::Filter => "FILTER",
         Mode::Create(_) => "CREATE",
         Mode::PrPicker(_) => "PR",
+        Mode::IssuePicker(_) => "ISSUE",
         Mode::PrCompose(_) => "COMPOSE",
         Mode::Checkout(_) => "CHECKOUT",
         Mode::ConfirmRemove(_) => "REMOVE",
@@ -256,11 +259,12 @@ fn mode_label(mode: &Mode) -> &'static str {
 /// (the full reference lives in the help overlay). Their key text comes from the
 /// live [`Keymap`](crate::keys::Keymap) and their labels from
 /// [`KeyAction::label`], so the bar can never drift from the bindings (issue #39).
-const LIST_BAR: [KeyAction; 8] = [
+const LIST_BAR: [KeyAction; 9] = [
     KeyAction::Switch,
     KeyAction::New,
     KeyAction::Remove,
     KeyAction::PrCheckout,
+    KeyAction::OpenIssue,
     KeyAction::Checkout,
     KeyAction::Filter,
     KeyAction::Help,
@@ -283,6 +287,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::Filter => hint_pairs(hints::filter_hints()),
         Mode::Create(_) => hint_pairs(hints::create_hints()),
         Mode::PrPicker(_) => hint_pairs(hints::pr_picker_hints()),
+        Mode::IssuePicker(_) => hint_pairs(hints::issue_picker_hints()),
         Mode::PrCompose(_) => hint_pairs(hints::compose_edit_hints()),
         Mode::Checkout(_) => hint_pairs(hints::checkout_hints()),
         Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
@@ -1004,6 +1009,28 @@ mod tests {
         });
         // The PR-picker overlay is empty here, so the bottom bar hint shows.
         assert!(render_to_text(&a, 100, 30).contains("checkout"));
+    }
+
+    #[test]
+    fn issue_picker_renders_issue_context_and_hints() {
+        let mut app = app(&[("main", true)]);
+        app.mode = Mode::IssuePicker(IssuePickerState {
+            issues: vec![crate::tui::app::IssueItem {
+                number: 42,
+                title: "Open agent".into(),
+                labels: "enhancement".into(),
+                issue_type: Some("Feature".into()),
+                milestone: Some("v2".into()),
+                created_at: "2024-01-15T10:30:00Z".into(),
+            }],
+            ..Default::default()
+        });
+        let text = render_to_text(&app, 100, 30);
+        assert!(text.contains("open agent for issue"));
+        assert!(text.contains("#42"));
+        assert!(text.contains("Feature"));
+        assert!(text.contains("enhancement"));
+        assert!(text.contains("review & open"));
     }
 
     #[test]

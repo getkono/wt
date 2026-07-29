@@ -379,6 +379,75 @@ pub(super) fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Fra
     frame.render_stateful_widget(list, rect, &mut list_state);
 }
 
+/// Renders the open-issue picker overlay.
+pub(super) fn render_issue_picker(
+    app: &App,
+    state: &IssuePickerState,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let theme = Theme::with_palette(app.color, app.palette);
+    let rect = centered(area, 76, 20);
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered().title(Span::styled("open agent for issue", theme.title(true)));
+    if let Some(err) = &state.error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(err.clone(), theme.error())),
+                Line::from(Span::styled(
+                    "(run `gh auth login`)   Esc: close",
+                    theme.hint_label(),
+                )),
+            ])
+            .block(block),
+            rect,
+        );
+        return;
+    }
+    if state.loading {
+        frame.render_widget(
+            Paragraph::new(Span::styled("loading…", theme.spinner())).block(block),
+            rect,
+        );
+        return;
+    }
+    let now = now_unix();
+    let items: Vec<ListItem> = state
+        .issues
+        .iter()
+        .map(|issue| {
+            let age = parse_iso8601(&issue.created_at)
+                .map(|u| relative(now, u))
+                .unwrap_or_default();
+            let context = [
+                issue.issue_type.as_deref(),
+                (!issue.labels.is_empty()).then_some(issue.labels.as_str()),
+                issue.milestone.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("#{}", issue.number), theme.commit_hash()),
+                Span::raw("  "),
+                Span::raw(issue.title.clone()),
+                Span::raw("  "),
+                Span::styled(context, theme.hint_label()),
+                Span::raw("  "),
+                Span::styled(age, theme.time()),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(theme.selection())
+        .highlight_symbol(theme.selection_symbol())
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut list_state = ListState::default().with_selected(Some(state.selected));
+    frame.render_stateful_widget(list, rect, &mut list_state);
+}
+
 /// Renders the confirm-remove dialog.
 ///
 /// Beyond the branch, path, and safety warnings, this surfaces the same

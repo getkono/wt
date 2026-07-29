@@ -72,6 +72,10 @@ pub enum Effect {
     },
     /// Open the PR picker — the runtime fetches PRs.
     FetchPrs,
+    /// Open the issue picker — the runtime fetches open issues.
+    FetchIssues,
+    /// Suspend the dashboard and open an agent for the selected issue.
+    OpenIssue(u64),
     /// Check out the PR with the given number.
     CheckoutPr(u64),
     /// Check out `branch` in the worktree at `worktree_index` (in place).
@@ -224,6 +228,7 @@ impl App {
             Mode::Filter => self.key_filter(key),
             Mode::Create(_) => self.key_create(key),
             Mode::PrPicker(_) => self.key_pr(key),
+            Mode::IssuePicker(_) => self.key_issue(key),
             Mode::PrCompose(_) => self.key_compose(key),
             Mode::Checkout(_) => self.key_checkout_picker(key),
             Mode::ConfirmRemove(_) => self.key_confirm(key),
@@ -305,6 +310,13 @@ impl App {
                     ..Default::default()
                 });
                 return Effect::FetchPrs;
+            }
+            KeyAction::OpenIssue => {
+                self.mode = Mode::IssuePicker(crate::tui::app::IssuePickerState {
+                    loading: true,
+                    ..Default::default()
+                });
+                return Effect::FetchIssues;
             }
             KeyAction::Checkout => {
                 // Seed a branch picker for the selected worktree (its index into
@@ -469,6 +481,27 @@ impl App {
             KeyCode::Enter => {
                 if let Some(pr) = state.prs.get(state.selected) {
                     return Effect::CheckoutPr(pr.number);
+                }
+            }
+            KeyCode::Esc => self.mode = Mode::List,
+            _ => {}
+        }
+        Effect::None
+    }
+
+    /// Issue-picker key handling.
+    fn key_issue(&mut self, key: KeyEvent) -> Effect {
+        let Mode::IssuePicker(state) = &mut self.mode else {
+            return Effect::None;
+        };
+        match key.code {
+            KeyCode::Up => state.selected = state.selected.saturating_sub(1),
+            KeyCode::Down => {
+                state.selected = (state.selected + 1).min(state.issues.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                if let Some(issue) = state.issues.get(state.selected) {
+                    return Effect::OpenIssue(issue.number);
                 }
             }
             KeyCode::Esc => self.mode = Mode::List,
@@ -798,6 +831,13 @@ impl App {
                     state.selected = state.selected.saturating_sub(1);
                 } else {
                     state.selected = (state.selected + 1).min(state.prs.len().saturating_sub(1));
+                }
+            }
+            Mode::IssuePicker(state) => {
+                if up {
+                    state.selected = state.selected.saturating_sub(1);
+                } else {
+                    state.selected = (state.selected + 1).min(state.issues.len().saturating_sub(1));
                 }
             }
             _ => {}
@@ -1444,6 +1484,42 @@ mod tests {
         a.handle_event(press(KeyCode::Down));
         let effect = a.handle_event(press(KeyCode::Enter));
         assert_eq!(effect, Effect::CheckoutPr(9));
+    }
+
+    #[test]
+    fn issue_picker_opens_selects_and_returns_open_effect() {
+        let mut app = app(&[("a", true)]);
+        assert_eq!(
+            app.handle_event(press(KeyCode::Char('i'))),
+            Effect::FetchIssues
+        );
+        let Mode::IssuePicker(state) = &mut app.mode else {
+            panic!("expected issue picker");
+        };
+        state.loading = false;
+        state.issues = vec![
+            crate::tui::app::IssueItem {
+                number: 7,
+                title: "first".into(),
+                labels: String::new(),
+                issue_type: None,
+                milestone: None,
+                created_at: String::new(),
+            },
+            crate::tui::app::IssueItem {
+                number: 9,
+                title: "second".into(),
+                labels: "bug".into(),
+                issue_type: Some("Bug".into()),
+                milestone: Some("v2".into()),
+                created_at: String::new(),
+            },
+        ];
+        app.handle_event(press(KeyCode::Down));
+        assert_eq!(
+            app.handle_event(press(KeyCode::Enter)),
+            Effect::OpenIssue(9)
+        );
     }
 
     #[test]

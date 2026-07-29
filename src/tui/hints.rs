@@ -58,6 +58,16 @@ pub fn pr_picker_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Issue-picker hints.
+pub fn issue_picker_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[
+        hint("↑/↓", "select"),
+        hint("Enter", "review & open"),
+        hint("Esc", "close"),
+    ];
+    HINTS
+}
+
 /// PR-compose AI auto-fill controls (the first overlay hint row).
 pub fn compose_ai_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[
@@ -161,7 +171,7 @@ mod tests {
     use crate::tui::app::testutil::app;
     use crate::tui::app::{
         App, CheckoutState, ComposeField, CreateState, CreateStep, ExitBlockedState, ExitIntent,
-        Mode, PrComposeState, PrItem, PrPickerState, StaleBaseState,
+        IssueItem, IssuePickerState, Mode, PrComposeState, PrItem, PrPickerState, StaleBaseState,
     };
     use crate::tui::event::Effect;
     use crate::tui::options::OptionList;
@@ -179,6 +189,7 @@ mod tests {
             filter_hints(),
             create_hints(),
             pr_picker_hints(),
+            issue_picker_hints(),
             compose_ai_hints(),
             compose_edit_hints(),
             checkout_hints(),
@@ -266,6 +277,30 @@ mod tests {
                     ..Default::default()
                 });
             }
+            "issue_picker" => {
+                a.mode = Mode::IssuePicker(IssuePickerState {
+                    issues: vec![
+                        IssueItem {
+                            number: 1,
+                            title: "one".into(),
+                            labels: String::new(),
+                            issue_type: None,
+                            milestone: None,
+                            created_at: String::new(),
+                        },
+                        IssueItem {
+                            number: 2,
+                            title: "two".into(),
+                            labels: String::new(),
+                            issue_type: None,
+                            milestone: None,
+                            created_at: String::new(),
+                        },
+                    ],
+                    selected: 1,
+                    ..Default::default()
+                });
+            }
             "compose" => {
                 a.mode = Mode::PrCompose(PrComposeState {
                     field: ComposeField::Model,
@@ -337,6 +372,7 @@ mod tests {
         assert_hints_live("filter", filter_hints());
         assert_hints_live("create", create_hints());
         assert_hints_live("pr_picker", pr_picker_hints());
+        assert_hints_live("issue_picker", issue_picker_hints());
         assert_hints_live("compose", compose_ai_hints());
         assert_hints_live("compose", compose_edit_hints());
         assert_hints_live("checkout", checkout_hints());

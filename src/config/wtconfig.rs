@@ -1,5 +1,5 @@
 //! Per-worktree metadata stored in Git config under the `wt.*` namespace (spec
-//! §3/§7/§11): the base ref, originating PR number, and a "created by wt" flag.
+//! §3/§7/§11): the base ref, originating PR/issue, and a "created by wt" flag.
 //!
 //! Metadata is keyed by branch (`[wt "<branch>"]`), so it is shared across the
 //! repo yet unambiguous per worktree. Reads use `gix`; writes use `git config`
@@ -23,6 +23,12 @@ pub struct WtMeta {
     pub pr_title: Option<String>,
     /// Cached PR URL, for the TUI detail pane (§10).
     pub pr_url: Option<String>,
+    /// Linked GitHub issue number.
+    pub issue_number: Option<u64>,
+    /// Cached issue title.
+    pub issue_title: Option<String>,
+    /// Cached issue URL.
+    pub issue_url: Option<String>,
     /// Whether the branch/worktree was created by `wt` (§10).
     pub created_by_wt: bool,
 }
@@ -50,6 +56,15 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
     let pr_url = config
         .string(key(branch, "prUrl").as_str())
         .map(|v| v.to_string());
+    let issue_number = config
+        .string(key(branch, "issueNumber").as_str())
+        .and_then(|v| v.to_string().parse::<u64>().ok());
+    let issue_title = config
+        .string(key(branch, "issueTitle").as_str())
+        .map(|v| v.to_string());
+    let issue_url = config
+        .string(key(branch, "issueUrl").as_str())
+        .map(|v| v.to_string());
     let created_by_wt = config
         .boolean(key(branch, "createdByWt").as_str())
         .unwrap_or(false);
@@ -59,8 +74,29 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
         pr_state,
         pr_title,
         pr_url,
+        issue_number,
+        issue_title,
+        issue_url,
         created_by_wt,
     }
+}
+
+/// Records a GitHub issue link for `branch`.
+pub fn write_issue(
+    git: &dyn GitCli,
+    repo_root: &Path,
+    branch: &str,
+    number: u64,
+    title: &str,
+    url: &str,
+) -> Result<()> {
+    git.run(
+        repo_root,
+        &["config", &key(branch, "issueNumber"), &number.to_string()],
+    )?;
+    git.run(repo_root, &["config", &key(branch, "issueTitle"), title])?;
+    git.run(repo_root, &["config", &key(branch, "issueUrl"), url])?;
+    Ok(())
 }
 
 /// Records the full cached PR snapshot (number, state, title) for `branch`.
@@ -184,6 +220,27 @@ mod tests {
         assert_eq!(m.pr_number, Some(99));
         assert_eq!(m.pr_state.as_deref(), Some("open"));
         assert_eq!(m.pr_title.as_deref(), Some("Add feature"));
+    }
+
+    #[test]
+    fn issue_link_round_trips() {
+        let repo = TestRepo::init();
+        write_issue(
+            &RealGit,
+            repo.root(),
+            "main",
+            12,
+            "Open agent",
+            "https://github.com/o/r/issues/12",
+        )
+        .unwrap();
+        let m = meta(&repo, "main");
+        assert_eq!(m.issue_number, Some(12));
+        assert_eq!(m.issue_title.as_deref(), Some("Open agent"));
+        assert_eq!(
+            m.issue_url.as_deref(),
+            Some("https://github.com/o/r/issues/12")
+        );
     }
 
     #[test]

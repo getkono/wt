@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use crate::agent::{AgentClient, AgentKind, AgentOptions, AgentRun, AgentVersion, DetectedAgent};
 use crate::cx::{Cx, Env, Input, Stream};
 use crate::error::Error;
-use crate::gh::{GhClient, OpenPr, PrSummary, PrView, RealGh};
+use crate::gh::{GhClient, IssueSummary, IssueView, OpenPr, PrSummary, PrView, RealGh};
 use crate::git::cli::{GitCli, RealGit};
 
 /// A fake [`GhClient`] returning canned PR data or simulating an unavailable
@@ -26,6 +26,8 @@ use crate::git::cli::{GitCli, RealGit};
 pub(crate) struct FakeGh {
     list: Vec<PrSummary>,
     view: Option<PrView>,
+    issue_list: Vec<IssueSummary>,
+    issue_view: Option<IssueView>,
     available: bool,
     default_branch: Option<String>,
     existing_pr: Option<OpenPr>,
@@ -53,6 +55,20 @@ impl FakeGh {
             available: true,
             ..Default::default()
         }
+    }
+
+    /// Sets the open issues returned by `list_open_issues`.
+    pub(crate) fn with_issue_list(mut self, list: Vec<IssueSummary>) -> Self {
+        self.issue_list = list;
+        self.available = true;
+        self
+    }
+
+    /// Sets the issue returned by `view_issue`.
+    pub(crate) fn with_issue(mut self, issue: IssueView) -> Self {
+        self.issue_view = Some(issue);
+        self.available = true;
+        self
     }
 
     /// A fake whose `create_pr`/`edit_pr` succeed and return `stdout`.
@@ -94,6 +110,23 @@ impl FakeGh {
 }
 
 impl GhClient for FakeGh {
+    fn list_open_issues(&self, _dir: &Path) -> crate::error::Result<Vec<IssueSummary>> {
+        if self.available {
+            Ok(self.issue_list.clone())
+        } else {
+            Err(Error::GhUnavailable("gh unavailable".into()))
+        }
+    }
+
+    fn view_issue(&self, _dir: &Path, _target: &str) -> crate::error::Result<IssueView> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.issue_view
+            .clone()
+            .ok_or_else(|| Error::operation("no issue configured"))
+    }
+
     fn list_open_prs(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<PrSummary>> {
         if self.available {
             Ok(self.list.clone())
@@ -166,6 +199,7 @@ pub(crate) enum AgentBehavior {
 pub(crate) struct FakeAgent {
     behavior: AgentBehavior,
     last_opts: Mutex<Option<AgentOptions>>,
+    last_prompt: Mutex<Option<String>>,
 }
 
 #[allow(dead_code)]
@@ -174,6 +208,7 @@ impl FakeAgent {
         FakeAgent {
             behavior,
             last_opts: Mutex::new(None),
+            last_prompt: Mutex::new(None),
         }
     }
 
@@ -196,6 +231,11 @@ impl FakeAgent {
     pub(crate) fn last_opts(&self) -> Option<AgentOptions> {
         *self.last_opts.lock().expect("lock")
     }
+
+    /// The prompt passed to the most recent `run`, if any.
+    pub(crate) fn last_prompt(&self) -> Option<String> {
+        self.last_prompt.lock().expect("lock").clone()
+    }
 }
 
 impl AgentClient for FakeAgent {
@@ -216,11 +256,12 @@ impl AgentClient for FakeAgent {
     fn run(
         &self,
         kind: AgentKind,
-        _prompt: &str,
+        prompt: &str,
         _dir: &Path,
         opts: &AgentOptions,
     ) -> crate::error::Result<AgentRun> {
         *self.last_opts.lock().expect("lock") = Some(*opts);
+        *self.last_prompt.lock().expect("lock") = Some(prompt.to_string());
         match &self.behavior {
             AgentBehavior::Draft(result) => Ok(AgentRun {
                 kind,

@@ -84,6 +84,8 @@ pub(crate) enum Command {
     /// Check out a GitHub PR into its own worktree.
     #[command(args_conflicts_with_subcommands = true)]
     Pr(PrArgs),
+    /// Create an issue worktree and open a coding agent.
+    Issue(IssueArgs),
     /// Detailed status for one or all worktrees.
     Status(StatusArgs),
     /// Print the absolute path of a matching worktree.
@@ -149,6 +151,46 @@ impl NewArgs {
     pub(crate) fn submodule_override(&self) -> Option<bool> {
         submodule_override(self.init_submodules, self.no_init_submodules)
     }
+}
+
+/// Arguments for `wt issue`.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct IssueArgs {
+    /// GitHub issue number or URL; omit to open the issue picker.
+    pub(crate) target: Option<String>,
+    /// Override the AI-generated branch name.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) branch: Option<String>,
+    /// Base ref for a newly created branch (default: the repo's default branch).
+    #[arg(long, value_name = "REF")]
+    pub(crate) from: Option<String>,
+    /// Foreground coding-agent command (overrides `agent.command`).
+    #[arg(long = "agent-command", value_name = "COMMAND")]
+    pub(crate) agent_command: Option<String>,
+    /// Model for AI generation: `opus`, `sonnet`, or `haiku`.
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Effort for AI generation: `low`, `medium`, or `high`.
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) effort: Option<String>,
+    /// Prepare the worktree without launching the coding agent.
+    #[arg(long = "no-launch")]
+    pub(crate) no_launch: bool,
+    /// Do not switch into the issue worktree.
+    #[arg(long = "no-switch")]
+    pub(crate) no_switch: bool,
+    /// Skip the post-create hook.
+    #[arg(long = "no-hooks")]
+    pub(crate) no_hooks: bool,
+    /// Override the source worktree for the copy step.
+    #[arg(long = "copy-from", value_name = "QUERY")]
+    pub(crate) copy_from: Option<String>,
+    /// Initialize git submodules after creating the worktree.
+    #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
+    pub(crate) init_submodules: bool,
+    /// Do not initialize git submodules.
+    #[arg(long = "no-init-submodules")]
+    pub(crate) no_init_submodules: bool,
 }
 
 /// Arguments for `wt checkout`.
@@ -475,6 +517,7 @@ impl Cli {
             Some(Command::Drop(_)) => "drop",
             Some(Command::Prune(_)) => "prune",
             Some(Command::Pr(_)) => "pr",
+            Some(Command::Issue(_)) => "issue",
             Some(Command::Status(_)) => "status",
             Some(Command::Path(_)) => "path",
             Some(Command::Root) => "root",
@@ -577,6 +620,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::Prune(args)) => crate::commands::prune::run(cx, &args, json),
         Some(Command::Pr(args)) => {
             crate::commands::pr::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
+        Some(Command::Issue(args)) => {
+            crate::commands::issue::run(cx, &crate::hooks::RealHookRunner, &args)
         }
         Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
         Some(Command::Path(args)) => crate::commands::path::run(cx, &args),

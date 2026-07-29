@@ -71,6 +71,15 @@ pub fn pr_cell(worktree: &Worktree) -> String {
     }
 }
 
+/// The issue cell: `#N`, or empty when no issue is linked.
+pub fn issue_cell(worktree: &Worktree) -> String {
+    worktree
+        .issue
+        .as_ref()
+        .map(|issue| format!("#{}", issue.number))
+        .unwrap_or_default()
+}
+
 /// The path cell: relative to the repo root, or absolute if outside it.
 pub fn path_cell(worktree: &Worktree, repo_root: &Path) -> String {
     match worktree.path.strip_prefix(repo_root) {
@@ -103,6 +112,7 @@ pub fn cell(worktree: &Worktree, column: Column, ctx: &RenderCtx) -> String {
         Column::AheadBehind => ahead_behind_cell(worktree),
         Column::Commit => commit_cell(worktree, ctx.now),
         Column::Pr => pr_cell(worktree),
+        Column::Issue => issue_cell(worktree),
     }
 }
 
@@ -141,6 +151,13 @@ pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> Stri
             pr.title
         );
     }
+    if let Some(issue) = &worktree.issue {
+        let _ = writeln!(
+            out,
+            "issue:    #{} \"{}\" {}",
+            issue.number, issue.title, issue.url
+        );
+    }
     if !entries.is_empty() {
         let _ = writeln!(out, "dirty:");
         for entry in entries {
@@ -153,7 +170,7 @@ pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Commit, Pr, PrState};
+    use crate::model::{Commit, IssueLink, Pr, PrState};
     use std::path::PathBuf;
 
     fn base() -> Worktree {
@@ -260,6 +277,11 @@ mod tests {
             state: PrState::Open,
             title: "Add login page".into(),
         });
+        w.issue = Some(IssueLink {
+            number: 17,
+            title: "Open agent".into(),
+            url: "https://github.com/o/r/issues/17".into(),
+        });
         let entries = vec![
             StatusEntry {
                 marker: 'M',
@@ -276,6 +298,7 @@ mod tests {
         assert!(block.contains("base:     develop"));
         assert!(block.contains("ahead:    3  behind: 0"));
         assert!(block.contains("pr:       #42 (open) \"Add login page\""));
+        assert!(block.contains("issue:    #17 \"Open agent\""));
         assert!(block.contains("dirty:\n  M  src/main.rs\n  ?  scratch.txt"));
     }
 

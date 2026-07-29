@@ -63,6 +63,18 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
                 .map(|n| n.to_string())
                 .collect())
         }
+        "issue-numbers" => {
+            // Best-effort, matching PR completion: GitHub availability must
+            // never make shell completion fail.
+            let dir = repo.current_workdir().unwrap_or_else(|| cx.cwd.clone());
+            Ok(cx
+                .gh
+                .list_open_issues(&dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.number.to_string())
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -70,7 +82,9 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use crate::cli::CompleteArgs;
-    use crate::testutil::TestRepo;
+    use crate::gh::IssueSummary;
+    use crate::testutil::{FakeGh, TestRepo};
+    use std::sync::Arc;
 
     fn args(kind: &str, partial: Option<&str>) -> CompleteArgs {
         CompleteArgs {
@@ -148,5 +162,23 @@ mod tests {
         super::run(&mut t.cx, &args("pr-numbers", None)).unwrap();
         super::run(&mut t.cx, &args("bogus", None)).unwrap();
         assert!(t.out.contents().is_empty());
+    }
+
+    #[test]
+    fn completes_open_issue_numbers() {
+        let repo = TestRepo::init();
+        let mut test = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        test.cx.gh = Arc::new(FakeGh::default().with_issue_list(vec![IssueSummary {
+            number: 42,
+            title: "Open agent".into(),
+            state: "OPEN".into(),
+            labels: Vec::new(),
+            issue_type: None,
+            milestone: None,
+            created_at: String::new(),
+            url: String::new(),
+        }]));
+        super::run(&mut test.cx, &args("issue-numbers", Some("4"))).unwrap();
+        assert_eq!(test.out.contents().trim(), "42");
     }
 }
