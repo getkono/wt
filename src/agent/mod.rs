@@ -1,8 +1,8 @@
-//! The code-agent boundary (issue #11): detect installed agent CLIs and drive
-//! them in their JSON output mode. [`AgentClient`] isolates the subprocess work
-//! so callers can inject a fake; [`RealAgent`] spawns the real binaries. A
-//! missing binary yields [`Error::AgentUnavailable`]; a non-zero exit yields
-//! [`Error::Subprocess`].
+//! The code-agent boundary (issue #11): detect installed agent CLIs and generate
+//! text through the provider-neutral `agent-text` crate. [`AgentClient`] keeps
+//! the existing synchronous, injectable public contract; [`RealAgent`] bridges
+//! it to `agent_text` on an isolated runtime. A missing binary yields
+//! [`Error::AgentUnavailable`]; a non-zero exit yields [`Error::Subprocess`].
 //!
 //! Subprocess calls are synchronous (`std::process::Command`), matching the
 //! other CLI boundaries (`git`, `gh`, hooks).
@@ -13,6 +13,8 @@ pub mod types;
 
 use std::path::Path;
 use std::process::Command;
+
+use agent_text::{ClaudeCode, GenerationOptions, GenerationRequest, ReasoningEffort};
 
 use crate::error::{Error, Result};
 pub use model::{AgentModel, AgentOptions, Effort};
@@ -25,9 +27,12 @@ pub trait AgentClient {
     /// or `Err` if an installed binary fails to run.
     fn detect(&self, kind: AgentKind) -> Result<Option<DetectedAgent>>;
 
-    /// Runs `kind` non-interactively on `prompt` in `dir`, in the agent's JSON
-    /// output mode, with the selected model and effort (`opts`), and returns the
-    /// normalized result.
+    /// Generates text non-interactively from `prompt`, with the selected model
+    /// and effort (`opts`), and returns the normalized result.
+    ///
+    /// Production generation is intentionally isolated from `dir` by
+    /// `agent-text`; the argument remains part of this compatibility boundary
+    /// for injected clients and existing callers.
     fn run(
         &self,
         kind: AgentKind,
@@ -59,10 +64,10 @@ impl AgentClient for RealAgent {
         &self,
         kind: AgentKind,
         prompt: &str,
-        dir: &Path,
+        _dir: &Path,
         opts: &AgentOptions,
     ) -> Result<AgentRun> {
-        run_with(kind.spec().binary, kind, kind.spec(), prompt, dir, opts)
+        generate_with(&ClaudeCode::new(), kind, prompt, opts)
     }
 }
 
@@ -81,20 +86,78 @@ fn detect_with(binary: &str, kind: AgentKind, spec: &AgentSpec) -> Result<Option
     }
 }
 
-/// Runs `binary` on `prompt` in `dir` per `spec`, parsing the JSON result.
-/// Split from [`RealAgent::run`] for the same testability reason.
-fn run_with(
-    binary: &str,
+/// Bridges the synchronous [`AgentClient`] boundary to an async `agent-text`
+/// adapter. The scoped thread permits calls from both ordinary CLI code and a
+/// running Tokio TUI without nesting runtimes.
+fn generate_with(
+    agent: &(dyn agent_text::Agent + Sync),
     kind: AgentKind,
-    spec: &AgentSpec,
     prompt: &str,
-    dir: &Path,
     opts: &AgentOptions,
 ) -> Result<AgentRun> {
-    let prompt = spec::apply_effort(opts.effort, prompt);
-    let argv = spec::prompt_argv(spec, &prompt, opts.model);
-    let stdout = run_agent(binary, Some(dir), &argv)?;
-    spec::parse_result(kind, spec.result_format, &stdout)
+    let request = GenerationRequest::new(prompt).with_options(GenerationOptions {
+        model: Some(opts.model.id().to_string()),
+        reasoning_effort: Some(match opts.effort {
+            Effort::Low => ReasoningEffort::Low,
+            Effort::Medium => ReasoningEffort::Medium,
+            Effort::High => ReasoningEffort::High,
+        }),
+        timeout: None,
+    });
+    let generated = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(Error::from)?;
+                runtime
+                    .block_on(agent.generate(&request))
+                    .map_err(map_agent_text_error)
+            })
+            .join()
+    })
+    .map_err(|_| Error::operation("code-agent generation thread panicked"))??;
+
+    let usage = generated.usage.as_ref();
+    let raw = serde_json::json!({
+        "model": generated.model,
+        "elapsed_ms": generated.elapsed.as_millis(),
+        "usage": usage.map(|usage| serde_json::json!({
+            "input_tokens": usage.total_input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "cache_write_input_tokens": usage.cache_write_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cost_usd": usage.cost_usd,
+        })),
+    });
+    Ok(AgentRun {
+        kind,
+        is_error: false,
+        result: generated.text,
+        raw,
+    })
+}
+
+/// Maps provider-neutral generation failures onto wt's stable public errors.
+fn map_agent_text_error(error: agent_text::Error) -> Error {
+    match error {
+        agent_text::Error::Spawn { binary, source } => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                Error::AgentUnavailable(format!(
+                    "{} is not installed or not on PATH",
+                    binary.display()
+                ))
+            } else {
+                Error::AgentUnavailable(format!("failed to run {}: {source}", binary.display()))
+            }
+        }
+        agent_text::Error::Exit { stderr, .. } => Error::Subprocess {
+            program: "claude".to_string(),
+            stderr,
+        },
+        other => Error::operation(format!("code-agent generation failed: {other}")),
+    }
 }
 
 /// Runs an agent `binary` (optionally in `dir`), mapping a missing binary to
@@ -281,22 +344,6 @@ mod tests {
         fn detect_with_propagates_non_unavailable_errors() {
             let err = detect_with("sh", AgentKind::Claude, &SH_FAIL).unwrap_err();
             assert!(matches!(err, Error::Subprocess { .. }));
-        }
-
-        #[test]
-        fn run_with_invokes_and_parses_result() {
-            let dir = tempfile::tempdir().unwrap();
-            let run = run_with(
-                "sh",
-                AgentKind::Claude,
-                &SH_VERSION,
-                "my prompt",
-                dir.path(),
-                &AgentOptions::default(),
-            )
-            .unwrap();
-            assert!(!run.is_error);
-            assert_eq!(run.result, "ok");
         }
     }
 }

@@ -81,11 +81,9 @@ impl AgentModel {
     }
 }
 
-/// How much effort the agent should spend on a draft. Claude has no native
-/// headless effort flag, so `wt` conveys effort as a one-line directive
-/// prepended to the prompt (see [`Effort::directive`]) — a safe, never-failing
-/// lever that shapes the model's deliberation and can map to native reasoning
-/// controls per agent in the future.
+/// How much effort the agent should spend on a generation. The production
+/// adapter maps this onto `agent_text::ReasoningEffort`; the directive remains
+/// available for compatibility with custom clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
