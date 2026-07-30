@@ -781,21 +781,28 @@ pub(crate) fn do_draft_pr_ai(
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
     // Read the live model/effort from the form before borrowing it mutably.
-    let opts = match &app.mode {
-        Mode::PrCompose(state) => crate::agent::AgentOptions {
-            model: state.model.clone(),
-            effort: state.effort,
-        },
-        _ => crate::agent::AgentOptions::default(),
+    let (kind, opts) = match &app.mode {
+        Mode::PrCompose(state) => (
+            state.kind,
+            crate::agent::AgentOptions {
+                model: state.model.clone(),
+                effort: state.effort,
+            },
+        ),
+        _ => (
+            crate::agent::AgentKind::Claude,
+            crate::agent::AgentOptions::default(),
+        ),
     };
     // The TUI is suspended during the (blocking) agent call, so a progress line
     // on stderr is visible while the user waits.
     let _ = cx.err.line(&format!(
-        "Drafting PR with {} (effort {})…",
+        "Drafting PR with {} / {} (effort {})…",
+        kind.label(),
         opts.model.label(),
         opts.effort.id()
     ));
-    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), ctx, &dir, &opts);
+    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), kind, ctx, &dir, &opts);
     if let Mode::PrCompose(state) = &mut app.mode {
         match result {
             Ok((title, body)) => {

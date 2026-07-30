@@ -13,7 +13,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Wrap,
 };
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::AgentKind;
 use crate::keys::KeyAction;
 use crate::model::{MergeState, PrState, SortKey, SortSpec, Worktree};
 use crate::output::render::branch_display;
@@ -607,6 +607,22 @@ mod tests {
     }
 
     #[test]
+    fn pr_compose_agent_field_shows_provider_dropdown() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            field: ComposeField::Agent,
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("Claude"));
+        assert!(text.contains("Codex"));
+        assert!(text.contains("> agent:"));
+    }
+
+    #[test]
     fn pr_compose_effort_field_shows_options_dropdown() {
         let mut a = app(&[("main", true)]);
         a.mode = Mode::PrCompose(PrComposeState {
@@ -620,6 +636,22 @@ mod tests {
         assert!(text.contains("low"));
         assert!(text.contains("medium"));
         assert!(text.contains("high"));
+    }
+
+    #[test]
+    fn pr_compose_codex_effort_dropdown_omits_unsupported_max() {
+        let mut a = app(&[("main", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            kind: AgentKind::Codex,
+            field: ComposeField::Effort,
+            branch: "feat".into(),
+            trunk: "main".into(),
+            action_label: "create".into(),
+            ..Default::default()
+        });
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("xhigh"));
+        assert!(!text.contains("max"));
     }
 
     #[test]

@@ -11,17 +11,20 @@ use crate::agent::types::{AgentRun, AgentVersion, ClaudeResult};
 use crate::error::Result;
 
 /// A code-agent CLI that `wt` knows how to detect and drive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
     /// Anthropic's Claude Code (`claude`).
+    #[default]
     Claude,
+    /// OpenAI's Codex CLI (`codex`).
+    Codex,
 }
 
 impl AgentKind {
     /// Every known agent kind, in display order.
     pub fn all() -> &'static [AgentKind] {
-        &[AgentKind::Claude]
+        &[AgentKind::Claude, AgentKind::Codex]
     }
 
     /// The static [`AgentSpec`] for this kind. An exhaustive `match` (rather
@@ -29,6 +32,7 @@ impl AgentKind {
     pub fn spec(self) -> &'static AgentSpec {
         match self {
             AgentKind::Claude => &AGENTS[0],
+            AgentKind::Codex => &AGENTS[1],
         }
     }
 
@@ -39,7 +43,106 @@ impl AgentKind {
 
     /// Parses a lowercase kind identifier, returning `None` if unknown.
     pub fn parse(s: &str) -> Option<AgentKind> {
-        AgentKind::all().iter().copied().find(|k| k.as_str() == s)
+        let value = s.trim().to_ascii_lowercase();
+        AgentKind::all()
+            .iter()
+            .copied()
+            .find(|kind| kind.as_str() == value)
+    }
+
+    /// Human-readable provider name.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentKind::Claude => "Claude",
+            AgentKind::Codex => "Codex",
+        }
+    }
+
+    /// The next provider in display order, wrapping at the end.
+    pub fn next(self) -> AgentKind {
+        match self {
+            AgentKind::Claude => AgentKind::Codex,
+            AgentKind::Codex => AgentKind::Claude,
+        }
+    }
+
+    /// The previous provider in display order, wrapping at the start.
+    pub fn prev(self) -> AgentKind {
+        self.next()
+    }
+
+    /// The model used when no explicit model is configured for this provider.
+    pub fn default_model(self) -> AgentModel {
+        match self {
+            AgentKind::Claude => AgentModel::Haiku,
+            AgentKind::Codex => AgentModel::Default,
+        }
+    }
+
+    /// Curated models shown by the TUI for this provider.
+    pub fn models(self) -> &'static [AgentModel] {
+        const CLAUDE: &[AgentModel] = &[AgentModel::Opus, AgentModel::Sonnet, AgentModel::Haiku];
+        const CODEX: &[AgentModel] = &[AgentModel::Default];
+        match self {
+            AgentKind::Claude => CLAUDE,
+            AgentKind::Codex => CODEX,
+        }
+    }
+
+    /// Cycles to the next curated model for this provider.
+    pub fn next_model(self, current: &AgentModel) -> AgentModel {
+        let models = self.models();
+        let index = models
+            .iter()
+            .position(|model| model == current)
+            .unwrap_or(models.len().saturating_sub(1));
+        models[(index + 1) % models.len()].clone()
+    }
+
+    /// Cycles to the previous curated model for this provider.
+    pub fn prev_model(self, current: &AgentModel) -> AgentModel {
+        let models = self.models();
+        let index = models
+            .iter()
+            .position(|model| model == current)
+            .unwrap_or(0);
+        models[(index + models.len() - 1) % models.len()].clone()
+    }
+
+    /// Effort levels supported by this provider.
+    pub fn efforts(self) -> &'static [Effort] {
+        const CLAUDE: &[Effort] = &[
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::XHigh,
+            Effort::Max,
+        ];
+        const CODEX: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh];
+        match self {
+            AgentKind::Claude => CLAUDE,
+            AgentKind::Codex => CODEX,
+        }
+    }
+
+    /// Cycles to the next supported effort for this provider.
+    pub fn next_effort(self, current: Effort) -> Effort {
+        let efforts = self.efforts();
+        let index = efforts
+            .iter()
+            .position(|effort| *effort == current)
+            .unwrap_or(efforts.len().saturating_sub(1));
+        efforts[(index + 1) % efforts.len()]
+    }
+
+    /// Cycles to the previous supported effort for this provider.
+    pub fn prev_effort(self, current: Effort) -> Effort {
+        let efforts = self.efforts();
+        let index = efforts
+            .iter()
+            .position(|effort| *effort == current)
+            .unwrap_or(0);
+        efforts[(index + efforts.len() - 1) % efforts.len()]
     }
 }
 
@@ -75,16 +178,28 @@ pub struct AgentSpec {
 }
 
 /// The known agents. Add a new agent by appending one literal here.
-pub static AGENTS: &[AgentSpec] = &[AgentSpec {
-    kind: AgentKind::Claude,
-    binary: "claude",
-    version_args: &["--version"],
-    run_args: &["-p"],
-    prompt_positional: true,
-    json_args: &["--output-format", "json"],
-    model_flag: "--model",
-    result_format: ResultFormat::SingleObject,
-}];
+pub static AGENTS: &[AgentSpec] = &[
+    AgentSpec {
+        kind: AgentKind::Claude,
+        binary: "claude",
+        version_args: &["--version"],
+        run_args: &["-p"],
+        prompt_positional: true,
+        json_args: &["--output-format", "json"],
+        model_flag: "--model",
+        result_format: ResultFormat::SingleObject,
+    },
+    AgentSpec {
+        kind: AgentKind::Codex,
+        binary: "codex",
+        version_args: &["--version"],
+        run_args: &["exec"],
+        prompt_positional: true,
+        json_args: &["--json"],
+        model_flag: "--model",
+        result_format: ResultFormat::SingleObject,
+    },
+];
 
 /// Builds the version-probe argv for `spec`.
 pub fn version_argv(spec: &AgentSpec) -> Vec<String> {
@@ -102,7 +217,7 @@ pub fn prompt_argv(spec: &AgentSpec, prompt: &str, model: AgentModel) -> Vec<Str
         argv.push(prompt.to_string());
     }
     argv.extend(spec.json_args.iter().map(|s| s.to_string()));
-    if !spec.model_flag.is_empty() {
+    if !spec.model_flag.is_empty() && model != AgentModel::Default {
         argv.push(spec.model_flag.to_string());
         argv.push(model.id().to_string());
     }
@@ -187,6 +302,17 @@ mod tests {
             assert_eq!(AgentKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(AgentKind::parse("nope"), None);
+        assert_eq!(AgentKind::parse(" CODEX "), Some(AgentKind::Codex));
+        assert_eq!(AgentKind::Claude.next(), AgentKind::Codex);
+        assert_eq!(AgentKind::Codex.next(), AgentKind::Claude);
+    }
+
+    #[test]
+    fn provider_efforts_cycle_only_supported_values() {
+        assert!(AgentKind::Claude.efforts().contains(&Effort::Max));
+        assert!(!AgentKind::Codex.efforts().contains(&Effort::Max));
+        assert_eq!(AgentKind::Codex.next_effort(Effort::XHigh), Effort::Low);
+        assert_eq!(AgentKind::Codex.prev_effort(Effort::Low), Effort::XHigh);
     }
 
     #[test]
@@ -194,6 +320,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AgentKind::Claude).unwrap(),
             "\"claude\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentKind::Codex).unwrap(),
+            "\"codex\""
         );
     }
 
@@ -229,6 +359,9 @@ mod tests {
         // The selected model is passed verbatim via `--model`.
         assert_eq!(tricky[tricky.len() - 2], "--model");
         assert_eq!(tricky[tricky.len() - 1], "opus");
+
+        let codex = prompt_argv(AgentKind::Codex.spec(), "do a thing", AgentModel::Default);
+        assert_eq!(codex, vec!["exec", "do a thing", "--json"]);
     }
 
     #[test]

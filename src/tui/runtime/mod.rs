@@ -346,10 +346,13 @@ fn dispatch_effect(
                 target: Some(number.to_string()),
                 branch: None,
                 from: None,
+                agent: None,
                 agent_command: None,
                 model: None,
                 effort: None,
                 no_launch: false,
+                dangerous: false,
+                plan: false,
                 no_switch: true,
                 no_hooks: false,
                 copy_from: None,
@@ -904,6 +907,8 @@ pub struct ComposeSeed {
     pub body: String,
     /// Whether the draft toggle starts on.
     pub draft: bool,
+    /// The provider used for AI auto-fill.
+    pub kind: crate::agent::AgentKind,
     /// The model used for AI auto-fill (resolved from `--model`/config).
     pub model: crate::agent::AgentModel,
     /// The effort used for AI auto-fill (resolved from `--effort`/config).
@@ -937,6 +942,7 @@ pub(crate) fn run_pr_compose(
         branch: ctx.branch.clone(),
         trunk: ctx.trunk.clone(),
         action_label,
+        kind: seed.kind,
         model: seed.model,
         effort: seed.effort,
         ..Default::default()

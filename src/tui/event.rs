@@ -9,6 +9,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
+use crate::agent::Effort;
 use crate::keys::{KeyAction, KeyChord};
 use crate::tui::app::{
     App, ComposeField, CreateState, CreateStep, ExitIntent, MIN_HEIGHT, Mode, Pane,
@@ -179,11 +180,12 @@ fn longest_common_prefix(items: &[&str]) -> Option<String> {
     Some(prefix.to_string())
 }
 
-/// The next PR-compose field in Tab order (title → body → model → effort → wrap).
+/// The next PR-compose field in Tab order.
 fn compose_next_field(field: ComposeField) -> ComposeField {
     match field {
         ComposeField::Title => ComposeField::Body,
-        ComposeField::Body => ComposeField::Model,
+        ComposeField::Body => ComposeField::Agent,
+        ComposeField::Agent => ComposeField::Model,
         ComposeField::Model => ComposeField::Effort,
         ComposeField::Effort => ComposeField::Title,
     }
@@ -195,7 +197,8 @@ fn compose_prev_field(field: ComposeField) -> ComposeField {
     match field {
         ComposeField::Title => ComposeField::Effort,
         ComposeField::Effort => ComposeField::Model,
-        ComposeField::Model => ComposeField::Body,
+        ComposeField::Model => ComposeField::Agent,
+        ComposeField::Agent => ComposeField::Body,
         ComposeField::Body => ComposeField::Title,
     }
 }
@@ -544,16 +547,23 @@ impl App {
                 state.error = None;
                 return Effect::DraftPrAi;
             }
-            // Ctrl-M / Ctrl-E: quick-cycle the model / effort used for the next fill.
-            KeyCode::Char('m') if ctrl => state.model = state.model.next(),
-            KeyCode::Char('e') if ctrl => state.effort = state.effort.next(),
+            // Ctrl-P / Ctrl-M / Ctrl-E: cycle provider, model, and effort.
+            KeyCode::Char('p') if ctrl => {
+                state.kind = state.kind.next();
+                state.model = state.kind.default_model();
+                if !state.kind.efforts().contains(&state.effort) {
+                    state.effort = Effort::Low;
+                }
+            }
+            KeyCode::Char('m') if ctrl => state.model = state.kind.next_model(&state.model),
+            KeyCode::Char('e') if ctrl => state.effort = state.kind.next_effort(state.effort),
             KeyCode::Char('d') if ctrl => state.draft = !state.draft,
             // Plain character input edits the text fields; option fields ignore it.
             KeyCode::Char(c) if !ctrl => {
                 match state.field {
                     ComposeField::Title => state.title.push(c),
                     ComposeField::Body => state.body.push(c),
-                    ComposeField::Model | ComposeField::Effort => {}
+                    ComposeField::Agent | ComposeField::Model | ComposeField::Effort => {}
                 }
                 state.error = None;
             }
@@ -561,19 +571,33 @@ impl App {
                 match state.field {
                     ComposeField::Title => state.title.pop(),
                     ComposeField::Body => state.body.pop(),
-                    ComposeField::Model | ComposeField::Effort => None,
+                    ComposeField::Agent | ComposeField::Model | ComposeField::Effort => None,
                 };
                 state.error = None;
             }
             // On an option field the arrows move the selection like the picker.
             KeyCode::Up => match state.field {
-                ComposeField::Model => state.model = state.model.prev(),
-                ComposeField::Effort => state.effort = state.effort.prev(),
+                ComposeField::Agent => {
+                    state.kind = state.kind.prev();
+                    state.model = state.kind.default_model();
+                    if !state.kind.efforts().contains(&state.effort) {
+                        state.effort = Effort::Low;
+                    }
+                }
+                ComposeField::Model => state.model = state.kind.prev_model(&state.model),
+                ComposeField::Effort => state.effort = state.kind.prev_effort(state.effort),
                 _ => {}
             },
             KeyCode::Down => match state.field {
-                ComposeField::Model => state.model = state.model.next(),
-                ComposeField::Effort => state.effort = state.effort.next(),
+                ComposeField::Agent => {
+                    state.kind = state.kind.next();
+                    state.model = state.kind.default_model();
+                    if !state.kind.efforts().contains(&state.effort) {
+                        state.effort = Effort::Low;
+                    }
+                }
+                ComposeField::Model => state.model = state.kind.next_model(&state.model),
+                ComposeField::Effort => state.effort = state.kind.next_effort(state.effort),
                 _ => {}
             },
             KeyCode::Tab => state.field = compose_next_field(state.field),
@@ -582,6 +606,7 @@ impl App {
                 ComposeField::Title => state.field = ComposeField::Body,
                 ComposeField::Body => state.body.push('\n'),
                 // On the option fields, Enter confirms and moves on.
+                ComposeField::Agent => state.field = ComposeField::Model,
                 ComposeField::Model => state.field = ComposeField::Effort,
                 ComposeField::Effort => state.field = ComposeField::Title,
             },
@@ -1663,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_tab_cycles_all_four_fields() {
+    fn compose_tab_cycles_all_five_fields() {
         use crate::tui::app::PrComposeState;
         let mut a = app(&[("a", true)]);
         a.mode = Mode::PrCompose(PrComposeState::default());
@@ -1678,6 +1703,8 @@ mod tests {
         a.handle_event(press(KeyCode::Tab));
         assert_eq!(field(&a), ComposeField::Body);
         a.handle_event(press(KeyCode::Tab));
+        assert_eq!(field(&a), ComposeField::Agent);
+        a.handle_event(press(KeyCode::Tab));
         assert_eq!(field(&a), ComposeField::Model);
         a.handle_event(press(KeyCode::Tab));
         assert_eq!(field(&a), ComposeField::Effort);
@@ -1691,7 +1718,8 @@ mod tests {
         use crate::tui::app::PrComposeState;
         let mut a = app(&[("a", true)]);
         a.mode = Mode::PrCompose(PrComposeState::default());
-        // Tab to the model field (title → body → model).
+        // Tab to the model field (title → body → agent → model).
+        a.handle_event(press(KeyCode::Tab));
         a.handle_event(press(KeyCode::Tab));
         a.handle_event(press(KeyCode::Tab));
         // Down advances like next(); Up reverses like prev() (default: Haiku).
@@ -1798,6 +1826,28 @@ mod tests {
             assert_eq!(s.title, "");
         } else {
             panic!("expected compose mode");
+        }
+    }
+
+    #[test]
+    fn compose_ctrl_p_cycles_provider_and_resets_model() {
+        use crate::agent::{AgentKind, AgentModel, Effort};
+        use crate::tui::app::PrComposeState;
+        let mut a = app(&[("a", true)]);
+        a.mode = Mode::PrCompose(PrComposeState {
+            effort: Effort::Max,
+            ..PrComposeState::default()
+        });
+        a.handle_event(ctrl('p'));
+        if let Mode::PrCompose(state) = &a.mode {
+            assert_eq!(state.kind, AgentKind::Codex);
+            assert_eq!(state.model, AgentModel::Default);
+            assert_eq!(state.effort, Effort::Low);
+        }
+        a.handle_event(ctrl('p'));
+        if let Mode::PrCompose(state) = &a.mode {
+            assert_eq!(state.kind, AgentKind::Claude);
+            assert_eq!(state.model, AgentModel::Haiku);
         }
     }
 

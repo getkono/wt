@@ -11,6 +11,16 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+### Added
+
+- *(agent)* support Codex generation through agent-text 0.1.1
+- *(issue)* add provider, planning, and dangerous launch controls
+- *(pr)* add Claude/Codex provider selection for AI drafting
+
+### Changed
+
+- *(agent)* make model selection provider-aware and preserve custom launch commands
+
 ## [1.5.0](https://github.com/getkono/wt/compare/v1.4.0...v1.5.0) - 2026-07-10
 
 ### Added

@@ -198,6 +198,7 @@ pub(crate) enum AgentBehavior {
 /// last `run` so tests can assert the selected model/effort were threaded.
 pub(crate) struct FakeAgent {
     behavior: AgentBehavior,
+    last_kind: Mutex<Option<AgentKind>>,
     last_opts: Mutex<Option<AgentOptions>>,
     last_prompt: Mutex<Option<String>>,
 }
@@ -207,6 +208,7 @@ impl FakeAgent {
     fn new(behavior: AgentBehavior) -> Self {
         FakeAgent {
             behavior,
+            last_kind: Mutex::new(None),
             last_opts: Mutex::new(None),
             last_prompt: Mutex::new(None),
         }
@@ -230,6 +232,11 @@ impl FakeAgent {
     /// The [`AgentOptions`] passed to the most recent `run`, if any.
     pub(crate) fn last_opts(&self) -> Option<AgentOptions> {
         self.last_opts.lock().expect("lock").clone()
+    }
+
+    /// The provider passed to the most recent `run`, if any.
+    pub(crate) fn last_kind(&self) -> Option<AgentKind> {
+        *self.last_kind.lock().expect("lock")
     }
 
     /// The prompt passed to the most recent `run`, if any.
@@ -260,6 +267,7 @@ impl AgentClient for FakeAgent {
         _dir: &Path,
         opts: &AgentOptions,
     ) -> crate::error::Result<AgentRun> {
+        *self.last_kind.lock().expect("lock") = Some(kind);
         *self.last_opts.lock().expect("lock") = Some(opts.clone());
         *self.last_prompt.lock().expect("lock") = Some(prompt.to_string());
         match &self.behavior {

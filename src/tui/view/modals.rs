@@ -78,23 +78,40 @@ fn option_lines(theme: &Theme, options: &OptionList) -> Vec<Line<'static>> {
     lines
 }
 
-/// The model/effort options dropdown for the active PR-compose field, seeded to
+/// The provider/model/effort dropdown for the active PR-compose field, seeded to
 /// the current selection; `None` for the free-text title/body fields.
 fn compose_dropdown(state: &PrComposeState) -> Option<OptionList> {
     let (labels, index) = match state.field {
+        ComposeField::Agent => (
+            AgentKind::all()
+                .iter()
+                .map(|kind| kind.label().to_string())
+                .collect(),
+            AgentKind::all()
+                .iter()
+                .position(|kind| *kind == state.kind)?,
+        ),
         ComposeField::Model => (
-            AgentModel::all()
+            state
+                .kind
+                .models()
                 .iter()
                 .map(|m| m.label().to_string())
                 .collect(),
-            AgentModel::all().iter().position(|m| *m == state.model)?,
+            state.kind.models().iter().position(|m| *m == state.model)?,
         ),
         ComposeField::Effort => (
-            Effort::all()
+            state
+                .kind
+                .efforts()
                 .iter()
                 .map(|e| e.label().to_string())
                 .collect(),
-            Effort::all().iter().position(|e| *e == state.effort)?,
+            state
+                .kind
+                .efforts()
+                .iter()
+                .position(|e| *e == state.effort)?,
         ),
         ComposeField::Title | ComposeField::Body => return None,
     };
@@ -205,6 +222,7 @@ pub(super) fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut F
 
     let title_active = state.field == ComposeField::Title;
     let body_active = state.field == ComposeField::Body;
+    let agent_active = state.field == ComposeField::Agent;
     let model_active = state.field == ComposeField::Model;
     let effort_active = state.field == ComposeField::Effort;
     let draft_mark = if state.draft { "[x]" } else { "[ ]" };
@@ -231,8 +249,18 @@ pub(super) fn render_pr_compose(app: &App, state: &PrComposeState, frame: &mut F
             Span::raw("   "),
             Span::styled(format!("draft {draft_mark}"), theme.label()),
         ]),
-        // Agent settings used for `Ctrl-A` auto-fill (model + effort).
+        // Agent settings used for `Ctrl-A` auto-fill.
         Line::from(vec![
+            opt_label(
+                agent_active,
+                if agent_active {
+                    "> agent: "
+                } else {
+                    "  agent: "
+                },
+            ),
+            Span::styled(state.kind.label(), theme.accent()),
+            Span::raw("   "),
             opt_label(
                 model_active,
                 if model_active {

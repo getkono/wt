@@ -52,7 +52,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
     // The model/effort for AI fill: CLI flags override the config defaults. The
     // compose form always carries these (Ctrl-A can draft at any time), so they
     // are resolved even when `--ai` was not passed.
-    let opts = resolve_agent_options(args, &session.config)?;
+    let (kind, opts) = resolve_agent_options(args, &session.config)?;
 
     // Gate on the stderr TTY (where the TUI draws), matching the rest of `wt`.
     let yes = cx.assume_yes;
@@ -62,6 +62,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
             title: args.title.clone().unwrap_or_default(),
             body: flag_body.unwrap_or_default(),
             draft: args.draft,
+            kind,
             model: opts.model,
             effort: opts.effort,
         };
@@ -73,7 +74,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
         }
     } else {
         let (title, body) = if args.ai {
-            draft_with_ai(cx.agent.as_ref(), &ctx, &dir, &opts)?
+            draft_with_ai(cx.agent.as_ref(), kind, &ctx, &dir, &opts)?
         } else {
             (
                 args.title.clone().unwrap_or_default(),
@@ -310,14 +311,21 @@ pub(crate) fn build_ai_prompt(ctx: &sendit::PrContext) -> String {
 /// Resolves the agent model + effort for an AI draft: an explicit `--model` /
 /// `--effort` flag overrides the resolved config default. Unknown flag values
 /// are a usage error (exit 2).
-pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Result<AgentOptions> {
+pub(crate) fn resolve_agent_options(
+    args: &PrOpenArgs,
+    config: &Config,
+) -> Result<(AgentKind, AgentOptions)> {
+    let kind = match &args.agent {
+        Some(value) => AgentKind::parse(value)
+            .ok_or_else(|| Error::usage("unknown --agent; expected one of: claude, codex"))?,
+        None => config.agent_kind,
+    };
     let model = match &args.model {
-        Some(m) => AgentModel::parse(m).ok_or_else(|| {
-            Error::usage(format!(
-                "unknown --model {m:?}; expected one of: opus, sonnet, haiku"
-            ))
-        })?,
-        None => config.agent_model.clone(),
+        Some(model) => AgentModel::parse(model)
+            .or_else(|| AgentModel::custom(model))
+            .ok_or_else(|| Error::usage("--model must not be empty"))?,
+        None if args.agent.is_some() => kind.default_model(),
+        None => config.effective_agent_model(),
     };
     let effort = match &args.effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
@@ -327,7 +335,8 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
         })?,
         None => config.agent_effort,
     };
-    Ok(AgentOptions { model, effort })
+    crate::commands::issue::validate_provider_options(kind, &model, effort)?;
+    Ok((kind, AgentOptions { model, effort }))
 }
 
 /// Runs the code agent (`claude`) to draft a PR `(title, body)` from `ctx` with
@@ -336,11 +345,12 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
 /// typed error; a missing agent propagates [`Error::AgentUnavailable`].
 pub(crate) fn draft_with_ai(
     agent: &dyn AgentClient,
+    kind: AgentKind,
     ctx: &sendit::PrContext,
     dir: &Path,
     opts: &AgentOptions,
 ) -> Result<(String, String)> {
-    let run = agent.run(AgentKind::Claude, &build_ai_prompt(ctx), dir, opts)?;
+    let run = agent.run(kind, &build_ai_prompt(ctx), dir, opts)?;
     if run.is_error {
         return Err(Error::operation(format!(
             "code agent reported an error: {}",
@@ -694,6 +704,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (title, body) = draft_with_ai(
             &agent,
+            AgentKind::Claude,
             &ctx_for("feat", "main", false),
             dir.path(),
             &AgentOptions::default(),
@@ -711,8 +722,16 @@ mod tests {
             model: AgentModel::Opus,
             effort: Effort::High,
         };
-        draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path(), &opts).unwrap();
+        draft_with_ai(
+            &agent,
+            AgentKind::Claude,
+            &ctx_for("feat", "main", false),
+            dir.path(),
+            &opts,
+        )
+        .unwrap();
         assert_eq!(agent.last_opts(), Some(opts));
+        assert_eq!(agent.last_kind(), Some(AgentKind::Claude));
     }
 
     #[test]
@@ -721,6 +740,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = draft_with_ai(
             &agent,
+            AgentKind::Claude,
             &ctx_for("feat", "main", false),
             dir.path(),
             &AgentOptions::default(),
@@ -735,6 +755,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = draft_with_ai(
             &agent,
+            AgentKind::Claude,
             &ctx_for("feat", "main", false),
             dir.path(),
             &AgentOptions::default(),
@@ -751,26 +772,45 @@ mod tests {
             ..Config::default()
         };
         // No flags: config defaults win.
-        let opts = resolve_agent_options(&open_args(None), &config).unwrap();
+        let (_, opts) = resolve_agent_options(&open_args(None), &config).unwrap();
         assert_eq!(opts.model, AgentModel::Haiku);
         assert_eq!(opts.effort, Effort::Low);
         // Flags override.
         let mut args = open_args(None);
         args.model = Some("opus".into());
         args.effort = Some("high".into());
-        let opts = resolve_agent_options(&args, &config).unwrap();
+        let (_, opts) = resolve_agent_options(&args, &config).unwrap();
         assert_eq!(opts.model, AgentModel::Opus);
         assert_eq!(opts.effort, Effort::High);
     }
 
     #[test]
-    fn resolve_agent_options_rejects_unknown_values() {
+    fn codex_flag_selects_provider_default_model() {
+        let mut args = open_args(None);
+        args.agent = Some("codex".into());
+        let (kind, options) = resolve_agent_options(&args, &Config::default()).unwrap();
+        assert_eq!(kind, AgentKind::Codex);
+        assert_eq!(options.model, AgentModel::Default);
+
+        let agent = FakeAgent::drafting("T\n\nB");
+        let dir = tempfile::tempdir().unwrap();
+        draft_with_ai(
+            &agent,
+            kind,
+            &ctx_for("feat", "main", false),
+            dir.path(),
+            &options,
+        )
+        .unwrap();
+        assert_eq!(agent.last_kind(), Some(AgentKind::Codex));
+    }
+
+    #[test]
+    fn resolve_agent_options_accepts_custom_models_and_rejects_unknown_effort() {
         let mut args = open_args(None);
         args.model = Some("gpt".into());
-        assert!(matches!(
-            resolve_agent_options(&args, &Config::default()),
-            Err(Error::Usage(_))
-        ));
+        let (_, options) = resolve_agent_options(&args, &Config::default()).unwrap();
+        assert_eq!(options.model, AgentModel::Custom("gpt".into()));
         let mut args = open_args(None);
         args.effort = Some("extreme".into());
         assert!(matches!(
@@ -786,6 +826,7 @@ mod tests {
             body_file: None,
             draft: false,
             ai: false,
+            agent: None,
             model: None,
             effort: None,
             base: None,

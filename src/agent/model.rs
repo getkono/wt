@@ -1,4 +1,4 @@
-//! Model and effort selection for code-agent runs (the AI PR auto-fill path).
+//! Model and effort selection for code-agent generation.
 //!
 //! [`AgentModel`] provides curated tiers plus a provider-specific custom
 //! identifier; [`Effort`] is how hard the agent should work; [`AgentOptions`]
@@ -12,6 +12,8 @@ use serde::{Serialize, Serializer};
 /// models without waiting for another `wt` release.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AgentModel {
+    /// Let the selected agent CLI choose its configured default model.
+    Default,
     /// Most capable, highest latency (Claude Opus).
     Opus,
     /// Balanced capability and speed (Claude Sonnet).
@@ -33,6 +35,7 @@ impl AgentModel {
     /// agent CLI's `--model` value (e.g. `"sonnet"`).
     pub fn id(&self) -> &str {
         match self {
+            AgentModel::Default => "",
             AgentModel::Opus => "opus",
             AgentModel::Sonnet => "sonnet",
             AgentModel::Haiku => "haiku",
@@ -44,6 +47,7 @@ impl AgentModel {
     /// family (the `id` alias always selects the latest of that tier).
     pub fn label(&self) -> &str {
         match self {
+            AgentModel::Default => "Default",
             AgentModel::Opus => "Opus 4.8",
             AgentModel::Sonnet => "Sonnet 4.6",
             AgentModel::Haiku => "Haiku 4.5",
@@ -55,6 +59,7 @@ impl AgentModel {
     /// returning `None` if unknown.
     pub fn parse(s: &str) -> Option<AgentModel> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "default" => Some(AgentModel::Default),
             "opus" => Some(AgentModel::Opus),
             "sonnet" => Some(AgentModel::Sonnet),
             "haiku" => Some(AgentModel::Haiku),
@@ -68,19 +73,20 @@ impl AgentModel {
         (!id.is_empty()).then(|| AgentModel::Custom(id.to_string()))
     }
 
-    /// The next model in cycle order (wraps), for the TUI's `Ctrl-M` picker.
+    /// The next Claude model in cycle order (wraps).
     pub fn next(&self) -> AgentModel {
         match self {
+            AgentModel::Default => AgentModel::Opus,
             AgentModel::Opus => AgentModel::Sonnet,
             AgentModel::Sonnet => AgentModel::Haiku,
             AgentModel::Haiku | AgentModel::Custom(_) => AgentModel::Opus,
         }
     }
 
-    /// The previous model in cycle order (wraps), for navigating the TUI's
-    /// model dropdown upward (`↑`).
+    /// The previous Claude model in cycle order (wraps).
     pub fn prev(&self) -> AgentModel {
         match self {
+            AgentModel::Default => AgentModel::Haiku,
             AgentModel::Opus => AgentModel::Haiku,
             AgentModel::Sonnet => AgentModel::Opus,
             AgentModel::Haiku | AgentModel::Custom(_) => AgentModel::Sonnet,
@@ -90,7 +96,11 @@ impl AgentModel {
 
 impl Serialize for AgentModel {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.id())
+        serializer.serialize_str(if *self == AgentModel::Default {
+            "default"
+        } else {
+            self.id()
+        })
     }
 }
 

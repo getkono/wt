@@ -6,7 +6,7 @@
 use ratatui::style::Color;
 use toml::Value;
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::{AgentKind, AgentModel, Effort};
 use crate::config::schema::{ConfigLayer, SubmoduleInit};
 use crate::error::{Error, Result};
 use crate::keys::{KeyAction, KeyChord};
@@ -145,6 +145,12 @@ fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
     for (sub, val) in as_table(file, "agent", value)? {
         let key = format!("agent.{sub}");
         match sub.as_str() {
+            "provider" => {
+                let text = as_string(file, &key, val)?;
+                let kind = AgentKind::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: claude, codex"))?;
+                layer.agent_kind = Some(kind);
+            }
             "command" => {
                 let text = as_string(file, &key, val)?;
                 let parsed = shell_words::split(&text)
@@ -157,7 +163,8 @@ fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
             "model" => {
                 let text = as_string(file, &key, val)?;
                 let model = AgentModel::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: opus, sonnet, haiku"))?;
+                    .or_else(|| AgentModel::custom(&text))
+                    .ok_or_else(|| cfg_err(file, &key, "model must not be empty"))?;
                 layer.agent_model = Some(model);
             }
             "effort" => {
@@ -315,6 +322,7 @@ mod tests {
             init = "always"
 
             [agent]
+            provider = "codex"
             command = "claude --permission-mode plan"
             model = "opus"
             effort = "high"
@@ -346,6 +354,7 @@ mod tests {
         assert_eq!(layer.remove_untracked_blocks, Some(true));
         assert_eq!(layer.pr_default_remote.as_deref(), Some("upstream"));
         assert_eq!(layer.submodules_init, Some(SubmoduleInit::Always));
+        assert_eq!(layer.agent_kind, Some(AgentKind::Codex));
         assert_eq!(layer.agent_model, Some(AgentModel::Opus));
         assert_eq!(layer.agent_effort, Some(Effort::High));
         assert_eq!(
@@ -411,10 +420,11 @@ mod tests {
     }
 
     #[test]
-    fn invalid_agent_model_and_effort_rejected() {
-        let (key, reason) = config_reason(parse("[agent]\nmodel = \"gpt\"").unwrap_err());
-        assert_eq!(key, "agent.model");
-        assert!(reason.contains("opus, sonnet, haiku"));
+    fn custom_agent_model_is_accepted_and_invalid_effort_rejected() {
+        assert_eq!(
+            parse("[agent]\nmodel = \"gpt\"").unwrap().agent_model,
+            Some(AgentModel::Custom("gpt".into()))
+        );
         let (key, reason) = config_reason(parse("[agent]\neffort = \"extreme\"").unwrap_err());
         assert_eq!(key, "agent.effort");
         assert!(reason.contains("low, medium, high, xhigh, max"));

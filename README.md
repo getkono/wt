@@ -104,11 +104,26 @@ These are the things worth knowing up front; the rest is discoverable from
   labels, type, and milestone, then uses the configured text agent to propose a
   conventional `type/123-slug` branch and concise implementation brief. You can
   edit every setup value and must explicitly approve before `wt` creates or
-  reuses the linked worktree, records the issue metadata, and launches `claude`
-  there. Interactive setup presents model and effort choices plus a custom-entry
-  escape hatch, and lists local and remote-tracking branches for the base. Use
-  `--no-launch` to prepare only, `--agent-command` (or `agent.command`) to choose
-  another foreground tool, and global `-y` to accept defaults non-interactively.
+  reuses the linked worktree, records the issue metadata, and launches Claude
+  Code or Codex there. `--agent claude|codex` switches both setup generation and
+  the foreground coding session; `--model` accepts a provider-specific model
+  identifier. Interactive setup presents provider, model, effort, planning, and
+  dangerous-mode choices, plus local and remote-tracking branches for the base.
+  For example:
+
+  ```bash
+  wt issue 123 --agent codex --plan
+  wt issue 123 --agent codex --model gpt-5 --dangerous
+  wt issue 123 --agent claude --model opus --plan
+  ```
+
+  `--dangerous` maps to each provider's full permission-bypass mode; use it only
+  in an externally isolated environment. `--plan` starts Claude in its plan
+  permission mode and starts Codex with an inline `/plan` request. Use
+  `--no-launch` to prepare only, `--agent-command` (or `agent.command`) for an
+  arbitrary foreground tool, and global `-y` to accept defaults
+  non-interactively. The custom-command escape hatch keeps generation settings
+  but does not receive structured plan/danger flags.
   In the dashboard, press `i` to pick an open issue; the dashboard returns and
   focuses its worktree when the agent exits.
 - **See every branch, not just worktrees.** The TUI lists your worktrees first,
@@ -120,7 +135,12 @@ These are the things worth knowing up front; the rest is discoverable from
   inline dropdown instead of blind typing. The new-worktree branch/base fields
   suggest existing local **and** remote branches to fork from or check out — type
   to filter, `↑/↓` to pick, `Enter` to accept, or just type a brand-new name. The
-  PR compose form's model and effort fields list their choices the same way.
+  PR compose form's provider, model, and effort fields list their choices the
+  same way. `Ctrl-P`, `Ctrl-M`, and `Ctrl-E` cycle them quickly.
+- **Draft PRs with Claude or Codex.** `wt pr open --ai --agent codex` uses Codex
+  for title/body generation; omit `--agent` to use `agent.provider`. Both CLI
+  providers run through isolated `agent-text` generation, while the TUI exposes
+  the same provider picker.
 - **Where worktrees are created.** New worktrees follow a configurable path
   template. The default keeps them beside the repo, out of it, and prefixes each
   worktree directory with the repo name so it's obvious which repo you're in:
@@ -159,7 +179,15 @@ These are the things worth knowing up front; the rest is discoverable from
   a global user config, managed with `wt config get|set|list|edit` (`--global` for
   the user config); precedence is flags > repo > global. `wt init` is an optional
   convenience that scaffolds a starter `.wt.toml` and, for a subdir store, offers
-  to add it to `.gitignore`.
+  to add it to `.gitignore`. Claude/Haiku/low remain the defaults; switch
+  providers globally or per repository with:
+
+  ```toml
+  [agent]
+  provider = "codex"
+  effort = "high"
+  # model = "gpt-5" # omit to use the Codex CLI default
+  ```
 - **Theme the TUI.** Pick a built-in palette and tweak individual colors under
   `[ui.theme]`: `preset` selects the base (`one-dark` (default) or `solarized`),
   and the named slots (`accent`, `green`, `red`, `yellow`, `orange`, `cyan`,

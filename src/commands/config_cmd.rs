@@ -23,6 +23,7 @@ const KEYS: &[&str] = &[
     "remove.delete_merged_branch",
     "remove.untracked_blocks",
     "pr.default_remote",
+    "agent.provider",
     "agent.command",
     "agent.model",
     "agent.effort",
@@ -199,6 +200,7 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "hooks.post_create"
         | "hooks.pre_remove"
         | "pr.default_remote"
+        | "agent.provider"
         | "agent.command"
         | "agent.model"
         | "agent.effort"
@@ -237,8 +239,12 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "remove.delete_merged_branch" => Some(config.remove_delete_merged_branch.to_string()),
         "remove.untracked_blocks" => Some(config.remove_untracked_blocks.to_string()),
         "pr.default_remote" => Some(config.pr_default_remote.clone()),
-        "agent.command" => Some(config.agent_command.clone()),
-        "agent.model" => Some(config.agent_model.id().to_string()),
+        "agent.provider" => Some(config.agent_kind.as_str().to_string()),
+        "agent.command" => config.agent_command.clone(),
+        "agent.model" => {
+            let model = config.effective_agent_model();
+            (!model.id().is_empty()).then(|| model.id().to_string())
+        }
         "agent.effort" => Some(config.agent_effort.id().to_string()),
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),
         "list.columns" => Some(
@@ -432,6 +438,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, crate::error::Error::Config { .. }));
+    }
+
+    #[test]
+    fn agent_provider_roundtrips_and_codex_default_model_is_unset() {
+        let repo = TestRepo::init();
+        run(
+            &repo,
+            &[],
+            ConfigAction::Set {
+                key: "agent.provider".into(),
+                value: "codex".into(),
+            },
+            false,
+            false,
+        );
+        let (_, provider, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "agent.provider".into(),
+            },
+            false,
+            false,
+        );
+        assert_eq!(provider.trim(), "codex");
+        let (_, model, _) = run(
+            &repo,
+            &[],
+            ConfigAction::Get {
+                key: "agent.model".into(),
+            },
+            false,
+            false,
+        );
+        assert!(model.trim().is_empty());
     }
 
     #[test]

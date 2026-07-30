@@ -14,7 +14,7 @@ pub mod types;
 use std::path::Path;
 use std::process::Command;
 
-use agent_text::{ClaudeCode, GenerationOptions, GenerationRequest, ReasoningEffort};
+use agent_text::{ClaudeCode, Codex, GenerationOptions, GenerationRequest, ReasoningEffort};
 
 use crate::error::{Error, Result};
 pub use model::{AgentModel, AgentOptions, Effort};
@@ -67,7 +67,10 @@ impl AgentClient for RealAgent {
         _dir: &Path,
         opts: &AgentOptions,
     ) -> Result<AgentRun> {
-        generate_with(&ClaudeCode::new(), kind, prompt, opts)
+        match kind {
+            AgentKind::Claude => generate_with(&ClaudeCode::new(), kind, prompt, opts),
+            AgentKind::Codex => generate_with(&Codex::new(), kind, prompt, opts),
+        }
     }
 }
 
@@ -96,7 +99,7 @@ fn generate_with(
     opts: &AgentOptions,
 ) -> Result<AgentRun> {
     let request = GenerationRequest::new(prompt).with_options(GenerationOptions {
-        model: Some(opts.model.id().to_string()),
+        model: (opts.model != AgentModel::Default).then(|| opts.model.id().to_string()),
         reasoning_effort: Some(match opts.effort {
             Effort::Low => ReasoningEffort::Low,
             Effort::Medium => ReasoningEffort::Medium,
@@ -115,7 +118,7 @@ fn generate_with(
                     .map_err(Error::from)?;
                 runtime
                     .block_on(agent.generate(&request))
-                    .map_err(map_agent_text_error)
+                    .map_err(|error| map_agent_text_error(kind, error))
             })
             .join()
     })
@@ -142,7 +145,7 @@ fn generate_with(
 }
 
 /// Maps provider-neutral generation failures onto wt's stable public errors.
-fn map_agent_text_error(error: agent_text::Error) -> Error {
+fn map_agent_text_error(kind: AgentKind, error: agent_text::Error) -> Error {
     match error {
         agent_text::Error::Spawn { binary, source } => {
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -155,7 +158,7 @@ fn map_agent_text_error(error: agent_text::Error) -> Error {
             }
         }
         agent_text::Error::Exit { stderr, .. } => Error::Subprocess {
-            program: "claude".to_string(),
+            program: kind.as_str().to_string(),
             stderr,
         },
         other => Error::operation(format!("code-agent generation failed: {other}")),
@@ -285,6 +288,12 @@ mod tests {
         // `claude` may or may not be installed in the test environment; either
         // way detection must not error (absent => Ok(None)).
         assert!(RealAgent.detect(AgentKind::Claude).is_ok());
+    }
+
+    #[test]
+    fn real_agent_detect_codex_does_not_error() {
+        // `codex` may or may not be installed; absence is a successful miss.
+        assert!(RealAgent.detect(AgentKind::Codex).is_ok());
     }
 
     // The real-subprocess paths below shell out to `sh`, which the existing

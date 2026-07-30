@@ -72,6 +72,7 @@ pub fn issue_picker_hints() -> &'static [Hint] {
 pub fn compose_ai_hints() -> &'static [Hint] {
     const HINTS: &[Hint] = &[
         hint("Ctrl-A", "AI fill"),
+        hint("Ctrl-P", "provider"),
         hint("Ctrl-M", "model"),
         hint("Ctrl-E", "effort"),
         hint("↑/↓", "pick"),
@@ -226,6 +227,7 @@ mod tests {
             "u" => (KeyCode::Char('u'), KeyModifiers::empty()),
             "p" => (KeyCode::Char('p'), KeyModifiers::empty()),
             "Ctrl-A" => (KeyCode::Char('a'), KeyModifiers::CONTROL),
+            "Ctrl-P" => (KeyCode::Char('p'), KeyModifiers::CONTROL),
             "Ctrl-S" => (KeyCode::Char('s'), KeyModifiers::CONTROL),
             "Ctrl-D" => (KeyCode::Char('d'), KeyModifiers::CONTROL),
             "Ctrl-M" => (KeyCode::Char('m'), KeyModifiers::CONTROL),

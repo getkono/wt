@@ -19,11 +19,12 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-text"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf3ad01940831ac8018fdea968cd18c2acafaea70e129dd50b909c1a5b1eb69"
+checksum = "9f432625494ad4c9ecf8afa619254a212434aa311547c61ba05cab380264a6c5"
 dependencies = [
  "async-trait",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

@@ -3,7 +3,7 @@
 
 use ratatui::style::Color;
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::{AgentKind, AgentModel, Effort};
 use crate::cx::Env;
 use crate::keys::{KeyAction, KeyChord, Keymap};
 use crate::model::Column;
@@ -67,14 +67,16 @@ pub struct Config {
     pub pr_default_remote: String,
     /// When to auto-initialize git submodules on create/checkout (issue #50).
     pub submodules_init: SubmoduleInit,
-    /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
-    /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
+    /// Default AI provider for generation and structured issue-agent launches.
+    pub agent_kind: AgentKind,
+    /// Default model for code-agent generation; overridable per-invocation by
+    /// `--model` or the TUI's `Ctrl-M` key.
     pub agent_model: AgentModel,
-    /// Default effort for the AI PR auto-fill; overridable by `--effort` or the
-    /// TUI's `Ctrl-E` key.
+    /// Default generation effort; overridable by `--effort` or the TUI's
+    /// `Ctrl-E` key.
     pub agent_effort: Effort,
-    /// Foreground coding-agent command for `wt issue`.
-    pub agent_command: String,
+    /// Optional custom foreground coding-agent command for `wt issue`.
+    pub agent_command: Option<String>,
     /// Show `?` in the dirty column for untracked files.
     pub list_show_untracked: bool,
     /// Ordered list of columns to display in `wt list`.
@@ -106,9 +108,10 @@ impl Default for Config {
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
             submodules_init: SubmoduleInit::default(),
-            agent_model: AgentModel::default(),
+            agent_kind: AgentKind::Claude,
+            agent_model: AgentModel::Default,
             agent_effort: Effort::default(),
-            agent_command: "claude".to_string(),
+            agent_command: None,
             list_show_untracked: true,
             list_columns: Column::ALL.to_vec(),
             ui_nerd_fonts: false,
@@ -122,6 +125,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Resolves the configured model, falling back to the selected provider's
+    /// economical/default choice when `agent.model` is not explicitly set.
+    pub fn effective_agent_model(&self) -> AgentModel {
+        if self.agent_model == AgentModel::Default {
+            self.agent_kind.default_model()
+        } else {
+            self.agent_model.clone()
+        }
+    }
+
     /// Applies a parsed layer on top of this config (spec §11 merge semantics):
     /// scalars replace, arrays (`copy`, `list.columns`) replace wholesale,
     /// `ui.keybindings` deep-merges per action, and the `[ui.theme]` colors
@@ -158,6 +171,9 @@ impl Config {
         if let Some(v) = layer.submodules_init {
             self.submodules_init = v;
         }
+        if let Some(v) = layer.agent_kind {
+            self.agent_kind = v;
+        }
         if let Some(v) = layer.agent_model {
             self.agent_model = v;
         }
@@ -165,7 +181,7 @@ impl Config {
             self.agent_effort = v;
         }
         if let Some(v) = layer.agent_command {
-            self.agent_command = v;
+            self.agent_command = Some(v);
         }
         if let Some(v) = layer.list_show_untracked {
             self.list_show_untracked = v;
@@ -243,11 +259,13 @@ pub struct ConfigLayer {
     pub pr_default_remote: Option<String>,
     /// `submodules.init`.
     pub submodules_init: Option<SubmoduleInit>,
+    /// `agent.provider`.
+    pub agent_kind: Option<AgentKind>,
     /// `agent.model`.
     pub agent_model: Option<AgentModel>,
     /// `agent.effort`.
     pub agent_effort: Option<Effort>,
-    /// `agent.command`.
+    /// Optional `agent.command`.
     pub agent_command: Option<String>,
     /// `list.show_untracked`.
     pub list_show_untracked: Option<bool>,
@@ -358,9 +376,11 @@ mod tests {
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
         assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
-        assert_eq!(c.agent_model, AgentModel::Haiku);
+        assert_eq!(c.agent_kind, AgentKind::Claude);
+        assert_eq!(c.agent_model, AgentModel::Default);
+        assert_eq!(c.effective_agent_model(), AgentModel::Haiku);
         assert_eq!(c.agent_effort, Effort::Low);
-        assert_eq!(c.agent_command, "claude");
+        assert!(c.agent_command.is_none());
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());
         assert!(!c.ui_nerd_fonts);

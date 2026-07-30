@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::{AgentKind, AgentModel, Effort};
 use crate::keys::Keymap;
 use crate::model::{Column, SortKey, SortSpec, Worktree};
 use crate::tui::event::Effect;
@@ -253,6 +253,8 @@ pub enum ComposeField {
     Title,
     /// Editing the multi-line body.
     Body,
+    /// Selecting the AI provider used for auto-fill.
+    Agent,
     /// Selecting the AI auto-fill model from its options dropdown (issue #25).
     Model,
     /// Selecting the AI auto-fill effort from its options dropdown (issue #25).
@@ -277,6 +279,8 @@ pub struct PrComposeState {
     pub trunk: String,
     /// Precomputed action label, e.g. `create` or `update #12`.
     pub action_label: String,
+    /// The provider used for AI auto-fill (`Ctrl-P`).
+    pub kind: AgentKind,
     /// The model used for AI auto-fill (`Ctrl-A`), cycled with `Ctrl-M`.
     pub model: AgentModel,
     /// The effort used for AI auto-fill, cycled with `Ctrl-E`.

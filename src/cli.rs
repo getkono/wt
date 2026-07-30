@@ -164,10 +164,17 @@ pub(crate) struct IssueArgs {
     /// Base ref for a newly created branch (default: the repo's default branch).
     #[arg(long, value_name = "REF")]
     pub(crate) from: Option<String>,
+    /// AI provider for setup generation and the launched coding session.
+    #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
+    pub(crate) agent: Option<String>,
     /// Foreground coding-agent command (overrides `agent.command`).
-    #[arg(long = "agent-command", value_name = "COMMAND")]
+    #[arg(
+        long = "agent-command",
+        value_name = "COMMAND",
+        conflicts_with_all = ["agent", "dangerous", "plan"]
+    )]
     pub(crate) agent_command: Option<String>,
-    /// Model for AI generation: `opus`, `sonnet`, or `haiku`.
+    /// Provider-specific model for generation and the launched coding session.
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
     /// Effort for AI generation: `low`, `medium`, `high`, `xhigh`, or `max`.
@@ -176,6 +183,12 @@ pub(crate) struct IssueArgs {
     /// Prepare the worktree without launching the coding agent.
     #[arg(long = "no-launch")]
     pub(crate) no_launch: bool,
+    /// Launch the coding agent without its approval/permission safeguards.
+    #[arg(long)]
+    pub(crate) dangerous: bool,
+    /// Launch the coding agent in planning mode.
+    #[arg(long)]
+    pub(crate) plan: bool,
     /// Do not switch into the issue worktree.
     #[arg(long = "no-switch")]
     pub(crate) no_switch: bool,
@@ -372,11 +385,13 @@ pub(crate) struct PrOpenArgs {
     /// Open the PR as a draft (create only).
     #[arg(long)]
     pub(crate) draft: bool,
-    /// Draft the title/body with a code agent (Claude), then review before sending.
+    /// Draft the title/body with the selected code agent, then review before sending.
     #[arg(long)]
     pub(crate) ai: bool,
-    /// Model for `--ai` drafting: `opus`, `sonnet`, or `haiku` (overrides
-    /// `agent.model`; default `haiku`).
+    /// AI provider for drafting: `claude` or `codex`.
+    #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
+    pub(crate) agent: Option<String>,
+    /// Provider-specific model for `--ai` drafting (overrides `agent.model`).
     #[arg(long, value_name = "MODEL")]
     pub(crate) model: Option<String>,
     /// Effort for `--ai` drafting: `low`, `medium`, `high`, `xhigh`, or `max` (overrides
@@ -796,10 +811,11 @@ mod tests {
             }
             _ => panic!("expected pr"),
         }
-        // `pr open --title X --draft --ai --model opus --effort high` -> the open
+        // `pr open --title X --draft --ai --agent codex ...` -> the open
         // sub-form with its flags, including the model/effort overrides.
         let cli = parse(&[
-            "pr", "open", "--title", "X", "--draft", "--ai", "--model", "opus", "--effort", "high",
+            "pr", "open", "--title", "X", "--draft", "--ai", "--agent", "codex", "--model",
+            "gpt-5", "--effort", "high",
         ])
         .unwrap();
         match cli.command {
@@ -808,7 +824,8 @@ mod tests {
                     assert_eq!(o.title.as_deref(), Some("X"));
                     assert!(o.draft);
                     assert!(o.ai);
-                    assert_eq!(o.model.as_deref(), Some("opus"));
+                    assert_eq!(o.agent.as_deref(), Some("codex"));
+                    assert_eq!(o.model.as_deref(), Some("gpt-5"));
                     assert_eq!(o.effort.as_deref(), Some("high"));
                     assert!(!o.update && !o.new);
                 }
@@ -820,6 +837,33 @@ mod tests {
         assert!(parse(&["pr", "open", "--update", "--new"]).is_err());
         // `--body` and `--body-file` are mutually exclusive.
         assert!(parse(&["pr", "open", "--body", "b", "--body-file", "f"]).is_err());
+    }
+
+    #[test]
+    fn issue_parses_structured_agent_modes_and_custom_command_conflicts() {
+        let cli = parse(&[
+            "issue",
+            "42",
+            "--agent",
+            "codex",
+            "--model",
+            "gpt-5",
+            "--dangerous",
+            "--plan",
+        ])
+        .unwrap();
+        let Some(Command::Issue(args)) = cli.command else {
+            panic!("expected issue");
+        };
+        assert_eq!(args.agent.as_deref(), Some("codex"));
+        assert_eq!(args.model.as_deref(), Some("gpt-5"));
+        assert!(args.dangerous);
+        assert!(args.plan);
+
+        assert!(parse(&["issue", "42", "--agent", "other"]).is_err());
+        assert!(parse(&["issue", "42", "--agent-command", "aider", "--dangerous"]).is_err());
+        // Existing generation controls remain usable with a custom launcher.
+        assert!(parse(&["issue", "42", "--agent-command", "aider", "--model", "opus"]).is_ok());
     }
 
     #[test]
