@@ -74,7 +74,13 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
         }
     } else {
         let (title, body) = if args.ai {
-            draft_with_ai(cx.agent.as_ref(), kind, &ctx, &dir, &opts)?
+            print_generation_summary(cx, kind, &opts)?;
+            let agent = cx.agent.clone();
+            let draft_ctx = ctx.clone();
+            let draft_dir = dir.clone();
+            crate::progress::run(&mut cx.err, "Drafting pull request", move || {
+                draft_with_ai(agent.as_ref(), kind, &draft_ctx, &draft_dir, &opts)
+            })?
         } else {
             (
                 args.title.clone().unwrap_or_default(),
@@ -112,6 +118,20 @@ pub(crate) fn run(cx: &mut Cx, args: &PrOpenArgs, json: bool) -> Result<u8> {
         )?;
         emit_outcome(cx, &ctx, &spec, &outcome, json)
     }
+}
+
+fn print_generation_summary(cx: &mut Cx, kind: AgentKind, options: &AgentOptions) -> Result<()> {
+    let model = if options.model.id().is_empty() {
+        "Provider default".to_string()
+    } else {
+        format!("{} ({})", options.model.label(), options.model.id())
+    };
+    cx.err.line("Generation")?;
+    cx.err.line(&format!("  Provider: {}", kind.label()))?;
+    cx.err.line(&format!("  Model: {model}"))?;
+    cx.err
+        .line(&format!("  Effort: {}", options.effort.label()))?;
+    cx.err.line("  Produces: pull request title and body")
 }
 
 /// Reads the PR body from `--body`, `--body-file <path>`, or `--body-file -`
@@ -308,29 +328,29 @@ pub(crate) fn build_ai_prompt(ctx: &sendit::PrContext) -> String {
     s
 }
 
-/// Resolves the agent model + effort for an AI draft: an explicit `--model` /
-/// `--effort` flag overrides the resolved config default. Unknown flag values
-/// are a usage error (exit 2).
+/// Resolves the generation provider, model, and effort for an AI draft. Each
+/// explicit generation flag overrides its corresponding config default.
 pub(crate) fn resolve_agent_options(
     args: &PrOpenArgs,
     config: &Config,
 ) -> Result<(AgentKind, AgentOptions)> {
     let kind = match &args.generation_provider {
-        Some(value) => AgentKind::parse(value)
-            .ok_or_else(|| Error::usage("unknown --agent; expected one of: claude, codex"))?,
+        Some(value) => AgentKind::parse(value).ok_or_else(|| {
+            Error::usage("unknown --generation-provider; expected one of: claude, codex")
+        })?,
         None => config.agent_generation.provider,
     };
     let model = match &args.generation_model {
         Some(model) => AgentModel::parse(model)
             .or_else(|| AgentModel::custom(model))
-            .ok_or_else(|| Error::usage("--model must not be empty"))?,
+            .ok_or_else(|| Error::usage("--generation-model must not be empty"))?,
         None if args.generation_provider.is_some() => kind.economy_model(),
         None => config.agent_generation.effective_model(),
     };
     let effort = match &args.generation_effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
             Error::usage(format!(
-                "unknown --effort {e:?}; expected one of: low, medium, high, xhigh, max"
+                "unknown --generation-effort {e:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
         None => config.agent_generation.effort,

@@ -22,6 +22,7 @@ pub mod hooks;
 pub mod keys;
 pub mod model;
 pub mod output;
+pub(crate) mod progress;
 pub mod query;
 pub mod slug;
 pub mod template;

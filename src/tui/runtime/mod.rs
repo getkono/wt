@@ -96,7 +96,9 @@ pub(crate) fn run_issue_picker(
         .repo
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
-    let issues = gh.list_open_issues(&dir)?;
+    let issues = crate::progress::run(&mut cx.err, "Fetching open issues", move || {
+        gh.list_open_issues(&dir)
+    })?;
     if issues.is_empty() {
         cx.err.line("no open GitHub issues")?;
         return Ok(0);
@@ -257,7 +259,7 @@ async fn run_loop(cx: &mut Cx, session: &Session, app: &mut App, initial: Effect
         tokio::select! {
             // Animate the per-row spinners while any background job runs (the guard
             // disables this branch — and the timer wakeups — when idle).
-            _ = ticker.tick(), if app.any_jobs() => {
+            _ = ticker.tick(), if app.spinner_active() => {
                 app.tick_spinner();
                 tui.draw(app)?;
             }

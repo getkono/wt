@@ -794,15 +794,11 @@ pub(crate) fn do_draft_pr_ai(
             crate::agent::AgentOptions::default(),
         ),
     };
-    // The TUI is suspended during the (blocking) agent call, so a progress line
-    // on stderr is visible while the user waits.
-    let _ = cx.err.line(&format!(
-        "Drafting PR with {} / {} (effort {})…",
-        kind.label(),
-        opts.model.label(),
-        opts.effort.id()
-    ));
-    let result = crate::commands::pr_open::draft_with_ai(cx.agent.as_ref(), kind, ctx, &dir, &opts);
+    let agent = cx.agent.clone();
+    let draft_ctx = ctx.clone();
+    let result = crate::progress::run(&mut cx.err, "Drafting pull request", move || {
+        crate::commands::pr_open::draft_with_ai(agent.as_ref(), kind, &draft_ctx, &dir, &opts)
+    });
     if let Mode::PrCompose(state) = &mut app.mode {
         match result {
             Ok((title, body)) => {

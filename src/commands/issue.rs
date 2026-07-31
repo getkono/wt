@@ -79,7 +79,11 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         .repo
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
-    let issue = gh.view_issue(&dir, args.target.as_deref().unwrap_or_default())?;
+    let issue_target = args.target.clone().unwrap_or_default();
+    let issue_dir = dir.clone();
+    let issue = crate::progress::run(&mut cx.err, "Fetching issue", move || {
+        gh.view_issue(&issue_dir, &issue_target)
+    })?;
     let branch_choices = all_branches(session.repo.gix()).unwrap_or_default();
     let suggested_base = suggested_base(session.repo.gix(), args.from.as_deref());
     let linked = linked_branch(session.repo.gix(), issue.number)?;
@@ -117,15 +121,22 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         }
         print_generation_summary(cx, kind, &options, args)?;
         ensure_agent_available(cx.agent.as_ref(), kind, "generation")?;
-        let generated = generate_issue_plan(
-            cx.agent.as_ref(),
-            &issue,
-            &session.primary_root,
-            kind,
-            &options,
-            args.branch.as_deref(),
-            args.brief.as_deref(),
-        )?;
+        let agent = cx.agent.clone();
+        let generation_issue = issue.clone();
+        let generation_root = session.primary_root.clone();
+        let branch_override = args.branch.clone();
+        let brief_override = args.brief.clone();
+        let generated = crate::progress::run(&mut cx.err, "Generating issue setup", move || {
+            generate_issue_plan(
+                agent.as_ref(),
+                &generation_issue,
+                &generation_root,
+                kind,
+                &options,
+                branch_override.as_deref(),
+                brief_override.as_deref(),
+            )
+        })?;
         (
             args.branch.clone().unwrap_or(generated.branch),
             args.brief.clone().unwrap_or(generated.brief),
@@ -412,11 +423,12 @@ fn print_generation_summary(
     };
     cx.err.line("Generation")?;
     cx.err.line(&format!("  Provider: {}", kind.label()))?;
-    cx.err.line(&format!(
-        "  Model: {} ({})",
-        options.model.label(),
-        options.model.id()
-    ))?;
+    let model = if options.model.id().is_empty() {
+        model_display(&options.model).to_string()
+    } else {
+        format!("{} ({})", options.model.label(), options.model.id())
+    };
+    cx.err.line(&format!("  Model: {model}"))?;
     cx.err
         .line(&format!("  Effort: {}", options.effort.label()))?;
     cx.err.line(&format!("  Produces: {produces}"))?;
@@ -578,8 +590,10 @@ pub(crate) fn create_and_open(
 
     let existing = existing_worktree_for_branch(cx, &setup.branch)?;
     let path = if let Some(path) = existing {
+        cx.err.line("✓ Reusing existing issue worktree")?;
         path
     } else {
+        cx.err.line("… Preparing issue worktree")?;
         let new_args = NewArgs {
             branch: setup.branch.clone(),
             from: setup.base.clone(),
@@ -596,6 +610,7 @@ pub(crate) fn create_and_open(
         if code != 0 {
             return Ok(code);
         }
+        cx.err.line("✓ Prepared issue worktree")?;
         existing_worktree_for_branch(cx, &setup.branch)?.ok_or_else(|| {
             Error::operation("created issue worktree could not be found after initialization")
         })?

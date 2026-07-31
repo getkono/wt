@@ -517,11 +517,18 @@ impl App {
     }
 
     /// Advances the shared spinner one frame (called on each animation tick); a
-    /// no-op when no job is in flight.
+    /// no-op when no job or picker load is in flight.
     pub fn tick_spinner(&mut self) {
-        if !self.jobs.is_empty() {
+        if self.spinner_active() {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }
+    }
+
+    /// Whether any UI state currently needs animated spinner frames.
+    pub fn spinner_active(&self) -> bool {
+        !self.jobs.is_empty()
+            || matches!(&self.mode, Mode::PrPicker(state) if state.loading)
+            || matches!(&self.mode, Mode::IssuePicker(state) if state.loading)
     }
 
     /// Whether any background job is in flight (keeps the animation ticker awake).

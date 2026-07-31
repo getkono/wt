@@ -368,8 +368,16 @@ pub(super) fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Fra
         return;
     }
     if state.loading {
+        let glyphs = crate::tui::glyphs::Glyphs::new(app.nerd_fonts);
         frame.render_widget(
-            Paragraph::new(Span::styled("loading…", theme.spinner())).block(block),
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    glyphs.spinner_frame(app.spinner_frame).to_string(),
+                    theme.spinner(),
+                ),
+                Span::raw(" loading open pull requests…"),
+            ]))
+            .block(block),
             rect,
         );
         return;
@@ -433,8 +441,16 @@ pub(super) fn render_issue_picker(
         return;
     }
     if state.loading {
+        let glyphs = crate::tui::glyphs::Glyphs::new(app.nerd_fonts);
         frame.render_widget(
-            Paragraph::new(Span::styled("loading…", theme.spinner())).block(block),
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    glyphs.spinner_frame(app.spinner_frame).to_string(),
+                    theme.spinner(),
+                ),
+                Span::raw(" loading open issues…"),
+            ]))
+            .block(block),
             rect,
         );
         return;
