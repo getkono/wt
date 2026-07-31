@@ -140,17 +140,81 @@ fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Resul
     Ok(())
 }
 
-/// Parses the `[agent]` table, validating the model and effort identifiers.
+/// Parses the task-specific `[agent.generation]` and `[agent.work]` tables.
 fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     for (sub, val) in as_table(file, "agent", value)? {
         let key = format!("agent.{sub}");
         match sub.as_str() {
-            "provider" => {
-                let text = as_string(file, &key, val)?;
-                let kind = AgentKind::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: claude, codex"))?;
-                layer.agent_kind = Some(kind);
+            "generation" => parse_agent_generation(file, val, layer)?,
+            "work" => parse_agent_work(file, val, layer)?,
+            "provider" | "model" | "effort" | "command" => {
+                return Err(cfg_err(
+                    file,
+                    &key,
+                    format!(
+                        "retired key; use agent.generation.{sub} and agent.work.{sub} as applicable"
+                    ),
+                ));
             }
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+fn parse_provider(file: &str, key: &str, value: &Value) -> Result<AgentKind> {
+    let text = as_string(file, key, value)?;
+    AgentKind::parse(&text).ok_or_else(|| cfg_err(file, key, "expected one of: claude, codex"))
+}
+
+fn parse_model(file: &str, key: &str, value: &Value) -> Result<AgentModel> {
+    let text = as_string(file, key, value)?;
+    AgentModel::parse(&text)
+        .or_else(|| AgentModel::custom(&text))
+        .ok_or_else(|| cfg_err(file, key, "model must not be empty"))
+}
+
+fn parse_effort(file: &str, key: &str, value: &Value) -> Result<Effort> {
+    let text = as_string(file, key, value)?;
+    Effort::parse(&text)
+        .ok_or_else(|| cfg_err(file, key, "expected one of: low, medium, high, xhigh, max"))
+}
+
+fn parse_agent_generation(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "agent.generation", value)? {
+        let key = format!("agent.generation.{sub}");
+        match sub.as_str() {
+            "provider" => layer.agent_generation_provider = Some(parse_provider(file, &key, val)?),
+            "model" => {
+                let text = as_string(file, &key, val)?;
+                layer.agent_generation_model = Some(if text.eq_ignore_ascii_case("economy") {
+                    None
+                } else {
+                    Some(parse_model(file, &key, val)?)
+                });
+            }
+            "effort" => layer.agent_generation_effort = Some(parse_effort(file, &key, val)?),
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+fn parse_agent_work(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "agent.work", value)? {
+        let key = format!("agent.work.{sub}");
+        match sub.as_str() {
+            "provider" => layer.agent_work_provider = Some(parse_provider(file, &key, val)?),
+            "model" => layer.agent_work_model = Some(parse_model(file, &key, val)?),
+            "effort" => {
+                let text = as_string(file, &key, val)?;
+                layer.agent_work_effort = Some(if text.eq_ignore_ascii_case("default") {
+                    None
+                } else {
+                    Some(parse_effort(file, &key, val)?)
+                });
+            }
+            "name" => layer.agent_work_name = Some(as_string(file, &key, val)?),
             "command" => {
                 let text = as_string(file, &key, val)?;
                 let parsed = shell_words::split(&text)
@@ -158,22 +222,11 @@ fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
                 if parsed.is_empty() {
                     return Err(cfg_err(file, &key, "command must not be empty"));
                 }
-                layer.agent_command = Some(text);
+                layer.agent_work_command = Some(text);
             }
-            "model" => {
-                let text = as_string(file, &key, val)?;
-                let model = AgentModel::parse(&text)
-                    .or_else(|| AgentModel::custom(&text))
-                    .ok_or_else(|| cfg_err(file, &key, "model must not be empty"))?;
-                layer.agent_model = Some(model);
-            }
-            "effort" => {
-                let text = as_string(file, &key, val)?;
-                let effort = Effort::parse(&text).ok_or_else(|| {
-                    cfg_err(file, &key, "expected one of: low, medium, high, xhigh, max")
-                })?;
-                layer.agent_effort = Some(effort);
-            }
+            "launch" => layer.agent_work_launch = Some(as_bool(file, &key, val)?),
+            "plan" => layer.agent_work_plan = Some(as_bool(file, &key, val)?),
+            "dangerous" => layer.agent_work_dangerous = Some(as_bool(file, &key, val)?),
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
@@ -321,11 +374,17 @@ mod tests {
             [submodules]
             init = "always"
 
-            [agent]
+            [agent.generation]
             provider = "codex"
-            command = "claude --permission-mode plan"
             model = "opus"
             effort = "high"
+
+            [agent.work]
+            provider = "claude"
+            command = "claude --permission-mode plan"
+            model = "default"
+            effort = "default"
+            launch = true
 
             [list]
             show_untracked = false
@@ -354,13 +413,16 @@ mod tests {
         assert_eq!(layer.remove_untracked_blocks, Some(true));
         assert_eq!(layer.pr_default_remote.as_deref(), Some("upstream"));
         assert_eq!(layer.submodules_init, Some(SubmoduleInit::Always));
-        assert_eq!(layer.agent_kind, Some(AgentKind::Codex));
-        assert_eq!(layer.agent_model, Some(AgentModel::Opus));
-        assert_eq!(layer.agent_effort, Some(Effort::High));
+        assert_eq!(layer.agent_generation_provider, Some(AgentKind::Codex));
+        assert_eq!(layer.agent_generation_model, Some(Some(AgentModel::Opus)));
+        assert_eq!(layer.agent_generation_effort, Some(Effort::High));
         assert_eq!(
-            layer.agent_command.as_deref(),
+            layer.agent_work_command.as_deref(),
             Some("claude --permission-mode plan")
         );
+        assert_eq!(layer.agent_work_model, Some(AgentModel::Default));
+        assert_eq!(layer.agent_work_effort, Some(None));
+        assert_eq!(layer.agent_work_launch, Some(true));
         assert_eq!(layer.list_show_untracked, Some(false));
         assert_eq!(layer.list_columns, Some(vec![Column::Branch, Column::Pr]));
         assert_eq!(layer.ui_nerd_fonts, Some(true));
@@ -422,14 +484,25 @@ mod tests {
     #[test]
     fn custom_agent_model_is_accepted_and_invalid_effort_rejected() {
         assert_eq!(
-            parse("[agent]\nmodel = \"gpt\"").unwrap().agent_model,
-            Some(AgentModel::Custom("gpt".into()))
+            parse("[agent.generation]\nmodel = \"gpt\"")
+                .unwrap()
+                .agent_generation_model,
+            Some(Some(AgentModel::Custom("gpt".into())))
         );
-        let (key, reason) = config_reason(parse("[agent]\neffort = \"extreme\"").unwrap_err());
-        assert_eq!(key, "agent.effort");
+        let (key, reason) =
+            config_reason(parse("[agent.generation]\neffort = \"extreme\"").unwrap_err());
+        assert_eq!(key, "agent.generation.effort");
         assert!(reason.contains("low, medium, high, xhigh, max"));
         let (key, _) = config_reason(parse("[agent]\nwiggle = true").unwrap_err());
         assert_eq!(key, "agent.wiggle");
+    }
+
+    #[test]
+    fn retired_agent_keys_name_the_replacement_profiles() {
+        let (key, reason) = config_reason(parse("[agent]\nprovider = \"claude\"").unwrap_err());
+        assert_eq!(key, "agent.provider");
+        assert!(reason.contains("agent.generation.provider"));
+        assert!(reason.contains("agent.work.provider"));
     }
 
     #[test]

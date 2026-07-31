@@ -38,8 +38,14 @@ pub(crate) struct IssueSetup {
     pub(crate) brief: String,
     /// Base ref override.
     pub(crate) base: Option<String>,
-    /// Provider used for generation and structured foreground launch.
+    /// Provider used for the structured foreground launch.
     pub(crate) kind: AgentKind,
+    /// Model used for foreground work; default delegates to the provider.
+    pub(crate) model: AgentModel,
+    /// Optional foreground effort override.
+    pub(crate) effort: Option<Effort>,
+    /// Optional Claude session display name.
+    pub(crate) name: Option<String>,
     /// Optional custom foreground command; `None` uses the provider's command.
     pub(crate) command: Option<String>,
     /// Whether the structured agent launch bypasses its safeguards.
@@ -48,8 +54,6 @@ pub(crate) struct IssueSetup {
     pub(crate) plan: bool,
     /// Whether to launch the command after initialization.
     pub(crate) launch: bool,
-    /// Model/effort used for generation and regeneration.
-    pub(crate) options: AgentOptions,
 }
 
 /// Runs the complete CLI issue workflow.
@@ -76,14 +80,14 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         .current_workdir()
         .unwrap_or_else(|| session.primary_root.clone());
     let issue = gh.view_issue(&dir, args.target.as_deref().unwrap_or_default())?;
-    let mut kind = resolve_agent_kind(args, &session.config)?;
-    let mut options = resolve_agent_options(args, &session.config, kind)?;
-    if !cx.assume_yes {
-        (kind, options) = edit_generation_options(cx, kind, options)?;
-    }
     let branch_choices = all_branches(session.repo.gix()).unwrap_or_default();
     let suggested_base = suggested_base(session.repo.gix(), args.from.as_deref());
     let linked = linked_branch(session.repo.gix(), issue.number)?;
+    let work = resolve_work_options(args, &session.config, issue.number)?;
+    validate_work_options(&work)?;
+    if work.launch && work.command.is_none() {
+        ensure_agent_available(cx.agent.as_ref(), work.kind, "work")?;
+    }
 
     let (branch, brief) = if let Some(branch) = linked {
         if let Some(requested) = &args.branch
@@ -96,12 +100,23 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         }
         (
             branch,
-            format!(
+            args.brief.clone().unwrap_or_else(|| format!(
                 "Continue work on issue #{}: {}. Inspect the existing branch, implement the remaining requirements, and run the repository's validation.",
                 issue.number, issue.title
-            ),
+            )),
         )
+    } else if let (Some(branch), Some(brief)) = (&args.branch, &args.brief) {
+        cx.err
+            .line("Generation: skipped (branch and brief supplied)")?;
+        (branch.clone(), brief.clone())
     } else {
+        let mut kind = resolve_generation_kind(args, &session.config)?;
+        let mut options = resolve_generation_options(args, &session.config, kind)?;
+        if !cx.assume_yes {
+            (kind, options) = edit_generation_options(cx, args, kind, options)?;
+        }
+        print_generation_summary(cx, kind, &options, args)?;
+        ensure_agent_available(cx.agent.as_ref(), kind, "generation")?;
         let generated = generate_issue_plan(
             cx.agent.as_ref(),
             &issue,
@@ -109,10 +124,11 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
             kind,
             &options,
             args.branch.as_deref(),
+            args.brief.as_deref(),
         )?;
         (
             args.branch.clone().unwrap_or(generated.branch),
-            generated.brief,
+            args.brief.clone().unwrap_or(generated.brief),
         )
     };
 
@@ -121,22 +137,22 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         branch,
         brief,
         base: suggested_base,
-        kind,
-        command: args.agent_command.clone().or_else(|| {
-            args.agent
-                .is_none()
-                .then(|| session.config.agent_command.clone())
-                .flatten()
-        }),
-        dangerous: args.dangerous,
-        plan: args.plan,
-        launch: !args.no_launch,
-        options,
+        kind: work.kind,
+        model: work.model,
+        effort: work.effort,
+        name: work.name,
+        command: work.command,
+        dangerous: work.dangerous,
+        plan: work.plan,
+        launch: work.launch,
     };
     validate_setup(&setup)?;
     if !cx.assume_yes {
-        edit_setup(cx, &mut setup, &branch_choices)?;
+        edit_setup(cx, args, &mut setup, &branch_choices)?;
         validate_setup(&setup)?;
+    }
+    if setup.launch && setup.command.is_none() {
+        ensure_agent_available(cx.agent.as_ref(), setup.kind, "work")?;
     }
 
     let preview = existing_worktree_for_branch(cx, &setup.branch)?.map_or_else(
@@ -151,7 +167,7 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         },
         Ok,
     )?;
-    let launch = if !setup.launch {
+    let work_command = if !setup.launch {
         "(disabled)".to_string()
     } else if let Some(command) = &setup.command {
         command.clone()
@@ -164,15 +180,23 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
         )
     };
     let prompt = format!(
-        "issue #{}: {}\nbranch: {}\nbase: {}\nworktree: {}\ngeneration: {} / {} effort\nagent: {}\nCreate this issue worktree? [y/N] ",
+        "Issue #{}: {}\nBranch: {}\nBase: {}\nWorktree: {}\nWork provider: {}\nWork model: {}\nWork effort: {}\nWork name: {}\nWork mode: {}\nWork permissions: {}\nWork command: {}\nCreate this issue worktree? [y/N] ",
         setup.issue.number,
         setup.issue.title,
         setup.branch,
         setup.base.as_deref().unwrap_or("(repository default)"),
         preview.display(),
-        setup.options.model.label(),
-        setup.options.effort.id(),
-        launch,
+        setup.kind.label(),
+        model_display(&setup.model),
+        setup.effort.map_or("Provider default", Effort::label),
+        setup.name.as_deref().unwrap_or("(none)"),
+        if setup.plan { "Plan" } else { "Execute" },
+        if setup.dangerous {
+            "Dangerous"
+        } else {
+            "Standard"
+        },
+        work_command,
     );
     if !crate::commands::confirm(cx, &prompt)? {
         cx.err.line("aborted: issue worktree was not created")?;
@@ -182,41 +206,221 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
     create_and_open(cx, hooks, args, &setup)
 }
 
-/// Resolves the provider flag over the configured default.
-pub(crate) fn resolve_agent_kind(
+/// Resolves the generation provider flag over its task-specific default.
+pub(crate) fn resolve_generation_kind(
     args: &IssueArgs,
     config: &crate::config::Config,
 ) -> Result<AgentKind> {
-    match &args.agent {
+    match &args.generation_provider {
         Some(value) => AgentKind::parse(value)
-            .ok_or_else(|| Error::usage("unknown --agent; expected one of: claude, codex")),
-        None => Ok(config.agent_kind),
+            .ok_or_else(|| Error::usage("unknown --generation-provider; expected claude or codex")),
+        None => Ok(config.agent_generation.provider),
     }
 }
 
 /// Resolves model/effort flags over provider-aware configuration defaults.
-pub(crate) fn resolve_agent_options(
+pub(crate) fn resolve_generation_options(
     args: &IssueArgs,
     config: &crate::config::Config,
     kind: AgentKind,
 ) -> Result<AgentOptions> {
-    let model = match &args.model {
+    let model = match &args.generation_model {
         Some(value) => AgentModel::parse(value)
             .or_else(|| AgentModel::custom(value))
             .ok_or_else(|| Error::usage("--model must not be empty"))?,
-        None if args.agent.is_some() => kind.default_model(),
-        None => config.effective_agent_model(),
+        None if args.generation_provider.is_some() => kind.economy_model(),
+        None => config.agent_generation.effective_model(),
     };
-    let effort = match &args.effort {
+    let effort = match &args.generation_effort {
         Some(value) => Effort::parse(value).ok_or_else(|| {
             Error::usage(format!(
                 "unknown --effort {value:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
-        None => config.agent_effort,
+        None => config.agent_generation.effort,
     };
     validate_provider_options(kind, &model, effort)?;
     Ok(AgentOptions { model, effort })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedWorkOptions {
+    kind: AgentKind,
+    model: AgentModel,
+    effort: Option<Effort>,
+    name: Option<String>,
+    command: Option<String>,
+    launch: bool,
+    plan: bool,
+    dangerous: bool,
+}
+
+fn resolve_work_options(
+    args: &IssueArgs,
+    config: &crate::config::Config,
+    issue_number: u64,
+) -> Result<ResolvedWorkOptions> {
+    let configured = &config.agent_work;
+    let kind = args
+        .work_provider
+        .as_deref()
+        .map(|value| {
+            AgentKind::parse(value)
+                .ok_or_else(|| Error::usage("unknown --work-provider; expected claude or codex"))
+        })
+        .transpose()?
+        .unwrap_or(configured.provider);
+    let model = args
+        .work_model
+        .as_deref()
+        .map(|value| {
+            AgentModel::parse(value)
+                .or_else(|| AgentModel::custom(value))
+                .ok_or_else(|| Error::usage("--work-model must not be empty"))
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            if args.work_provider.is_some() {
+                AgentModel::Default
+            } else {
+                configured.model.clone()
+            }
+        });
+    let effort = match args.work_effort.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("default") => None,
+        Some(value) => Some(Effort::parse(value).ok_or_else(|| {
+            Error::usage(format!(
+                "unknown --work-effort {value:?}; expected default, low, medium, high, xhigh, or max"
+            ))
+        })?),
+        None if args.work_provider.is_some() => None,
+        None => configured.effort,
+    };
+    if let Some(effort) = effort {
+        validate_provider_options(kind, &model, effort)?;
+    }
+    let structured_explicit = args.work_provider.is_some()
+        || args.work_model.is_some()
+        || args.work_effort.is_some()
+        || args.work_name.is_some()
+        || args.work_plan
+        || args.no_work_plan
+        || args.work_dangerous
+        || args.no_work_dangerous;
+    let command = args.work_command.clone().or_else(|| {
+        (!structured_explicit)
+            .then(|| configured.command.clone())
+            .flatten()
+    });
+    let name = args
+        .work_name
+        .clone()
+        .or_else(|| configured.name.clone())
+        .or_else(|| {
+            (kind == AgentKind::Claude && command.is_none())
+                .then(|| format!("wt issue #{issue_number}"))
+        });
+    let launch = if args.launch {
+        true
+    } else if args.no_launch {
+        false
+    } else {
+        configured.launch
+    };
+    let plan = if args.work_plan {
+        true
+    } else if args.no_work_plan {
+        false
+    } else {
+        configured.plan
+    };
+    let dangerous = if args.work_dangerous {
+        true
+    } else if args.no_work_dangerous {
+        false
+    } else {
+        configured.dangerous
+    };
+    Ok(ResolvedWorkOptions {
+        kind,
+        model,
+        effort,
+        name,
+        command,
+        launch,
+        plan,
+        dangerous,
+    })
+}
+
+fn validate_work_options(work: &ResolvedWorkOptions) -> Result<()> {
+    if let Some(effort) = work.effort {
+        validate_provider_options(work.kind, &work.model, effort)?;
+    }
+    if work.name.is_some() && work.kind != AgentKind::Claude {
+        return Err(Error::usage(
+            "--work-name is supported only by the Claude provider",
+        ));
+    }
+    if work.command.is_some()
+        && (work.name.is_some()
+            || work.model != AgentModel::Default
+            || work.effort.is_some()
+            || work.plan
+            || work.dangerous)
+    {
+        return Err(Error::usage(
+            "a custom work command cannot use structured work name/model/effort/mode options",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_agent_available(
+    agent: &dyn crate::agent::AgentClient,
+    kind: AgentKind,
+    task: &str,
+) -> Result<()> {
+    if agent.detect(kind)?.is_some() {
+        return Ok(());
+    }
+    Err(Error::AgentUnavailable(format!(
+        "{} is required for {task} but is not installed or not on PATH",
+        kind.as_str()
+    )))
+}
+
+fn model_display(model: &AgentModel) -> &str {
+    if *model == AgentModel::Default {
+        "Provider default"
+    } else {
+        model.label()
+    }
+}
+
+fn print_generation_summary(
+    cx: &mut Cx,
+    kind: AgentKind,
+    options: &AgentOptions,
+    args: &IssueArgs,
+) -> Result<()> {
+    let produces = match (args.branch.is_none(), args.brief.is_none()) {
+        (true, true) => "branch and brief",
+        (true, false) => "branch",
+        (false, true) => "brief",
+        (false, false) => "nothing",
+    };
+    cx.err.line("Generation")?;
+    cx.err.line(&format!("  Provider: {}", kind.label()))?;
+    cx.err.line(&format!(
+        "  Model: {} ({})",
+        options.model.label(),
+        options.model.id()
+    ))?;
+    cx.err
+        .line(&format!("  Effort: {}", options.effort.label()))?;
+    cx.err.line(&format!("  Produces: {produces}"))?;
+    Ok(())
 }
 
 /// Rejects portable options that the selected adapter cannot honor.
@@ -242,6 +446,7 @@ pub(crate) fn generate_issue_plan(
     kind: AgentKind,
     options: &AgentOptions,
     branch_override: Option<&str>,
+    brief_override: Option<&str>,
 ) -> Result<IssuePlan> {
     let prompt = build_generation_prompt(issue, branch_override);
     let run = agent.run(kind, &prompt, dir, options)?;
@@ -254,6 +459,9 @@ pub(crate) fn generate_issue_plan(
     let mut plan = parse_issue_plan(&run.result)?;
     if let Some(branch) = branch_override {
         plan.branch = branch.to_string();
+    }
+    if let Some(brief) = brief_override {
+        plan.brief = brief.to_string();
     }
     validate_plan(issue.number, &plan)?;
     Ok(plan)
@@ -474,9 +682,25 @@ pub(crate) fn launch_argv(setup: &IssueSetup, prompt: &str) -> Result<Vec<String
     }
 
     let mut argv = vec![setup.kind.as_str().to_string()];
-    if *setup.model() != AgentModel::Default {
+    if setup.model != AgentModel::Default {
         argv.push("--model".to_string());
-        argv.push(setup.model().id().to_string());
+        argv.push(setup.model.id().to_string());
+    }
+    if let Some(effort) = setup.effort {
+        match setup.kind {
+            AgentKind::Claude => {
+                argv.push("--effort".to_string());
+                argv.push(effort.id().to_string());
+            }
+            AgentKind::Codex => {
+                argv.push("-c".to_string());
+                argv.push(format!("model_reasoning_effort=\"{}\"", effort.id()));
+            }
+        }
+    }
+    if let Some(name) = &setup.name {
+        argv.push("--name".to_string());
+        argv.push(name.clone());
     }
     if setup.dangerous {
         argv.push(
@@ -497,13 +721,6 @@ pub(crate) fn launch_argv(setup: &IssueSetup, prompt: &str) -> Result<Vec<String
     };
     argv.push(prompt);
     Ok(argv)
-}
-
-impl IssueSetup {
-    /// The model selected for both generation and structured launch.
-    fn model(&self) -> &AgentModel {
-        &self.options.model
-    }
 }
 
 /// Builds the reviewed prompt supplied to the foreground coding agent.
@@ -577,10 +794,24 @@ fn validate_setup(setup: &IssueSetup) -> Result<()> {
             brief: setup.brief.clone(),
         },
     )?;
-    validate_provider_options(setup.kind, &setup.options.model, setup.options.effort)?;
+    if let Some(effort) = setup.effort {
+        validate_provider_options(setup.kind, &setup.model, effort)?;
+    }
+    if setup.name.is_some() && setup.kind != AgentKind::Claude {
+        return Err(Error::usage(
+            "--work-name is supported only by the Claude provider",
+        ));
+    }
     if setup.command.is_some() && (setup.plan || setup.dangerous) {
         return Err(Error::usage(
-            "--plan and --dangerous require a structured Claude or Codex launch; use --agent",
+            "work plan/dangerous options require a structured Claude or Codex launch",
+        ));
+    }
+    if setup.command.is_some()
+        && (setup.name.is_some() || setup.model != AgentModel::Default || setup.effort.is_some())
+    {
+        return Err(Error::usage(
+            "work name/model/effort options cannot be applied to a custom work command",
         ));
     }
     if setup.launch
@@ -597,24 +828,67 @@ fn validate_setup(setup: &IssueSetup) -> Result<()> {
 
 /// Plain-terminal editor used for targeted CLI invocations. Blank input keeps
 /// each generated/default value; the final mutation still has its own approval.
-fn edit_setup(cx: &mut Cx, setup: &mut IssueSetup, branches: &[String]) -> Result<()> {
-    setup.branch = prompt_value(cx, "branch", &setup.branch)?;
-    setup.base = prompt_base(cx, setup.base.as_deref(), branches)?;
-    setup.brief = prompt_value(cx, "brief", &setup.brief)?;
-    if let Some(command) = &setup.command {
-        setup.command = Some(prompt_value(cx, "agent command", command)?);
+fn edit_setup(
+    cx: &mut Cx,
+    args: &IssueArgs,
+    setup: &mut IssueSetup,
+    branches: &[String],
+) -> Result<()> {
+    if args.branch.is_none() {
+        setup.branch = prompt_value(cx, "branch", &setup.branch)?;
     }
-    let launch = prompt_value(
-        cx,
-        "launch agent (yes/no)",
-        if setup.launch { "yes" } else { "no" },
-    )?;
-    setup.launch = matches!(launch.to_ascii_lowercase().as_str(), "y" | "yes" | "true");
+    if args.from.is_none() {
+        setup.base = prompt_base(cx, setup.base.as_deref(), branches)?;
+    }
+    if args.brief.is_none() {
+        setup.brief = prompt_value(cx, "brief", &setup.brief)?;
+    }
+    if let Some(command) = &setup.command {
+        if args.work_command.is_none() {
+            setup.command = Some(prompt_value(cx, "work command", command)?);
+        }
+    } else {
+        if args.work_provider.is_none() {
+            const AGENTS: &[&str] = &["claude", "codex"];
+            let selected = prompt_choice(cx, "work provider", setup.kind.as_str(), AGENTS)?;
+            let PromptSelection::Choice(selected) = selected else {
+                return Err(Error::usage("work provider must be claude or codex"));
+            };
+            let selected = AgentKind::parse(&selected)
+                .ok_or_else(|| Error::usage("work provider must be claude or codex"))?;
+            if selected != setup.kind {
+                setup.kind = selected;
+                setup.model = AgentModel::Default;
+                setup.effort = None;
+                setup.name = (selected == AgentKind::Claude)
+                    .then(|| format!("wt issue #{}", setup.issue.number));
+            }
+        }
+        if args.work_model.is_none() {
+            setup.model = prompt_agent_model(cx, "work model", setup.kind, &setup.model, true)?;
+        }
+        if args.work_effort.is_none() {
+            setup.effort = prompt_optional_effort(cx, setup.kind, setup.effort)?;
+        }
+        if setup.kind == AgentKind::Claude && args.work_name.is_none() {
+            let current = setup.name.as_deref().unwrap_or("");
+            let name = prompt_value(cx, "work name", current)?;
+            setup.name = (!name.trim().is_empty()).then_some(name);
+        }
+    }
+    if !args.launch && !args.no_launch {
+        let launch = prompt_value(cx, "launch agent (yes/no)", yes_no(setup.launch))?;
+        setup.launch = is_yes(&launch);
+    }
     if setup.launch && setup.command.is_none() {
-        let plan = prompt_value(cx, "planning mode (yes/no)", yes_no(setup.plan))?;
-        setup.plan = is_yes(&plan);
-        let dangerous = prompt_value(cx, "dangerous mode (yes/no)", yes_no(setup.dangerous))?;
-        setup.dangerous = is_yes(&dangerous);
+        if !args.work_plan && !args.no_work_plan {
+            let plan = prompt_value(cx, "planning mode (yes/no)", yes_no(setup.plan))?;
+            setup.plan = is_yes(&plan);
+        }
+        if !args.work_dangerous && !args.no_work_dangerous {
+            let dangerous = prompt_value(cx, "dangerous mode (yes/no)", yes_no(setup.dangerous))?;
+            setup.dangerous = is_yes(&dangerous);
+        }
     }
     Ok(())
 }
@@ -622,58 +896,90 @@ fn edit_setup(cx: &mut Cx, setup: &mut IssueSetup, branches: &[String]) -> Resul
 /// Prompts for the LLM generation options before requesting branch/brief text.
 fn edit_generation_options(
     cx: &mut Cx,
+    args: &IssueArgs,
     mut kind: AgentKind,
     mut options: AgentOptions,
 ) -> Result<(AgentKind, AgentOptions)> {
-    const AGENTS: &[&str] = &["claude", "codex"];
-    let selected = prompt_choice(cx, "AI provider", kind.as_str(), AGENTS)?;
-    let PromptSelection::Choice(selected) = selected else {
-        return Err(Error::usage("AI provider must be claude or codex"));
-    };
-    let selected = AgentKind::parse(&selected)
-        .ok_or_else(|| Error::usage("AI provider must be claude or codex"))?;
-    if selected != kind {
-        kind = selected;
-        options.model = kind.default_model();
-    }
-
-    const CLAUDE_MODELS: &[&str] = &["haiku", "sonnet", "opus"];
-    const CODEX_MODELS: &[&str] = &["default"];
-    let choices = match kind {
-        AgentKind::Claude => CLAUDE_MODELS,
-        AgentKind::Codex => CODEX_MODELS,
-    };
-    let current = if options.model == AgentModel::Default {
-        "default"
-    } else {
-        options.model.id()
-    };
-    let model = match prompt_choice(cx, "generation model", current, choices)? {
-        PromptSelection::Choice(model) => model,
-        PromptSelection::Custom => prompt_value(cx, "custom generation model", current)?,
-    };
-    options.model = if model == "default" {
-        AgentModel::Default
-    } else {
-        AgentModel::parse(&model)
-            .or_else(|| AgentModel::custom(&model))
-            .ok_or_else(|| Error::usage("generation model must not be empty"))?
-    };
-
-    const EFFORTS: &[&str] = &["low", "medium", "high"];
-    let effort = match prompt_choice(cx, "generation effort", options.effort.id(), EFFORTS)? {
-        PromptSelection::Choice(effort) => effort,
-        PromptSelection::Custom => {
-            prompt_value(cx, "custom generation effort", options.effort.id())?
+    if args.generation_provider.is_none() {
+        const AGENTS: &[&str] = &["claude", "codex"];
+        let selected = prompt_choice(cx, "generation provider", kind.as_str(), AGENTS)?;
+        let PromptSelection::Choice(selected) = selected else {
+            return Err(Error::usage("generation provider must be claude or codex"));
+        };
+        let selected = AgentKind::parse(&selected)
+            .ok_or_else(|| Error::usage("generation provider must be claude or codex"))?;
+        if selected != kind {
+            kind = selected;
+            options.model = kind.economy_model();
         }
-    };
-    options.effort = Effort::parse(&effort).ok_or_else(|| {
-        Error::usage(format!(
-            "unknown effort {effort:?}; expected one of: low, medium, high, xhigh, max"
-        ))
-    })?;
+    }
+    if args.generation_model.is_none() {
+        options.model = prompt_agent_model(cx, "generation model", kind, &options.model, false)?;
+    }
+    if args.generation_effort.is_none() {
+        options.effort = prompt_required_effort(cx, "generation effort", options.effort)?;
+    }
     validate_provider_options(kind, &options.model, options.effort)?;
     Ok((kind, options))
+}
+
+fn prompt_agent_model(
+    cx: &mut Cx,
+    label: &str,
+    kind: AgentKind,
+    current: &AgentModel,
+    allow_default: bool,
+) -> Result<AgentModel> {
+    const CLAUDE_MODELS: &[&str] = &["default", "haiku", "sonnet", "opus"];
+    const CODEX_MODELS: &[&str] = &["default", "gpt-5.6-luna"];
+    let choices = match (kind, allow_default) {
+        (AgentKind::Claude, true) => CLAUDE_MODELS,
+        (AgentKind::Claude, false) => &CLAUDE_MODELS[1..],
+        (AgentKind::Codex, true) => CODEX_MODELS,
+        (AgentKind::Codex, false) => &CODEX_MODELS[1..],
+    };
+    let current = if *current == AgentModel::Default {
+        "default"
+    } else {
+        current.id()
+    };
+    let model = match prompt_choice(cx, label, current, choices)? {
+        PromptSelection::Choice(model) => model,
+        PromptSelection::Custom => prompt_value(cx, &format!("custom {label}"), current)?,
+    };
+    AgentModel::parse(&model)
+        .or_else(|| AgentModel::custom(&model))
+        .ok_or_else(|| Error::usage(format!("{label} must not be empty")))
+}
+
+fn prompt_required_effort(cx: &mut Cx, label: &str, current: Effort) -> Result<Effort> {
+    const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    let effort = match prompt_choice(cx, label, current.id(), EFFORTS)? {
+        PromptSelection::Choice(effort) => effort,
+        PromptSelection::Custom => prompt_value(cx, &format!("custom {label}"), current.id())?,
+    };
+    Effort::parse(&effort).ok_or_else(|| Error::usage(format!("unknown {label} {effort:?}")))
+}
+
+fn prompt_optional_effort(
+    cx: &mut Cx,
+    kind: AgentKind,
+    current: Option<Effort>,
+) -> Result<Option<Effort>> {
+    let mut choices = vec!["default"];
+    choices.extend(kind.efforts().iter().map(|effort| effort.id()));
+    let current = current.map_or("default", Effort::id);
+    let effort = match prompt_choice(cx, "work effort", current, &choices)? {
+        PromptSelection::Choice(effort) => effort,
+        PromptSelection::Custom => prompt_value(cx, "custom work effort", current)?,
+    };
+    if effort == "default" {
+        Ok(None)
+    } else {
+        Effort::parse(&effort)
+            .map(Some)
+            .ok_or_else(|| Error::usage(format!("unknown work effort {effort:?}")))
+    }
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -900,6 +1206,7 @@ mod tests {
             AgentKind::Claude,
             &AgentOptions::default(),
             Some("fix/42-selected"),
+            None,
         )
         .unwrap();
         assert_eq!(generated.branch, "fix/42-selected");
@@ -911,9 +1218,13 @@ mod tests {
     fn generation_options_are_selected_from_numbered_choices() {
         let mut test = test_cx(&[], "/work");
         test.cx.input = Box::new(CannedInput::new(&["", "2", "3"]));
-        let (_, options) =
-            edit_generation_options(&mut test.cx, AgentKind::Claude, AgentOptions::default())
-                .unwrap();
+        let (_, options) = edit_generation_options(
+            &mut test.cx,
+            &args(),
+            AgentKind::Claude,
+            AgentOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(options.model, AgentModel::Sonnet);
         assert_eq!(options.effort, Effort::High);
@@ -927,13 +1238,40 @@ mod tests {
     #[test]
     fn generation_options_accept_custom_model_and_extended_effort() {
         let mut test = test_cx(&[], "/work");
-        test.cx.input = Box::new(CannedInput::new(&["", "4", "claude-future", "4", "max"]));
-        let (_, options) =
-            edit_generation_options(&mut test.cx, AgentKind::Claude, AgentOptions::default())
-                .unwrap();
+        test.cx.input = Box::new(CannedInput::new(&["", "4", "claude-future", "5"]));
+        let (_, options) = edit_generation_options(
+            &mut test.cx,
+            &args(),
+            AgentKind::Claude,
+            AgentOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(options.model, AgentModel::Custom("claude-future".into()));
         assert_eq!(options.effort, Effort::Max);
+    }
+
+    #[test]
+    fn explicit_generation_flags_lock_every_generation_prompt() {
+        let mut test = test_cx(&[], "/work");
+        let mut explicit = args();
+        explicit.generation_provider = Some("claude".into());
+        explicit.generation_model = Some("sonnet".into());
+        explicit.generation_effort = Some("high".into());
+        let (kind, options) = edit_generation_options(
+            &mut test.cx,
+            &explicit,
+            AgentKind::Claude,
+            AgentOptions {
+                model: AgentModel::Sonnet,
+                effort: Effort::High,
+            },
+        )
+        .unwrap();
+        assert_eq!(kind, AgentKind::Claude);
+        assert_eq!(options.model, AgentModel::Sonnet);
+        assert_eq!(options.effort, Effort::High);
+        assert!(test.err.contents().is_empty());
     }
 
     #[test]
@@ -1017,21 +1355,21 @@ mod tests {
             brief: "Implement it.".into(),
             base: Some("main".into()),
             kind,
+            model: kind.default_model(),
+            effort: Some(Effort::Low),
+            name: None,
             command: None,
             dangerous: false,
             plan: false,
             launch: true,
-            options: AgentOptions {
-                model: kind.default_model(),
-                effort: Effort::Low,
-            },
         }
     }
 
     #[test]
     fn structured_launch_argv_maps_provider_modes() {
         let mut claude = setup(AgentKind::Claude);
-        claude.options.model = AgentModel::Opus;
+        claude.model = AgentModel::Opus;
+        claude.name = Some("issue 42".into());
         claude.dangerous = true;
         claude.plan = true;
         assert_eq!(
@@ -1040,6 +1378,10 @@ mod tests {
                 "claude",
                 "--model",
                 "opus",
+                "--effort",
+                "low",
+                "--name",
+                "issue 42",
                 "--dangerously-skip-permissions",
                 "--permission-mode",
                 "plan",
@@ -1048,12 +1390,15 @@ mod tests {
         );
 
         let mut codex = setup(AgentKind::Codex);
+        codex.model = AgentModel::Default;
         codex.dangerous = true;
         codex.plan = true;
         assert_eq!(
             launch_argv(&codex, "do it").unwrap(),
             vec![
                 "codex",
+                "-c",
+                "model_reasoning_effort=\"low\"",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "/plan do it",
             ]
@@ -1063,6 +1408,8 @@ mod tests {
     #[test]
     fn custom_launch_preserves_argv_and_appends_prompt_once() {
         let mut setup = setup(AgentKind::Claude);
+        setup.model = AgentModel::Default;
+        setup.effort = None;
         setup.command = Some("aider --model \"custom model\"".into());
         assert_eq!(
             launch_argv(&setup, "quoted $prompt").unwrap(),
@@ -1073,19 +1420,22 @@ mod tests {
     #[test]
     fn codex_selection_uses_default_model_and_rejects_max_effort() {
         let mut args = args();
-        args.agent = Some("codex".into());
+        args.generation_provider = Some("codex".into());
         let config = crate::config::Config {
-            agent_model: AgentModel::Opus,
+            agent_generation: crate::config::GenerationAgentConfig {
+                model: Some(AgentModel::Opus),
+                ..Default::default()
+            },
             ..crate::config::Config::default()
         };
-        let kind = resolve_agent_kind(&args, &config).unwrap();
-        let options = resolve_agent_options(&args, &config, kind).unwrap();
+        let kind = resolve_generation_kind(&args, &config).unwrap();
+        let options = resolve_generation_options(&args, &config, kind).unwrap();
         assert_eq!(kind, AgentKind::Codex);
-        assert_eq!(options.model, AgentModel::Default);
+        assert_eq!(options.model, AgentModel::Custom("gpt-5.6-luna".into()));
 
-        args.effort = Some("max".into());
+        args.generation_effort = Some("max".into());
         assert!(matches!(
-            resolve_agent_options(&args, &config, kind),
+            resolve_generation_options(&args, &config, kind),
             Err(Error::Usage(_))
         ));
     }
@@ -1095,13 +1445,21 @@ mod tests {
             target: Some("42".into()),
             branch: None,
             from: None,
-            agent: None,
-            agent_command: None,
-            model: None,
-            effort: None,
+            generation_provider: None,
+            generation_model: None,
+            generation_effort: None,
+            brief: None,
+            work_provider: None,
+            work_model: None,
+            work_effort: None,
+            work_name: None,
+            work_command: None,
+            launch: false,
             no_launch: true,
-            dangerous: false,
-            plan: false,
+            work_dangerous: false,
+            no_work_dangerous: false,
+            work_plan: false,
+            no_work_plan: false,
             no_switch: true,
             no_hooks: true,
             copy_from: None,
@@ -1135,6 +1493,49 @@ mod tests {
                 .trim(),
             "Open agent"
         );
+        let output = test.err.contents();
+        assert!(output.contains("Generation\n"));
+        assert!(output.contains("Provider: Codex"));
+        assert!(output.contains("gpt-5.6-luna"));
+        assert!(output.contains("Work provider: Claude"));
+    }
+
+    #[test]
+    fn explicit_branch_and_brief_skip_unavailable_generator() {
+        let repo = TestRepo::init();
+        let mut test = test_cx(&[], repo.root().to_str().unwrap());
+        test.cx.assume_yes = true;
+        test.cx.gh = Arc::new(FakeGh::default().with_issue(issue()));
+        test.cx.agent = Arc::new(FakeAgent::unavailable());
+        let mut explicit = args();
+        explicit.branch = Some("feat/42-manual".into());
+        explicit.brief = Some("Implement the manual setup and test it.".into());
+
+        assert_eq!(
+            run(&mut test.cx, &crate::hooks::RealHookRunner, &explicit).unwrap(),
+            0
+        );
+        assert!(wt_dir(&repo, "feat-42-manual").exists());
+        assert!(test.err.contents().contains("Generation: skipped"));
+    }
+
+    #[test]
+    fn work_defaults_delegate_model_and_effort_to_claude() {
+        let resolved =
+            resolve_work_options(&args(), &crate::config::Config::default(), 42).unwrap();
+        assert_eq!(resolved.kind, AgentKind::Claude);
+        assert_eq!(resolved.model, AgentModel::Default);
+        assert_eq!(resolved.effort, None);
+        assert_eq!(resolved.name.as_deref(), Some("wt issue #42"));
+    }
+
+    #[test]
+    fn codex_rejects_a_session_display_name_before_launch() {
+        let mut named = args();
+        named.work_provider = Some("codex".into());
+        named.work_name = Some("issue 42".into());
+        let resolved = resolve_work_options(&named, &crate::config::Config::default(), 42).unwrap();
+        assert!(validate_work_options(&resolved).is_err());
     }
 
     #[test]

@@ -48,9 +48,9 @@ impl AgentModel {
     pub fn label(&self) -> &str {
         match self {
             AgentModel::Default => "Default",
-            AgentModel::Opus => "Opus 4.8",
-            AgentModel::Sonnet => "Sonnet 4.6",
-            AgentModel::Haiku => "Haiku 4.5",
+            AgentModel::Opus => "Opus",
+            AgentModel::Sonnet => "Sonnet",
+            AgentModel::Haiku => "Haiku",
             AgentModel::Custom(id) => id,
         }
     }

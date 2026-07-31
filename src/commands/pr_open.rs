@@ -315,25 +315,25 @@ pub(crate) fn resolve_agent_options(
     args: &PrOpenArgs,
     config: &Config,
 ) -> Result<(AgentKind, AgentOptions)> {
-    let kind = match &args.agent {
+    let kind = match &args.generation_provider {
         Some(value) => AgentKind::parse(value)
             .ok_or_else(|| Error::usage("unknown --agent; expected one of: claude, codex"))?,
-        None => config.agent_kind,
+        None => config.agent_generation.provider,
     };
-    let model = match &args.model {
+    let model = match &args.generation_model {
         Some(model) => AgentModel::parse(model)
             .or_else(|| AgentModel::custom(model))
             .ok_or_else(|| Error::usage("--model must not be empty"))?,
-        None if args.agent.is_some() => kind.default_model(),
-        None => config.effective_agent_model(),
+        None if args.generation_provider.is_some() => kind.economy_model(),
+        None => config.agent_generation.effective_model(),
     };
-    let effort = match &args.effort {
+    let effort = match &args.generation_effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
             Error::usage(format!(
                 "unknown --effort {e:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
-        None => config.agent_effort,
+        None => config.agent_generation.effort,
     };
     crate::commands::issue::validate_provider_options(kind, &model, effort)?;
     Ok((kind, AgentOptions { model, effort }))
@@ -767,8 +767,11 @@ mod tests {
     #[test]
     fn resolve_agent_options_flags_override_config() {
         let config = Config {
-            agent_model: AgentModel::Haiku,
-            agent_effort: Effort::Low,
+            agent_generation: crate::config::GenerationAgentConfig {
+                provider: AgentKind::Claude,
+                model: Some(AgentModel::Haiku),
+                effort: Effort::Low,
+            },
             ..Config::default()
         };
         // No flags: config defaults win.
@@ -777,8 +780,8 @@ mod tests {
         assert_eq!(opts.effort, Effort::Low);
         // Flags override.
         let mut args = open_args(None);
-        args.model = Some("opus".into());
-        args.effort = Some("high".into());
+        args.generation_model = Some("opus".into());
+        args.generation_effort = Some("high".into());
         let (_, opts) = resolve_agent_options(&args, &config).unwrap();
         assert_eq!(opts.model, AgentModel::Opus);
         assert_eq!(opts.effort, Effort::High);
@@ -787,10 +790,10 @@ mod tests {
     #[test]
     fn codex_flag_selects_provider_default_model() {
         let mut args = open_args(None);
-        args.agent = Some("codex".into());
+        args.generation_provider = Some("codex".into());
         let (kind, options) = resolve_agent_options(&args, &Config::default()).unwrap();
         assert_eq!(kind, AgentKind::Codex);
-        assert_eq!(options.model, AgentModel::Default);
+        assert_eq!(options.model, AgentModel::Custom("gpt-5.6-luna".into()));
 
         let agent = FakeAgent::drafting("T\n\nB");
         let dir = tempfile::tempdir().unwrap();
@@ -808,11 +811,11 @@ mod tests {
     #[test]
     fn resolve_agent_options_accepts_custom_models_and_rejects_unknown_effort() {
         let mut args = open_args(None);
-        args.model = Some("gpt".into());
+        args.generation_model = Some("gpt".into());
         let (_, options) = resolve_agent_options(&args, &Config::default()).unwrap();
         assert_eq!(options.model, AgentModel::Custom("gpt".into()));
         let mut args = open_args(None);
-        args.effort = Some("extreme".into());
+        args.generation_effort = Some("extreme".into());
         assert!(matches!(
             resolve_agent_options(&args, &Config::default()),
             Err(Error::Usage(_))
@@ -826,9 +829,9 @@ mod tests {
             body_file: None,
             draft: false,
             ai: false,
-            agent: None,
-            model: None,
-            effort: None,
+            generation_provider: None,
+            generation_model: None,
+            generation_effort: None,
             base: None,
             update: false,
             new: false,

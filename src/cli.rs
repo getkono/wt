@@ -164,31 +164,58 @@ pub(crate) struct IssueArgs {
     /// Base ref for a newly created branch (default: the repo's default branch).
     #[arg(long, value_name = "REF")]
     pub(crate) from: Option<String>,
-    /// AI provider for setup generation and the launched coding session.
+    /// AI provider used to generate missing branch/brief values.
     #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
-    pub(crate) agent: Option<String>,
-    /// Foreground coding-agent command (overrides `agent.command`).
-    #[arg(
-        long = "agent-command",
-        value_name = "COMMAND",
-        conflicts_with_all = ["agent", "dangerous", "plan"]
-    )]
-    pub(crate) agent_command: Option<String>,
-    /// Provider-specific model for generation and the launched coding session.
+    pub(crate) generation_provider: Option<String>,
+    /// Model used to generate missing branch/brief values.
     #[arg(long, value_name = "MODEL")]
-    pub(crate) model: Option<String>,
-    /// Effort for AI generation: `low`, `medium`, `high`, `xhigh`, or `max`.
+    pub(crate) generation_model: Option<String>,
+    /// Effort used to generate missing branch/brief values.
     #[arg(long, value_name = "LEVEL")]
-    pub(crate) effort: Option<String>,
+    pub(crate) generation_effort: Option<String>,
+    /// Override the AI-generated implementation brief.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) brief: Option<String>,
+    /// Provider for the foreground coding session.
+    #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
+    pub(crate) work_provider: Option<String>,
+    /// Provider-specific model for the foreground coding session.
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) work_model: Option<String>,
+    /// Effort for the foreground coding session, or `default`.
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) work_effort: Option<String>,
+    /// Display name for the foreground Claude session.
+    #[arg(long, value_name = "NAME", conflicts_with = "work_command")]
+    pub(crate) work_name: Option<String>,
+    /// Foreground coding-agent command (overrides `agent.work.command`).
+    #[arg(
+        long = "work-command",
+        value_name = "COMMAND",
+        conflicts_with_all = [
+            "work_provider", "work_model", "work_effort", "work_name",
+            "work_plan", "no_work_plan", "work_dangerous", "no_work_dangerous"
+        ]
+    )]
+    pub(crate) work_command: Option<String>,
+    /// Explicitly launch the coding agent after preparation.
+    #[arg(long, conflicts_with = "no_launch")]
+    pub(crate) launch: bool,
     /// Prepare the worktree without launching the coding agent.
     #[arg(long = "no-launch")]
     pub(crate) no_launch: bool,
-    /// Launch the coding agent without its approval/permission safeguards.
-    #[arg(long)]
-    pub(crate) dangerous: bool,
+    /// Launch the work agent without its approval/permission safeguards.
+    #[arg(long, conflicts_with = "no_work_dangerous")]
+    pub(crate) work_dangerous: bool,
+    /// Explicitly retain the work agent's normal safeguards.
+    #[arg(long, conflicts_with = "work_dangerous")]
+    pub(crate) no_work_dangerous: bool,
     /// Launch the coding agent in planning mode.
-    #[arg(long)]
-    pub(crate) plan: bool,
+    #[arg(long, conflicts_with = "no_work_plan")]
+    pub(crate) work_plan: bool,
+    /// Explicitly start the work agent in execution mode.
+    #[arg(long, conflicts_with = "work_plan")]
+    pub(crate) no_work_plan: bool,
     /// Do not switch into the issue worktree.
     #[arg(long = "no-switch")]
     pub(crate) no_switch: bool,
@@ -390,14 +417,14 @@ pub(crate) struct PrOpenArgs {
     pub(crate) ai: bool,
     /// AI provider for drafting: `claude` or `codex`.
     #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
-    pub(crate) agent: Option<String>,
+    pub(crate) generation_provider: Option<String>,
     /// Provider-specific model for `--ai` drafting (overrides `agent.model`).
     #[arg(long, value_name = "MODEL")]
-    pub(crate) model: Option<String>,
+    pub(crate) generation_model: Option<String>,
     /// Effort for `--ai` drafting: `low`, `medium`, `high`, `xhigh`, or `max` (overrides
     /// `agent.effort`; default `low`).
     #[arg(long, value_name = "LEVEL")]
-    pub(crate) effort: Option<String>,
+    pub(crate) generation_effort: Option<String>,
     /// Override the base/trunk branch to target.
     #[arg(long, value_name = "REF")]
     pub(crate) base: Option<String>,
@@ -811,11 +838,21 @@ mod tests {
             }
             _ => panic!("expected pr"),
         }
-        // `pr open --title X --draft --ai --agent codex ...` -> the open
+        // `pr open --title X --draft --ai --generation-provider codex ...`
         // sub-form with its flags, including the model/effort overrides.
         let cli = parse(&[
-            "pr", "open", "--title", "X", "--draft", "--ai", "--agent", "codex", "--model",
-            "gpt-5", "--effort", "high",
+            "pr",
+            "open",
+            "--title",
+            "X",
+            "--draft",
+            "--ai",
+            "--generation-provider",
+            "codex",
+            "--generation-model",
+            "gpt-5",
+            "--generation-effort",
+            "high",
         ])
         .unwrap();
         match cli.command {
@@ -824,9 +861,9 @@ mod tests {
                     assert_eq!(o.title.as_deref(), Some("X"));
                     assert!(o.draft);
                     assert!(o.ai);
-                    assert_eq!(o.agent.as_deref(), Some("codex"));
-                    assert_eq!(o.model.as_deref(), Some("gpt-5"));
-                    assert_eq!(o.effort.as_deref(), Some("high"));
+                    assert_eq!(o.generation_provider.as_deref(), Some("codex"));
+                    assert_eq!(o.generation_model.as_deref(), Some("gpt-5"));
+                    assert_eq!(o.generation_effort.as_deref(), Some("high"));
                     assert!(!o.update && !o.new);
                 }
                 _ => panic!("expected pr open"),
@@ -844,26 +881,36 @@ mod tests {
         let cli = parse(&[
             "issue",
             "42",
-            "--agent",
+            "--work-provider",
             "codex",
-            "--model",
+            "--work-model",
             "gpt-5",
-            "--dangerous",
-            "--plan",
+            "--work-dangerous",
+            "--work-plan",
         ])
         .unwrap();
         let Some(Command::Issue(args)) = cli.command else {
             panic!("expected issue");
         };
-        assert_eq!(args.agent.as_deref(), Some("codex"));
-        assert_eq!(args.model.as_deref(), Some("gpt-5"));
-        assert!(args.dangerous);
-        assert!(args.plan);
+        assert_eq!(args.work_provider.as_deref(), Some("codex"));
+        assert_eq!(args.work_model.as_deref(), Some("gpt-5"));
+        assert!(args.work_dangerous);
+        assert!(args.work_plan);
 
-        assert!(parse(&["issue", "42", "--agent", "other"]).is_err());
-        assert!(parse(&["issue", "42", "--agent-command", "aider", "--dangerous"]).is_err());
-        // Existing generation controls remain usable with a custom launcher.
-        assert!(parse(&["issue", "42", "--agent-command", "aider", "--model", "opus"]).is_ok());
+        assert!(parse(&["issue", "42", "--work-provider", "other"]).is_err());
+        assert!(parse(&["issue", "42", "--work-command", "aider", "--work-dangerous"]).is_err());
+        assert!(
+            parse(&[
+                "issue",
+                "42",
+                "--work-command",
+                "aider",
+                "--generation-model",
+                "opus"
+            ])
+            .is_ok()
+        );
+        assert!(parse(&["issue", "42", "--agent", "claude"]).is_err());
     }
 
     #[test]

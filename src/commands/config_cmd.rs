@@ -23,10 +23,17 @@ const KEYS: &[&str] = &[
     "remove.delete_merged_branch",
     "remove.untracked_blocks",
     "pr.default_remote",
-    "agent.provider",
-    "agent.command",
-    "agent.model",
-    "agent.effort",
+    "agent.generation.provider",
+    "agent.generation.model",
+    "agent.generation.effort",
+    "agent.work.provider",
+    "agent.work.model",
+    "agent.work.effort",
+    "agent.work.name",
+    "agent.work.command",
+    "agent.work.launch",
+    "agent.work.plan",
+    "agent.work.dangerous",
     "list.show_untracked",
     "list.columns",
     "ui.nerd_fonts",
@@ -200,10 +207,14 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "hooks.post_create"
         | "hooks.pre_remove"
         | "pr.default_remote"
-        | "agent.provider"
-        | "agent.command"
-        | "agent.model"
-        | "agent.effort"
+        | "agent.generation.provider"
+        | "agent.generation.model"
+        | "agent.generation.effort"
+        | "agent.work.provider"
+        | "agent.work.model"
+        | "agent.work.effort"
+        | "agent.work.name"
+        | "agent.work.command"
         | "ui.color"
         | "ui.theme.preset"
         | "ui.theme.accent"
@@ -220,7 +231,10 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "remove.untracked_blocks"
         | "list.show_untracked"
         | "ui.nerd_fonts"
-        | "ui.mouse" => KeyType::Bool,
+        | "ui.mouse"
+        | "agent.work.launch"
+        | "agent.work.plan"
+        | "agent.work.dangerous" => KeyType::Bool,
         "copy" | "list.columns" => KeyType::StrArray,
         _ => return None,
     })
@@ -239,13 +253,42 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "remove.delete_merged_branch" => Some(config.remove_delete_merged_branch.to_string()),
         "remove.untracked_blocks" => Some(config.remove_untracked_blocks.to_string()),
         "pr.default_remote" => Some(config.pr_default_remote.clone()),
-        "agent.provider" => Some(config.agent_kind.as_str().to_string()),
-        "agent.command" => config.agent_command.clone(),
-        "agent.model" => {
-            let model = config.effective_agent_model();
-            (!model.id().is_empty()).then(|| model.id().to_string())
-        }
-        "agent.effort" => Some(config.agent_effort.id().to_string()),
+        "agent.generation.provider" => Some(config.agent_generation.provider.as_str().to_string()),
+        "agent.generation.model" => Some(
+            config
+                .agent_generation
+                .model
+                .as_ref()
+                .map_or("economy", |model| {
+                    if *model == crate::agent::AgentModel::Default {
+                        "default"
+                    } else {
+                        model.id()
+                    }
+                })
+                .to_string(),
+        ),
+        "agent.generation.effort" => Some(config.agent_generation.effort.id().to_string()),
+        "agent.work.provider" => Some(config.agent_work.provider.as_str().to_string()),
+        "agent.work.model" => Some(
+            if config.agent_work.model == crate::agent::AgentModel::Default {
+                "default".to_string()
+            } else {
+                config.agent_work.model.id().to_string()
+            },
+        ),
+        "agent.work.effort" => Some(
+            config
+                .agent_work
+                .effort
+                .map_or("default", crate::agent::Effort::id)
+                .to_string(),
+        ),
+        "agent.work.name" => config.agent_work.name.clone(),
+        "agent.work.command" => config.agent_work.command.clone(),
+        "agent.work.launch" => Some(config.agent_work.launch.to_string()),
+        "agent.work.plan" => Some(config.agent_work.plan.to_string()),
+        "agent.work.dangerous" => Some(config.agent_work.dangerous.to_string()),
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),
         "list.columns" => Some(
             config
@@ -292,6 +335,9 @@ fn config_json_value(config: &Config, key: &str) -> serde_json::Value {
         "list.show_untracked" => Value::from(config.list_show_untracked),
         "ui.nerd_fonts" => Value::from(config.ui_nerd_fonts),
         "ui.mouse" => Value::from(config.ui_mouse),
+        "agent.work.launch" => Value::from(config.agent_work.launch),
+        "agent.work.plan" => Value::from(config.agent_work.plan),
+        "agent.work.dangerous" => Value::from(config.agent_work.dangerous),
         _ => match config_value(config, key) {
             Ok(Some(v)) => Value::from(v),
             _ => Value::Null,
@@ -391,23 +437,23 @@ mod tests {
     #[test]
     fn agent_model_and_effort_roundtrip_and_validate() {
         let repo = TestRepo::init();
-        // Default value is the resolved Haiku/low.
+        // Generation defaults to the provider-aware economy model.
         let (_, out, _) = run(
             &repo,
             &[],
             ConfigAction::Get {
-                key: "agent.model".into(),
+                key: "agent.generation.model".into(),
             },
             false,
             false,
         );
-        assert_eq!(out.trim(), "haiku");
+        assert_eq!(out.trim(), "economy");
         // Set + get a valid model.
         run(
             &repo,
             &[],
             ConfigAction::Set {
-                key: "agent.model".into(),
+                key: "agent.generation.model".into(),
                 value: "opus".into(),
             },
             false,
@@ -417,7 +463,7 @@ mod tests {
             &repo,
             &[],
             ConfigAction::Get {
-                key: "agent.model".into(),
+                key: "agent.generation.model".into(),
             },
             false,
             false,
@@ -429,7 +475,7 @@ mod tests {
             &mut t.cx,
             &ConfigArgs {
                 action: ConfigAction::Set {
-                    key: "agent.effort".into(),
+                    key: "agent.generation.effort".into(),
                     value: "extreme".into(),
                 },
                 global: false,
@@ -447,7 +493,7 @@ mod tests {
             &repo,
             &[],
             ConfigAction::Set {
-                key: "agent.provider".into(),
+                key: "agent.generation.provider".into(),
                 value: "codex".into(),
             },
             false,
@@ -457,7 +503,7 @@ mod tests {
             &repo,
             &[],
             ConfigAction::Get {
-                key: "agent.provider".into(),
+                key: "agent.generation.provider".into(),
             },
             false,
             false,
@@ -467,12 +513,12 @@ mod tests {
             &repo,
             &[],
             ConfigAction::Get {
-                key: "agent.model".into(),
+                key: "agent.generation.model".into(),
             },
             false,
             false,
         );
-        assert!(model.trim().is_empty());
+        assert_eq!(model.trim(), "economy");
     }
 
     #[test]

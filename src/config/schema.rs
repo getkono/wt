@@ -31,6 +31,72 @@ pub enum SubmoduleInit {
     Always,
 }
 
+/// Defaults used by non-interactive code-agent generation tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationAgentConfig {
+    /// Provider used for generated text.
+    pub provider: AgentKind,
+    /// Model override; `None` selects the provider's cheapest supported model.
+    pub model: Option<AgentModel>,
+    /// Reasoning effort used for generation.
+    pub effort: Effort,
+}
+
+impl Default for GenerationAgentConfig {
+    fn default() -> Self {
+        Self {
+            provider: AgentKind::Codex,
+            model: None,
+            effort: Effort::Low,
+        }
+    }
+}
+
+impl GenerationAgentConfig {
+    /// Resolves the configured model or the selected provider's economical model.
+    pub fn effective_model(&self) -> AgentModel {
+        self.model
+            .clone()
+            .unwrap_or_else(|| self.provider.economy_model())
+    }
+}
+
+/// Defaults used by the interactive coding agent opened for an issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkAgentConfig {
+    /// Provider used for implementation work.
+    pub provider: AgentKind,
+    /// Model override; [`AgentModel::Default`] leaves selection to the provider.
+    pub model: AgentModel,
+    /// Effort override; `None` leaves selection to the provider.
+    pub effort: Option<Effort>,
+    /// Optional Claude session display name.
+    pub name: Option<String>,
+    /// Optional custom foreground command in place of a structured provider.
+    pub command: Option<String>,
+    /// Whether the foreground agent is launched after worktree creation.
+    pub launch: bool,
+    /// Whether the foreground agent starts in planning mode.
+    pub plan: bool,
+    /// Whether the foreground agent bypasses its safeguards.
+    pub dangerous: bool,
+}
+
+impl Default for WorkAgentConfig {
+    fn default() -> Self {
+        Self {
+            provider: AgentKind::Claude,
+            model: AgentModel::Default,
+            effort: None,
+            name: None,
+            command: None,
+            launch: true,
+            plan: false,
+            dangerous: false,
+        }
+    }
+}
+
 impl SubmoduleInit {
     /// Parses a `submodules.init` value (`prompt`, `never`, `always`).
     pub fn parse(value: &str) -> Option<SubmoduleInit> {
@@ -67,16 +133,10 @@ pub struct Config {
     pub pr_default_remote: String,
     /// When to auto-initialize git submodules on create/checkout (issue #50).
     pub submodules_init: SubmoduleInit,
-    /// Default AI provider for generation and structured issue-agent launches.
-    pub agent_kind: AgentKind,
-    /// Default model for code-agent generation; overridable per-invocation by
-    /// `--model` or the TUI's `Ctrl-M` key.
-    pub agent_model: AgentModel,
-    /// Default generation effort; overridable by `--effort` or the TUI's
-    /// `Ctrl-E` key.
-    pub agent_effort: Effort,
-    /// Optional custom foreground coding-agent command for `wt issue`.
-    pub agent_command: Option<String>,
+    /// Defaults for issue setup and PR drafting generation.
+    pub agent_generation: GenerationAgentConfig,
+    /// Defaults for the foreground coding agent opened by `wt issue`.
+    pub agent_work: WorkAgentConfig,
     /// Show `?` in the dirty column for untracked files.
     pub list_show_untracked: bool,
     /// Ordered list of columns to display in `wt list`.
@@ -108,10 +168,8 @@ impl Default for Config {
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
             submodules_init: SubmoduleInit::default(),
-            agent_kind: AgentKind::Claude,
-            agent_model: AgentModel::Default,
-            agent_effort: Effort::default(),
-            agent_command: None,
+            agent_generation: GenerationAgentConfig::default(),
+            agent_work: WorkAgentConfig::default(),
             list_show_untracked: true,
             list_columns: Column::ALL.to_vec(),
             ui_nerd_fonts: false,
@@ -125,16 +183,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Resolves the configured model, falling back to the selected provider's
-    /// economical/default choice when `agent.model` is not explicitly set.
-    pub fn effective_agent_model(&self) -> AgentModel {
-        if self.agent_model == AgentModel::Default {
-            self.agent_kind.default_model()
-        } else {
-            self.agent_model.clone()
-        }
-    }
-
     /// Applies a parsed layer on top of this config (spec §11 merge semantics):
     /// scalars replace, arrays (`copy`, `list.columns`) replace wholesale,
     /// `ui.keybindings` deep-merges per action, and the `[ui.theme]` colors
@@ -171,17 +219,38 @@ impl Config {
         if let Some(v) = layer.submodules_init {
             self.submodules_init = v;
         }
-        if let Some(v) = layer.agent_kind {
-            self.agent_kind = v;
+        if let Some(v) = layer.agent_generation_provider {
+            self.agent_generation.provider = v;
         }
-        if let Some(v) = layer.agent_model {
-            self.agent_model = v;
+        if let Some(v) = layer.agent_generation_model {
+            self.agent_generation.model = v;
         }
-        if let Some(v) = layer.agent_effort {
-            self.agent_effort = v;
+        if let Some(v) = layer.agent_generation_effort {
+            self.agent_generation.effort = v;
         }
-        if let Some(v) = layer.agent_command {
-            self.agent_command = Some(v);
+        if let Some(v) = layer.agent_work_provider {
+            self.agent_work.provider = v;
+        }
+        if let Some(v) = layer.agent_work_model {
+            self.agent_work.model = v;
+        }
+        if let Some(v) = layer.agent_work_effort {
+            self.agent_work.effort = v;
+        }
+        if let Some(v) = layer.agent_work_name {
+            self.agent_work.name = Some(v);
+        }
+        if let Some(v) = layer.agent_work_command {
+            self.agent_work.command = Some(v);
+        }
+        if let Some(v) = layer.agent_work_launch {
+            self.agent_work.launch = v;
+        }
+        if let Some(v) = layer.agent_work_plan {
+            self.agent_work.plan = v;
+        }
+        if let Some(v) = layer.agent_work_dangerous {
+            self.agent_work.dangerous = v;
         }
         if let Some(v) = layer.list_show_untracked {
             self.list_show_untracked = v;
@@ -259,14 +328,28 @@ pub struct ConfigLayer {
     pub pr_default_remote: Option<String>,
     /// `submodules.init`.
     pub submodules_init: Option<SubmoduleInit>,
-    /// `agent.provider`.
-    pub agent_kind: Option<AgentKind>,
-    /// `agent.model`.
-    pub agent_model: Option<AgentModel>,
-    /// `agent.effort`.
-    pub agent_effort: Option<Effort>,
-    /// Optional `agent.command`.
-    pub agent_command: Option<String>,
+    /// `agent.generation.provider`.
+    pub agent_generation_provider: Option<AgentKind>,
+    /// `agent.generation.model`.
+    pub agent_generation_model: Option<Option<AgentModel>>,
+    /// `agent.generation.effort`.
+    pub agent_generation_effort: Option<Effort>,
+    /// `agent.work.provider`.
+    pub agent_work_provider: Option<AgentKind>,
+    /// `agent.work.model`.
+    pub agent_work_model: Option<AgentModel>,
+    /// `agent.work.effort`.
+    pub agent_work_effort: Option<Option<Effort>>,
+    /// `agent.work.name`.
+    pub agent_work_name: Option<String>,
+    /// `agent.work.command`.
+    pub agent_work_command: Option<String>,
+    /// `agent.work.launch`.
+    pub agent_work_launch: Option<bool>,
+    /// `agent.work.plan`.
+    pub agent_work_plan: Option<bool>,
+    /// `agent.work.dangerous`.
+    pub agent_work_dangerous: Option<bool>,
     /// `list.show_untracked`.
     pub list_show_untracked: Option<bool>,
     /// `list.columns`.
@@ -376,11 +459,16 @@ mod tests {
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
         assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
-        assert_eq!(c.agent_kind, AgentKind::Claude);
-        assert_eq!(c.agent_model, AgentModel::Default);
-        assert_eq!(c.effective_agent_model(), AgentModel::Haiku);
-        assert_eq!(c.agent_effort, Effort::Low);
-        assert!(c.agent_command.is_none());
+        assert_eq!(c.agent_generation.provider, AgentKind::Codex);
+        assert_eq!(
+            c.agent_generation.effective_model(),
+            AgentModel::Custom("gpt-5.6-luna".into())
+        );
+        assert_eq!(c.agent_generation.effort, Effort::Low);
+        assert_eq!(c.agent_work.provider, AgentKind::Claude);
+        assert_eq!(c.agent_work.model, AgentModel::Default);
+        assert!(c.agent_work.effort.is_none());
+        assert!(c.agent_work.command.is_none());
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());
         assert!(!c.ui_nerd_fonts);
@@ -432,8 +520,10 @@ mod tests {
             remove_delete_merged_branch: Some(false),
             remove_untracked_blocks: Some(true),
             submodules_init: Some(SubmoduleInit::Always),
-            agent_model: Some(AgentModel::Haiku),
-            agent_effort: Some(Effort::Low),
+            agent_generation_model: Some(Some(AgentModel::Haiku)),
+            agent_generation_effort: Some(Effort::Low),
+            agent_work_provider: Some(AgentKind::Codex),
+            agent_work_effort: Some(Some(Effort::High)),
             list_show_untracked: Some(false),
             ui_nerd_fonts: Some(true),
             ui_color: Some(ColorChoice::Never),
@@ -447,8 +537,10 @@ mod tests {
         assert!(!c.remove_delete_merged_branch);
         assert!(c.remove_untracked_blocks);
         assert_eq!(c.submodules_init, SubmoduleInit::Always);
-        assert_eq!(c.agent_model, AgentModel::Haiku);
-        assert_eq!(c.agent_effort, Effort::Low);
+        assert_eq!(c.agent_generation.model, Some(AgentModel::Haiku));
+        assert_eq!(c.agent_generation.effort, Effort::Low);
+        assert_eq!(c.agent_work.provider, AgentKind::Codex);
+        assert_eq!(c.agent_work.effort, Some(Effort::High));
         assert!(!c.list_show_untracked);
         assert!(c.ui_nerd_fonts);
         assert_eq!(c.ui_color, ColorChoice::Never);

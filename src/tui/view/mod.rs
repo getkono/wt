@@ -600,9 +600,9 @@ mod tests {
         });
         let text = render_to_text(&a, 100, 30);
         // Every model option is listed, the active field marked with `>`.
-        assert!(text.contains("Opus 4.8"));
-        assert!(text.contains("Sonnet 4.6"));
-        assert!(text.contains("Haiku 4.5"));
+        assert!(text.contains("Opus"));
+        assert!(text.contains("Sonnet"));
+        assert!(text.contains("Haiku"));
         assert!(text.contains("> model:"));
     }
 
@@ -680,7 +680,7 @@ mod tests {
         // The AI-fill controls and the selected model/effort are shown.
         assert!(text.contains("Ctrl-A"));
         assert!(text.contains("model:"));
-        assert!(text.contains("Haiku 4.5")); // the default model label
+        assert!(text.contains("Haiku")); // the default model label
         assert!(text.contains("effort:"));
     }
 
@@ -697,7 +697,7 @@ mod tests {
             ..Default::default()
         });
         let text = render_to_text(&a, 100, 30);
-        assert!(text.contains("Opus 4.8"));
+        assert!(text.contains("Opus"));
         assert!(text.contains("high"));
     }
 

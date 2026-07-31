@@ -79,6 +79,14 @@ impl AgentKind {
         }
     }
 
+    /// The cheapest supported model suitable for focused generation tasks.
+    pub fn economy_model(self) -> AgentModel {
+        match self {
+            AgentKind::Claude => AgentModel::Haiku,
+            AgentKind::Codex => AgentModel::Custom("gpt-5.6-luna".to_string()),
+        }
+    }
+
     /// Curated models shown by the TUI for this provider.
     pub fn models(self) -> &'static [AgentModel] {
         const CLAUDE: &[AgentModel] = &[AgentModel::Opus, AgentModel::Sonnet, AgentModel::Haiku];
