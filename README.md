@@ -101,31 +101,41 @@ These are the things worth knowing up front; the rest is discoverable from
 `--help` and the TUI.
 
 - **Open an agent for an issue.** `wt issue 123` fetches the issue's title, body,
-  labels, type, and milestone, then uses the configured text agent to propose a
-  conventional `type/123-slug` branch and concise implementation brief. You can
-  edit every setup value and must explicitly approve before `wt` creates or
-  reuses the linked worktree, records the issue metadata, and launches Claude
-  Code or Codex there. `--agent claude|codex` switches both setup generation and
-  the foreground coding session; `--model` accepts a provider-specific model
-  identifier. Interactive setup presents provider, model, effort, planning, and
-  dangerous-mode choices, plus local and remote-tracking branches for the base.
-  For example:
+  labels, type, and milestone, then uses a focused generation profile to propose
+  a conventional `type/123-slug` branch and concise implementation brief. A
+  separate work profile controls the foreground coding session. By default,
+  inexpensive Codex (`gpt-5.6-luna`, low effort) generates setup while Claude
+  Code chooses its own model and effort for the implementation work.
+
+  Generation and work flags are deliberately separate, so an override cannot
+  leak into the other task. Each explicit flag locks only its own field in the
+  interactive editor; the final grouped approval still shows every resolved
+  value before anything is created or launched. `-y` accepts that review
+  non-interactively. Before each slow task, `wt` prints its provider, model,
+  effort, and expected output, then shows a terminal spinner (or stable progress
+  lines when redirected). For example:
 
   ```bash
-  wt issue 123 --agent codex --plan
-  wt issue 123 --agent codex --model gpt-5 --dangerous
-  wt issue 123 --agent claude --model opus --plan
+  wt issue 123 --generation-provider claude --generation-model haiku
+  wt issue 123 --work-provider codex --work-model gpt-5.6-luna --work-plan
+  wt issue 123 --work-name "issue-123-login" --work-effort high
+  wt issue 123 --branch feat/123-login --brief "Implement login and test it" -y
   ```
 
-  `--dangerous` maps to each provider's full permission-bypass mode; use it only
-  in an externally isolated environment. `--plan` starts Claude in its plan
-  permission mode and starts Codex with an inline `/plan` request. Use
-  `--no-launch` to prepare only, `--agent-command` (or `agent.command`) for an
-  arbitrary foreground tool, and global `-y` to accept defaults
-  non-interactively. The custom-command escape hatch keeps generation settings
-  but does not receive structured plan/danger flags.
+  Supplying both `--branch` and `--brief` skips generation entirely. Linked
+  issues also reuse their branch without generation. `--work-name` sets
+  Claude's session display name (the default is `wt issue #123`); Codex and
+  custom commands reject it because they cannot honor the setting.
+  `--work-dangerous` maps to each provider's full permission-bypass mode; use it
+  only in an externally isolated environment. `--work-plan` starts Claude in
+  plan permission mode and starts Codex with an inline `/plan` request. Use
+  `--no-launch` to prepare only or `--work-command` for an arbitrary foreground
+  tool. A custom command is intentionally incompatible with structured work
+  provider/model/effort/name/plan/dangerous flags, so the launch contract stays
+  unambiguous. Agent availability is checked before worktree mutation.
   In the dashboard, press `i` to pick an open issue; the dashboard returns and
-  focuses its worktree when the agent exits.
+  focuses its worktree when the agent exits. Issue and PR pickers animate while
+  their GitHub data is loading.
 - **See every branch, not just worktrees.** The TUI lists your worktrees first,
   then — dimmed beneath them — any local branch that has no worktree, each with how
   far it is ahead/behind its base. Select one and press `Enter` to create a
@@ -137,10 +147,11 @@ These are the things worth knowing up front; the rest is discoverable from
   to filter, `↑/↓` to pick, `Enter` to accept, or just type a brand-new name. The
   PR compose form's provider, model, and effort fields list their choices the
   same way. `Ctrl-P`, `Ctrl-M`, and `Ctrl-E` cycle them quickly.
-- **Draft PRs with Claude or Codex.** `wt pr open --ai --agent codex` uses Codex
-  for title/body generation; omit `--agent` to use `agent.provider`. Both CLI
-  providers run through isolated `agent-text` generation, while the TUI exposes
-  the same provider picker.
+- **Draft PRs with Claude or Codex.** `wt pr open --ai` uses the same generation
+  profile as issue setup. Override one draft with `--generation-provider`,
+  `--generation-model`, or `--generation-effort`. Both CLI providers run through
+  isolated `agent-text` generation, while the TUI exposes the same provider,
+  model, and effort pickers.
 - **Where worktrees are created.** New worktrees follow a configurable path
   template. The default keeps them beside the repo, out of it, and prefixes each
   worktree directory with the repo name so it's obvious which repo you're in:
@@ -179,15 +190,30 @@ These are the things worth knowing up front; the rest is discoverable from
   a global user config, managed with `wt config get|set|list|edit` (`--global` for
   the user config); precedence is flags > repo > global. `wt init` is an optional
   convenience that scaffolds a starter `.wt.toml` and, for a subdir store, offers
-  to add it to `.gitignore`. Claude/Haiku/low remain the defaults; switch
-  providers globally or per repository with:
+  to add it to `.gitignore`. Agent settings are nested by task; generation
+  defaults to Codex's economical model at low effort, while work defaults to
+  Claude with provider-selected model and effort:
 
   ```toml
-  [agent]
+  [agent.generation]
   provider = "codex"
-  effort = "high"
-  # model = "gpt-5" # omit to use the Codex CLI default
+  model = "economy" # gpt-5.6-luna for Codex; haiku for Claude
+  effort = "low"
+
+  [agent.work]
+  provider = "claude"
+  model = "default"
+  effort = "default"
+  # name = "my-session"
+  launch = true
+  plan = false
+  dangerous = false
   ```
+
+  The former flat `[agent]` keys are intentionally retired: migrate each value
+  to `[agent.generation]`, `[agent.work]`, or both. The dotted keys work with
+  `wt config get|set`, for example
+  `wt config set agent.work.provider codex`.
 - **Theme the TUI.** Pick a built-in palette and tweak individual colors under
   `[ui.theme]`: `preset` selects the base (`one-dark` (default) or `solarized`),
   and the named slots (`accent`, `green`, `red`, `yellow`, `orange`, `cyan`,

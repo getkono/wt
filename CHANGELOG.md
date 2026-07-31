@@ -14,12 +14,19 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 ### Added
 
 - *(agent)* support Codex generation through agent-text 0.1.1
-- *(issue)* add provider, planning, and dangerous launch controls
-- *(pr)* add Claude/Codex provider selection for AI drafting
+- *(issue)* add independent generation/work overrides, implementation briefs,
+  Claude session names, planning, and dangerous launch controls
+- *(pr)* share the generation profile and task-specific overrides with issue setup
+- *(ui)* animate slow CLI operations and TUI issue/PR loading states
 
 ### Changed
 
-- *(agent)* make model selection provider-aware and preserve custom launch commands
+- *(agent)* default economical generation to Codex and implementation work to Claude
+- *(agent)* replace flat `[agent]` configuration and generic agent flags with
+  `[agent.generation]`, `[agent.work]`, and task-specific CLI flags
+- *(issue)* lock explicitly supplied fields during interactive editing, print the
+  complete task settings before execution, and retain final approval unless `--yes`
+- *(issue)* skip generation when both `--branch` and `--brief` are supplied
 
 ## [1.5.0](https://github.com/getkono/wt/compare/v1.4.0...v1.5.0) - 2026-07-10
 
