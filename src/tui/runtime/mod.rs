@@ -919,9 +919,9 @@ pub struct ComposeSeed {
     pub draft: bool,
     /// The provider used for AI auto-fill.
     pub kind: crate::agent::AgentKind,
-    /// The model used for AI auto-fill (resolved from `--model`/config).
+    /// The model used for AI auto-fill (resolved from generation flags/config).
     pub model: crate::agent::AgentModel,
-    /// The effort used for AI auto-fill (resolved from `--effort`/config).
+    /// The effort used for AI auto-fill (resolved from generation flags/config).
     pub effort: crate::agent::Effort,
 }
 

@@ -418,11 +418,12 @@ pub(crate) struct PrOpenArgs {
     /// AI provider for drafting: `claude` or `codex`.
     #[arg(long, value_name = "PROVIDER", value_parser = ["claude", "codex"])]
     pub(crate) generation_provider: Option<String>,
-    /// Provider-specific model for `--ai` drafting (overrides `agent.model`).
+    /// Provider-specific model for `--ai` drafting (overrides
+    /// `agent.generation.model`).
     #[arg(long, value_name = "MODEL")]
     pub(crate) generation_model: Option<String>,
-    /// Effort for `--ai` drafting: `low`, `medium`, `high`, `xhigh`, or `max` (overrides
-    /// `agent.effort`; default `low`).
+    /// Effort for `--ai` drafting: `low`, `medium`, `high`, `xhigh`, or `max`
+    /// (overrides `agent.generation.effort`).
     #[arg(long, value_name = "LEVEL")]
     pub(crate) generation_effort: Option<String>,
     /// Override the base/trunk branch to target.

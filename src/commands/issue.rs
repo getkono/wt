@@ -238,14 +238,14 @@ pub(crate) fn resolve_generation_options(
     let model = match &args.generation_model {
         Some(value) => AgentModel::parse(value)
             .or_else(|| AgentModel::custom(value))
-            .ok_or_else(|| Error::usage("--model must not be empty"))?,
+            .ok_or_else(|| Error::usage("--generation-model must not be empty"))?,
         None if args.generation_provider.is_some() => kind.economy_model(),
         None => config.agent_generation.effective_model(),
     };
     let effort = match &args.generation_effort {
         Some(value) => Effort::parse(value).ok_or_else(|| {
             Error::usage(format!(
-                "unknown --effort {value:?}; expected one of: low, medium, high, xhigh, max"
+                "unknown --generation-effort {value:?}; expected one of: low, medium, high, xhigh, max"
             ))
         })?,
         None => config.agent_generation.effort,
