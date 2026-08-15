@@ -251,17 +251,32 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "ui.color" => Some(color_str(config.ui_color).to_string()),
         // The preset always resolves (default one-dark); per-color overrides are
         // raw — unset reads back empty (like `default_base`).
+        #[cfg(feature = "tui")]
         "ui.theme.preset" => Some(config.ui_theme.id().to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.accent" => config.theme_overrides.accent.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.green" => config.theme_overrides.green.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.red" => config.theme_overrides.red.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.yellow" => config.theme_overrides.yellow.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.orange" => config.theme_overrides.orange.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.cyan" => config.theme_overrides.cyan.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.magenta" => config.theme_overrides.magenta.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.gray" => config.theme_overrides.gray.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.selection_bg" => config.theme_overrides.selection_bg.map(|c| c.to_string()),
+        #[cfg(feature = "tui")]
         "ui.theme.chip_fg" => config.theme_overrides.chip_fg.map(|c| c.to_string()),
+        // Without the TUI feature the theme keys have no resolved value; they
+        // read back unset (the file remains editable via `config set`).
+        #[cfg(not(feature = "tui"))]
+        k if k.starts_with("ui.theme.") && key_type(k).is_some() => None,
         _ => return Err(Error::usage(format!("unknown config key: {key}"))),
     })
 }
@@ -547,6 +562,7 @@ mod tests {
         assert!(err.to_string().contains("no editor"));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn theme_preset_roundtrip_and_default() {
         let repo = TestRepo::init();
@@ -583,6 +599,7 @@ mod tests {
         assert_eq!(out.trim(), "solarized");
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn theme_color_override_roundtrip_and_unset_is_empty() {
         let repo = TestRepo::init();
@@ -623,6 +640,7 @@ mod tests {
         assert!(content.contains("accent = \"#ff8800\""));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn theme_set_rejects_invalid_color() {
         let repo = TestRepo::init();
@@ -644,6 +662,7 @@ mod tests {
         assert!(!repo.root().join(".wt.toml").exists());
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn list_includes_theme_keys() {
         let repo = TestRepo::init();

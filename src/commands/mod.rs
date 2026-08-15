@@ -11,6 +11,7 @@ pub mod list;
 pub mod new;
 pub mod path;
 pub mod pr;
+#[cfg(feature = "pr")]
 pub mod pr_open;
 pub mod prune;
 pub mod remove;
@@ -87,8 +88,15 @@ pub(crate) enum Resolution {
 /// returned; otherwise the candidate list is printed to stderr (exit code `3`).
 /// Spec §7.
 pub(crate) fn resolve_query(cx: &mut Cx, worktrees: &[Worktree], query: &str) -> Resolution {
-    resolve_query_with(cx, worktrees, query, |cx, q| {
+    #[cfg(feature = "tui")]
+    return resolve_query_with(cx, worktrees, query, |cx, q| {
         crate::tui::run_tui(cx, Some(q))
+    });
+    // Without the TUI there is no interactive picker; the erroring picker
+    // routes ambiguity to the candidate listing (exit code 3).
+    #[cfg(not(feature = "tui"))]
+    resolve_query_with(cx, worktrees, query, |_, _| {
+        Err(Error::operation("no interactive picker in this build"))
     })
 }
 

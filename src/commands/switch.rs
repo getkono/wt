@@ -30,6 +30,7 @@ pub(crate) fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {
 
 /// Launches the TUI picker; on a switch, prints the chosen path (so the wrapper
 /// `cd`s). A cancelled picker prints nothing and exits `0` (no `cd`).
+#[cfg(feature = "tui")]
 pub(crate) fn launch_picker(cx: &mut Cx) -> Result<u8> {
     match crate::tui::run_tui(cx, None)? {
         Some(path) => {
@@ -38,6 +39,14 @@ pub(crate) fn launch_picker(cx: &mut Cx) -> Result<u8> {
         }
         None => Ok(0),
     }
+}
+
+/// Without the TUI feature there is no interactive picker: name a worktree.
+#[cfg(not(feature = "tui"))]
+pub(crate) fn launch_picker(_cx: &mut Cx) -> Result<u8> {
+    Err(crate::error::Error::usage(
+        "the interactive picker requires a build with the `tui` feature; pass a query",
+    ))
 }
 
 #[cfg(test)]

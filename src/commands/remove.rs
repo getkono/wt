@@ -132,6 +132,7 @@ pub(crate) fn remove_resolved(
 /// safe delete is refused because the branch is unmerged, the returned error
 /// message contains the stable substring "not fully merged", which the TUI keys on
 /// to offer a force-delete.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn delete_branch_query(
     cx: &mut Cx,
     branch: &str,

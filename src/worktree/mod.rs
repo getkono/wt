@@ -16,14 +16,22 @@
 pub(crate) mod rows;
 mod service;
 
+// The row/guard helpers and the parts-based service entry points are how the
+// command handlers and the TUI drive this module; the core library's public
+// surface is the `Workspace` API below.
+#[cfg(feature = "cli")]
 pub(crate) use rows::{
-    build_rows, build_worktrees, enumerate_rows, enumerate_worktrees, guard_status, sort_worktrees,
-    sort_worktrees_base_first,
+    build_rows, build_worktrees, enumerate_worktrees, guard_status, sort_worktrees,
 };
+// The synchronous branch-row listing and base-first sort exist for the TUI
+// (issue #47).
+#[cfg(feature = "tui")]
+pub(crate) use rows::{enumerate_rows, sort_worktrees_base_first};
 pub use service::{
     CreateOptions, CreatedWorktree, HookOutcome, RemoveOptions, RemovedWorktree, SubmodulesOutcome,
     Workspace,
 };
+#[cfg(feature = "cli")]
 pub(crate) use service::{
     WorkspaceParts, create_in, remove_in, resolve_base, resolve_target, rollback_worktree,
     run_best_effort, same_path,

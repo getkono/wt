@@ -175,6 +175,7 @@ pub(crate) fn prospective_base(
 /// Detects whether the base `args` would fork from is behind its upstream (issue
 /// #56), for the TUI create pre-flight. `Ok(None)` when there is nothing to warn
 /// about (existing branch, no upstream, up to date, or offline).
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn detect_stale_base(
     cx: &mut Cx,
     args: &NewArgs,
@@ -194,6 +195,7 @@ pub(crate) fn detect_stale_base(
 
 /// Fast-forwards the base `args` would fork from to its upstream (issue #56, the
 /// TUI "update" action). A no-op when there is no stale base.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn update_stale_base(cx: &mut Cx, args: &NewArgs) -> Result<()> {
     let git = cx.git.clone();
     let git = git.as_ref();

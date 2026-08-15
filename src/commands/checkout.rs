@@ -290,6 +290,7 @@ pub(crate) fn remote_configured(repo: &gix::Repository, remote: &str) -> bool {
 }
 
 /// A human suffix describing the sync outcome, for the TUI status line.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn sync_suffix(outcome: SyncOutcome) -> &'static str {
     match outcome {
         SyncOutcome::FastForwarded => " (fast-forwarded)",

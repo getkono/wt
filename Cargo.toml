@@ -35,34 +35,75 @@ exclude = [
 name = "wt"
 path = "src/lib.rs"
 
-# Ship the binary as `wt`, independent of the crates.io package name.
+# Ship the binary as `wt`, independent of the crates.io package name. The
+# binary is the full application, so it requires the `cli` feature (the TUI and
+# PR surfaces come in via the default features).
 [[bin]]
 name = "wt"
 path = "src/main.rs"
+required-features = ["cli"]
+
+# Feature gates (issue #94). The core library — worktree service, naming,
+# config, git — builds with `default-features = false` and pulls none of the
+# application-surface dependencies, so embedders (karet) get a lean build.
+# All features are on by default: the binary and existing consumers are
+# unaffected.
+[features]
+default = ["cli", "tui", "pr", "agent"]
+# The command-line application surface: argument parsing, command handlers,
+# and the binary's error/tracing bootstrap.
+cli = [
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:color-eyre",
+    "dep:eyre",
+    "dep:tracing-subscriber",
+]
+# The terminal UI. It drives the PR compose flow and the agent auto-fill from
+# its keybindings, so it implies those surfaces.
+tui = [
+    "cli",
+    "pr",
+    "agent",
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:nucleo-matcher",
+    "dep:futures-util",
+    "dep:tokio",
+]
+# The `wt pr open` compose/submit flow. Its compose form is a TUI form and the
+# TUI's own keybindings drive PR submission, so `pr` and `tui` co-activate on
+# the current source layout; the epic's agent rework (#100) is what will let
+# them separate.
+pr = ["tui", "dep:sendit"]
+# The code-agent integration (PR auto-fill). Currently gates no external
+# dependency; it will gate `agent-text` once the issue flow lands.
+agent = ["cli"]
 
 [dependencies]
-clap = { version = "4.6.1", features = ["derive", "cargo", "wrap_help"] }
-clap_complete = "4.6.5"
-color-eyre = "0.6.5"
-crossterm = { version = "0.29.0", features = ["event-stream"] }
+clap = { version = "4.6.1", features = ["derive", "cargo", "wrap_help"], optional = true }
+clap_complete = { version = "4.6.5", optional = true }
+color-eyre = { version = "0.6.5", optional = true }
+crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
 directories = "6.0.0"
-eyre = "0.6.12"
-futures-util = "0.3.32"
+eyre = { version = "0.6.12", optional = true }
+futures-util = { version = "0.3.32", optional = true }
 gix = "0.85.0"
 globset = "0.4.18"
 jiff = "0.2.28"
-nucleo-matcher = "0.3.1"
-ratatui = "0.30.0"
-sendit = "0.1.1"
+nucleo-matcher = { version = "0.3.1", optional = true }
+ratatui = { version = "0.30.0", optional = true }
+sendit = { version = "0.1.1", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 shell-words = "1.1.1"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
+# `full` is only needed by the TUI runtime; the core library is tokio-free.
+tokio = { version = "1.52.3", features = ["full"], optional = true }
 toml = "1.1.2"
 toml_edit = "0.25.12"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 
 [build-dependencies]
 jiff = "0.2.28"

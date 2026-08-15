@@ -166,6 +166,7 @@ impl Workspace {
     }
 
     /// Decomposes into the parts the CLI session keeps.
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) fn into_session_parts(self) -> (Repo, PathBuf, Config) {
         (self.repo, self.primary_root, self.config)
     }

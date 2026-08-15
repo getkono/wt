@@ -30,8 +30,15 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool
 
     // `wt pr open`: compose and open a PR for the current branch (issue #9). It
     // opens its own session, so dispatch before setting one up here.
+    #[cfg(feature = "pr")]
     if let Some(PrSub::Open(open_args)) = &args.sub {
         return crate::commands::pr_open::run(cx, open_args, json);
+    }
+    #[cfg(not(feature = "pr"))]
+    if matches!(&args.sub, Some(PrSub::Open(_))) {
+        return Err(crate::error::Error::usage(
+            "wt pr open requires a build with the `pr` feature",
+        ));
     }
 
     let git = cx.git.clone();
@@ -61,6 +68,17 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool
 
 /// Launches the TUI PR picker; on a checkout, prints the chosen worktree path
 /// (so the wrapper `cd`s). A cancelled picker prints nothing and exits `0`.
+/// Without the TUI feature there is no picker: name a PR instead.
+#[cfg(not(feature = "tui"))]
+fn launch_pr_picker(_cx: &mut Cx) -> Result<u8> {
+    Err(crate::error::Error::usage(
+        "the interactive PR picker requires a build with the `tui` feature; pass a PR number or branch",
+    ))
+}
+
+/// Launches the TUI PR picker; on a checkout, prints the chosen worktree path
+/// (so the wrapper `cd`s). A cancelled picker prints nothing and exits `0`.
+#[cfg(feature = "tui")]
 fn launch_pr_picker(cx: &mut Cx) -> Result<u8> {
     match crate::tui::run_pr_picker(cx)? {
         Some(path) => {

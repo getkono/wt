@@ -10,6 +10,7 @@ use crate::model::{SortSpec, Worktree};
 use crate::output::render::RenderCtx;
 use crate::output::table::render_table;
 use crate::time::now_unix;
+#[cfg(feature = "tui")]
 use crate::util::fuzzy;
 use crate::worktree::{build_worktrees, sort_worktrees};
 
@@ -31,9 +32,7 @@ pub(crate) fn run(cx: &mut Cx, args: &ListArgs, json: bool) -> Result<u8> {
 
     if let Some(filter) = &args.filter {
         let haystacks: Vec<String> = worktrees.iter().map(haystack).collect();
-        let matching: HashSet<usize> = fuzzy::filter_indices(&haystacks, filter)
-            .into_iter()
-            .collect();
+        let matching: HashSet<usize> = filter_indices(&haystacks, filter).into_iter().collect();
         let mut index = 0;
         worktrees.retain(|_| {
             let keep = matching.contains(&index);
@@ -71,7 +70,27 @@ fn haystack(worktree: &Worktree) -> String {
     )
 }
 
+/// Indices of haystacks matching `filter`, best-first (the fuzzy matcher).
+#[cfg(feature = "tui")]
+fn filter_indices(haystacks: &[String], filter: &str) -> Vec<usize> {
+    fuzzy::filter_indices(haystacks, filter)
+}
+
+/// Indices of haystacks matching `filter`. Without the TUI feature there is no
+/// fuzzy matcher, so a case-insensitive substring match stands in.
+#[cfg(not(feature = "tui"))]
+fn filter_indices(haystacks: &[String], filter: &str) -> Vec<usize> {
+    let needle = filter.to_lowercase();
+    haystacks
+        .iter()
+        .enumerate()
+        .filter(|(_, haystack)| haystack.to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// The output width: the terminal width when stdout is a TTY, else a default.
+#[cfg(feature = "tui")]
 fn terminal_width(cx: &Cx) -> usize {
     if cx.out.is_tty() {
         crossterm::terminal::size()
@@ -80,6 +99,13 @@ fn terminal_width(cx: &Cx) -> usize {
     } else {
         DEFAULT_WIDTH
     }
+}
+
+/// The output width. Without the TUI feature there is no terminal backend to
+/// probe, so the default stands in.
+#[cfg(not(feature = "tui"))]
+fn terminal_width(_cx: &Cx) -> usize {
+    DEFAULT_WIDTH
 }
 
 #[cfg(test)]

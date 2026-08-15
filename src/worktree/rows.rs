@@ -5,6 +5,10 @@
 //! that the TUI loads asynchronously (dirty/untracked, ahead/behind, commit, PR).
 //! Also defines the remove/prune guards (spec §10/§12) shared by the CLI and TUI.
 
+// In a core (no-`cli`) build only the enumeration, enrichment, and guard
+// subset of this module is reachable; the row/sort helpers are CLI/TUI-only.
+#![cfg_attr(not(feature = "cli"), allow(dead_code))]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -320,6 +324,7 @@ fn enrich_branch_row(repo: &Repo, git: &dyn GitCli, abbrev: usize, row: &mut Wor
 /// local branch without a worktree (issue #47) — the immediate listing the TUI
 /// paints before async enrichment fills in ahead/behind. Branch rows render with
 /// spinners until [`build_rows`] replaces them.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn enumerate_rows(repo: &Repo, git: &dyn GitCli) -> Result<Vec<Worktree>> {
     let mut rows = enumerate_worktrees(repo, git)?;
     let names = branchless_local_branches(repo, &rows);
@@ -411,6 +416,7 @@ pub(crate) fn sort_worktrees(worktrees: &mut [Worktree], spec: crate::model::Sor
 /// front so the TUI always shows it first regardless of the active sort
 /// (issue #4). The CLI's `list` calls [`sort_worktrees`] directly and keeps the
 /// pure `--sort` order (it never has branch rows).
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn sort_worktrees_base_first(worktrees: &mut [Worktree], spec: crate::model::SortSpec) {
     sort_worktrees(worktrees, spec);
     // Branch rows always sit beneath the real worktrees, each group keeping its
