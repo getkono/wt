@@ -9,6 +9,7 @@
 //! with prompting and rendering; embedders call it directly.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::wtconfig::WtMeta;
 use crate::config::{self, Config, wtconfig};
@@ -24,6 +25,51 @@ use crate::query::{self, Resolved};
 use crate::slug::slugify_with_fallback;
 use crate::template::{self, TemplateVars};
 use crate::worktree::rows;
+
+/// How long a mutation waits for the advisory repository lock (issue #99)
+/// before failing with [`Error::LockUnavailable`].
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A held advisory repository lock (issue #99): while alive, no other `wt` (or
+/// embedder going through this library) can mutate worktrees or `wt.*`
+/// metadata in the repository. Released on drop.
+///
+/// [`Workspace::create`] and [`Workspace::remove`] take the lock internally
+/// around their mutation regions (hooks run *outside* it, so a hook that
+/// re-enters `wt` cannot deadlock) — do not hold a `RepoLock` while calling
+/// them. Take one directly to make your own read-check-write sequence over
+/// `wt.*` metadata atomic against concurrent writers.
+pub struct RepoLock {
+    _marker: gix_lock::Marker,
+}
+
+/// The directory holding the advisory lock file: the repository's common git
+/// directory, shared by every linked worktree (`.git` of the primary worktree,
+/// or the repository itself when bare).
+fn lock_dir(root: &Path) -> PathBuf {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        dot_git
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// Acquires the repo-level advisory mutation lock, waiting (with backoff) up
+/// to `timeout` for a concurrent holder to finish.
+pub(crate) fn acquire_repo_lock(root: &Path, timeout: Duration) -> Result<RepoLock> {
+    let resource = lock_dir(root).join("wt-mutation");
+    let marker = gix_lock::Marker::acquire_to_hold_resource(
+        &resource,
+        gix_lock::acquire::Fail::AfterDurationWithBackoff(timeout),
+        None,
+    )
+    .map_err(|e| Error::LockUnavailable {
+        path: format!("{}.lock", resource.display()),
+        reason: e.to_string(),
+    })?;
+    Ok(RepoLock { _marker: marker })
+}
 
 /// A discovered repository with its resolved configuration and environment
 /// snapshot: the entry point of the stateless worktree API.
@@ -68,12 +114,21 @@ impl Workspace {
             common.parent().map(Path::to_path_buf).unwrap_or(common)
         };
         let config = config::load(Some(&primary_root), env)?;
+        // Refuse a repository stamped with a future metadata schema up front
+        // (issue #99); reading it could silently misinterpret `wt.*` keys.
+        wtconfig::ensure_schema_supported(repo.gix())?;
         Ok(Workspace {
             repo,
             primary_root,
             config,
             env: env.clone(),
         })
+    }
+
+    /// Acquires the repository's advisory mutation lock (issue #99). See
+    /// [`RepoLock`] for the holding rules.
+    pub fn lock(&self) -> Result<RepoLock> {
+        acquire_repo_lock(&self.primary_root, LOCK_TIMEOUT)
     }
 
     /// The primary worktree root (or the repository path when bare). This is
@@ -301,6 +356,7 @@ pub(crate) fn create_in(
     hooks: &dyn HookRunner,
     options: &CreateOptions,
 ) -> Result<CreatedWorktree> {
+    wtconfig::ensure_schema_supported(ws.repo.gix())?;
     let branch = options.branch.clone();
     let worktrees = rows::enumerate_worktrees(ws.repo, git)?;
     let branch_exists = resolve_hex(ws.repo.gix(), &branch_ref(&branch)).is_some();
@@ -342,6 +398,11 @@ pub(crate) fn create_in(
         )));
     }
 
+    // The mutation region — target resolution through metadata + copy — runs
+    // under the advisory repository lock (issue #99) so two concurrent
+    // creators cannot interleave into a corrupt state. The lock is released
+    // before the hook runs: a hook that re-enters `wt` must not deadlock.
+    let lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
     let target = resolve_target(
         ws.config,
         ws.root,
@@ -376,6 +437,7 @@ pub(crate) fn create_in(
             return Err(e);
         }
     };
+    drop(lock);
 
     // The post-create hook: a failure is an outcome, not a rollback (§8).
     let ctx = HookContext {
@@ -481,6 +543,7 @@ pub(crate) fn remove_in(
     worktree: &Worktree,
     options: &RemoveOptions,
 ) -> Result<RemovedWorktree> {
+    wtconfig::ensure_schema_supported(ws.repo.gix())?;
     if worktree.is_main {
         return Err(Error::operation("refusing to remove the primary worktree"));
     }
@@ -493,6 +556,7 @@ pub(crate) fn remove_in(
 
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
+        let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
         ops::worktree_prune(git, ws.root)?;
         let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
         clear_metadata(git, ws.root, worktree);
@@ -537,7 +601,9 @@ pub(crate) fn remove_in(
         },
     };
 
-    // Remove the worktree.
+    // Remove the worktree, holding the advisory lock (issue #99). Acquired
+    // *after* the hook so a hook that re-enters `wt` cannot deadlock.
+    let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
     let path = worktree.path.to_string_lossy().into_owned();
     ops::worktree_remove(git, ws.root, &path, options.force_remove)?;
 
@@ -1069,6 +1135,104 @@ mod tests {
             .unwrap();
         assert_eq!(removed.pre_remove, HookOutcome::ExitedNonZero(5));
         assert!(!repo.git(&["worktree", "list"]).contains("hooked"));
+    }
+
+    #[test]
+    fn discover_refuses_a_future_schema() {
+        let repo = TestRepo::init();
+        repo.git(&["config", "wt.schema", "99"]);
+        let err = Workspace::discover(repo.root(), &env(), &RealGit)
+            .err()
+            .expect("a future schema must refuse discovery");
+        assert!(matches!(err, Error::SchemaTooNew { found: 99, .. }));
+    }
+
+    #[test]
+    fn mutations_refuse_a_schema_stamped_after_discovery() {
+        // A long-lived Workspace must not mutate a repo that was upgraded
+        // underneath it: create/remove re-check through a fresh handle.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["config", "wt.schema", "2"]);
+        let err = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("late"))
+            .unwrap_err();
+        assert!(matches!(err, Error::SchemaTooNew { found: 2, .. }));
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_released_on_drop() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let held = ws.lock().unwrap();
+        // A second acquisition times out while the first is held...
+        let err = acquire_repo_lock(ws.root(), Duration::from_millis(50))
+            .err()
+            .expect("the held lock must exclude a second holder");
+        match &err {
+            Error::LockUnavailable { path, .. } => {
+                assert!(path.ends_with("wt-mutation.lock"), "{path}");
+            }
+            other => panic!("expected LockUnavailable, got {other:?}"),
+        }
+        // ...and succeeds once the holder is dropped.
+        drop(held);
+        acquire_repo_lock(ws.root(), Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
+    fn create_releases_the_lock_before_the_post_create_hook() {
+        // A hook that re-enters wt must not deadlock (issue #99): the hook
+        // itself proves the lock file is gone by the time it runs.
+        let repo = TestRepo::init();
+        repo.write(
+            ".wt.toml",
+            "[hooks]\npost_create = \"test ! -e \\\"$WT_REPO_ROOT/.git/wt-mutation.lock\\\"\"\n",
+        );
+        repo.commit_all("config");
+        let ws = workspace(&repo);
+        let mut opts = create_opts("hookfree");
+        opts.no_hooks = false;
+        let created = ws.create(&RealGit, &RealHookRunner, &opts).unwrap();
+        assert_eq!(created.post_create, HookOutcome::Succeeded);
+    }
+
+    #[test]
+    fn concurrent_creates_on_one_branch_do_not_corrupt_metadata() {
+        // Two writers race to create the same branch (issue #99): exactly one
+        // wins, the loser gets a clean error, and the metadata ends up
+        // consistent — one worktree, one baseRef, createdByWt set once.
+        let repo = TestRepo::init();
+        let root = repo.root().to_path_buf();
+        let spawn = |root: PathBuf| {
+            std::thread::spawn(move || {
+                let ws = Workspace::discover(&root, &env(), &RealGit)?;
+                ws.create(&RealGit, &RealHookRunner, &create_opts("feat/race"))
+            })
+        };
+        let a = spawn(root.clone());
+        let b = spawn(root);
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        // Both may succeed only if one reused the other's finished worktree;
+        // never may both claim to have created it.
+        let created = results
+            .iter()
+            .filter(|r| r.as_ref().is_ok_and(|c| !c.reused))
+            .count();
+        assert!(ok >= 1, "at least one racer must win: {results:?}");
+        assert_eq!(created, 1, "exactly one racer creates: {results:?}");
+
+        let ws = workspace(&repo);
+        let rows = ws.list(&RealGit).unwrap();
+        let race_rows: Vec<_> = rows
+            .iter()
+            .filter(|w| w.branch.as_deref() == Some("feat/race"))
+            .collect();
+        assert_eq!(race_rows.len(), 1);
+        let meta = ws.read_meta("feat/race").unwrap();
+        assert_eq!(meta.base_ref.as_deref(), Some("main"));
+        assert!(meta.created_by_wt);
     }
 
     #[test]

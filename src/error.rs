@@ -73,6 +73,30 @@ pub enum Error {
     #[error("{0}")]
     AgentUnavailable(String),
 
+    /// The repository's `wt.schema` was written by a newer `wt` (or embedder)
+    /// than this one; reading it could silently misinterpret metadata, so the
+    /// operation is refused (issue #99).
+    #[error(
+        "repository metadata schema (wt.schema = {found}) is newer than this wt supports \
+         (up to {supported}); upgrade wt to work with this repository"
+    )]
+    SchemaTooNew {
+        /// The `wt.schema` value recorded in the repository.
+        found: u64,
+        /// The highest schema this build understands.
+        supported: u64,
+    },
+
+    /// The repository's advisory mutation lock could not be acquired (issue
+    /// #99) — usually another `wt` (or embedder) operation is in flight.
+    #[error("could not acquire the wt repository lock at {path}: {reason}")]
+    LockUnavailable {
+        /// The lock file path.
+        path: String,
+        /// Why acquisition failed (e.g. a timeout while another holder ran).
+        reason: String,
+    },
+
     /// Worktree removal was blocked by the dirty/unpushed safety guards
     /// (spec §10/§12); force-removal overrides them.
     #[error("worktree {}; use --force to remove anyway", guard_reasons(*dirty, *unpushed))]

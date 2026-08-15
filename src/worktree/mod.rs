@@ -16,9 +16,10 @@
 pub(crate) mod rows;
 mod service;
 
+pub use crate::config::wtconfig::SCHEMA_VERSION;
 // The row/guard helpers and the parts-based service entry points are how the
 // command handlers and the TUI drive this module; the core library's public
-// surface is the `Workspace` API below.
+// surface is the `Workspace` API and the re-exported schema/lock types.
 #[cfg(feature = "cli")]
 pub(crate) use rows::{
     build_rows, build_worktrees, enumerate_worktrees, guard_status, sort_worktrees,
@@ -28,8 +29,8 @@ pub(crate) use rows::{
 #[cfg(feature = "tui")]
 pub(crate) use rows::{enumerate_rows, sort_worktrees_base_first};
 pub use service::{
-    CreateOptions, CreatedWorktree, HookOutcome, RemoveOptions, RemovedWorktree, SubmodulesOutcome,
-    Workspace,
+    CreateOptions, CreatedWorktree, HookOutcome, RemoveOptions, RemovedWorktree, RepoLock,
+    SubmodulesOutcome, Workspace,
 };
 #[cfg(feature = "cli")]
 pub(crate) use service::{

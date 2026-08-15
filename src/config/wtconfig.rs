@@ -7,8 +7,57 @@
 
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
+
+/// The metadata schema version this build reads and writes (issue #99).
+///
+/// The version is a single repo-level `wt.schema` integer, deliberately
+/// minimal: a repository with no `wt.schema` is version `1` (every repository
+/// initialized to date), readers accept equal-or-lower values, and a *higher*
+/// value is refused with an actionable error — it means the metadata's key
+/// meanings may have changed and reading them could silently misinterpret
+/// them. Purely *additive* keys never need a bump: [`read_meta`] ignores
+/// unknown keys and maps missing keys to `None`. `wt` never writes
+/// `wt.schema` at version 1; the first meaning-changing version will.
+///
+/// Embedders (karet) should compare their supported version against
+/// [`schema_version`] (or just call [`ensure_schema_supported`]) *before*
+/// mutating anything.
+pub const SCHEMA_VERSION: u64 = 1;
+
+/// Reads the repository's `wt.schema`, treating a missing key as version `1`.
+/// A present but non-positive or unparseable value is a configuration error.
+pub fn schema_version(repo: &gix::Repository) -> Result<u64> {
+    let config = repo.config_snapshot();
+    let Some(raw) = config.string("wt.schema") else {
+        return Ok(1);
+    };
+    raw.to_string()
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v >= 1)
+        .ok_or_else(|| Error::Config {
+            file: "git config".into(),
+            key: "wt.schema".into(),
+            reason: format!("expected a positive integer, got {raw:?}"),
+        })
+}
+
+/// Fails with [`Error::SchemaTooNew`] when the repository's `wt.schema` is
+/// higher than [`SCHEMA_VERSION`]. Call before reading or writing `wt.*`
+/// metadata.
+pub fn ensure_schema_supported(repo: &gix::Repository) -> Result<()> {
+    let found = schema_version(repo)?;
+    if found > SCHEMA_VERSION {
+        return Err(Error::SchemaTooNew {
+            found,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Per-worktree metadata recorded by `wt`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -184,6 +233,57 @@ mod tests {
         assert_eq!(m.pr_number, Some(99));
         assert_eq!(m.pr_state.as_deref(), Some("open"));
         assert_eq!(m.pr_title.as_deref(), Some("Add feature"));
+    }
+
+    /// Opens a fresh gix handle on the repo (config is snapshotted at open).
+    fn gix_of(repo: &TestRepo) -> gix::Repository {
+        gix::discover(repo.root()).unwrap()
+    }
+
+    #[test]
+    fn missing_schema_is_version_one_and_supported() {
+        // Every repository initialized to date has no wt.schema.
+        let repo = TestRepo::init();
+        assert_eq!(schema_version(&gix_of(&repo)).unwrap(), 1);
+        ensure_schema_supported(&gix_of(&repo)).unwrap();
+    }
+
+    #[test]
+    fn equal_schema_is_supported() {
+        let repo = TestRepo::init();
+        repo.git(&["config", "wt.schema", &SCHEMA_VERSION.to_string()]);
+        assert_eq!(schema_version(&gix_of(&repo)).unwrap(), SCHEMA_VERSION);
+        ensure_schema_supported(&gix_of(&repo)).unwrap();
+    }
+
+    #[test]
+    fn future_schema_is_refused_with_an_upgrade_error() {
+        let repo = TestRepo::init();
+        repo.git(&["config", "wt.schema", "2"]);
+        let err = ensure_schema_supported(&gix_of(&repo)).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SchemaTooNew {
+                found: 2,
+                supported: SCHEMA_VERSION,
+            }
+        ));
+        let message = err.to_string();
+        assert!(message.contains("wt.schema = 2"), "{message}");
+        assert!(message.contains("upgrade wt"), "{message}");
+    }
+
+    #[test]
+    fn garbage_schema_is_a_config_error() {
+        for bad in ["banana", "0", "-3"] {
+            let repo = TestRepo::init();
+            repo.git(&["config", "wt.schema", bad]);
+            let err = schema_version(&gix_of(&repo)).unwrap_err();
+            assert!(
+                matches!(&err, Error::Config { key, .. } if key == "wt.schema"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]

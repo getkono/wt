@@ -2028,6 +2028,7 @@ dependencies = [
  "eyre",
  "futures-util",
  "gix",
+ "gix-lock",
  "globset",
  "insta",
  "jiff",
