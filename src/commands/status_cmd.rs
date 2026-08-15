@@ -6,7 +6,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::status_of;
 use crate::output::render::status_block;
-use crate::worktree_service::build_worktrees;
+use crate::worktree::build_worktrees;
 
 /// Renders the status block(s) to stdout, or newline-delimited JSON with
 /// `--json`. Default target is the current worktree; `--all` reports every one.

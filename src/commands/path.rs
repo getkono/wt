@@ -4,7 +4,7 @@ use crate::cli::PathArgs;
 use crate::commands::{Resolution, open_session, resolve_query};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
-use crate::worktree_service::build_worktrees;
+use crate::worktree::build_worktrees;
 
 /// Resolves the query and prints the worktree's absolute path to stdout. An
 /// ambiguous query lists candidates on stderr and exits `3`; no match exits `1`.

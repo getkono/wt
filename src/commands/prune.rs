@@ -15,7 +15,7 @@ use crate::git::{
     branch_ref, current_branch, default_branch, is_ancestor, local_branches, ops, upstream_of,
 };
 use crate::model::Worktree;
-use crate::worktree_service::{build_worktrees, guard_status};
+use crate::worktree::{build_worktrees, guard_status};
 
 /// A prune target: an existing worktree (an index into the worktree list) or a
 /// bare local branch — one with no worktree — that qualified for removal.

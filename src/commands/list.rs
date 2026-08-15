@@ -11,7 +11,7 @@ use crate::output::render::RenderCtx;
 use crate::output::table::render_table;
 use crate::time::now_unix;
 use crate::util::fuzzy;
-use crate::worktree_service::{build_worktrees, sort_worktrees};
+use crate::worktree::{build_worktrees, sort_worktrees};
 
 /// Fallback table width when stdout is not a terminal.
 const DEFAULT_WIDTH: usize = 100;

@@ -13,7 +13,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::hooks::HookRunner;
 use crate::model::RemovedResult;
-use crate::worktree_service::build_worktrees;
+use crate::worktree::build_worktrees;
 
 /// Removes the worktree that contains the current directory, keeping its branch.
 /// The primary/root worktree is refused, and a bare repository (no current

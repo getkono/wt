@@ -479,7 +479,7 @@ pub(super) fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: R
         // Safety warnings, layered on top of the neutral context above for
         // emphasis. The dirty warning mirrors the remove guard; dirtiness is
         // orthogonal to mergedness, so a merged-but-dirty tree still warns.
-        let guard = crate::worktree_service::guard_status(worktree, app.remove_untracked_blocks);
+        let guard = crate::worktree::guard_status(worktree, app.remove_untracked_blocks);
         if guard.dirty {
             lines.push(Line::from(Span::styled(
                 "(has uncommitted changes — data may be lost)",

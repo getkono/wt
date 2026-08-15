@@ -6,7 +6,7 @@ use crate::cli::SwitchArgs;
 use crate::commands::{Resolution, open_session, resolve_query};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
-use crate::worktree_service::build_worktrees;
+use crate::worktree::build_worktrees;
 
 /// Resolves the query (or opens the picker) and prints the chosen path.
 pub(crate) fn run(cx: &mut Cx, args: &SwitchArgs) -> Result<u8> {

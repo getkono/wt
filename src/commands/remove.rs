@@ -4,42 +4,31 @@ use std::path::Path;
 
 use crate::cli::RemoveArgs;
 use crate::commands::{Resolution, Session, open_session, resolve_query};
-use crate::config::wtconfig::{self, WtMeta};
+use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::{branch_ref, default_branch, is_ancestor, ops, resolve_hex};
-use crate::hooks::{HookContext, HookRunner, run_pre_remove};
+use crate::git::{branch_ref, ops, resolve_hex};
+use crate::hooks::HookRunner;
 use crate::model::{RemovedResult, Worktree};
-use crate::worktree_service::{build_worktrees, enumerate_worktrees, guard_status};
+use crate::worktree::{HookOutcome, build_worktrees, enumerate_worktrees, guard_status, remove_in};
 
-/// Options controlling a removal. The worktree-removal force (skip the
-/// dirty/unpushed guards) is decoupled from the branch-deletion force (delete a
-/// branch that is not fully merged). The CLI's `--force` sets both; the TUI
-/// confirm dialog sets only `force_remove` — the dialog is itself the guard, so
-/// `y` may remove a dirty/unpushed worktree, but it must never silently
-/// force-delete an unmerged branch (spec §10/§12).
-pub(crate) struct RemoveOptions {
-    /// Skip the dirty/unpushed guards and pass `--force` to `git worktree remove`.
-    pub(crate) force_remove: bool,
-    /// Permit deleting a branch that is not fully merged into its base.
-    pub(crate) force_branch: bool,
-    /// Always keep the local branch.
-    pub(crate) keep_branch: bool,
-    /// Skip the pre-remove hook.
-    pub(crate) no_hooks: bool,
-}
+// The CLI shares the service's removal options; re-exported so `drop` and the
+// TUI keep their historical import path. The worktree-removal force is
+// decoupled from the branch-deletion force: the CLI's `--force` sets both; the
+// TUI confirm dialog sets only `force_remove` — the dialog is itself the
+// guard, so `y` may remove a dirty/unpushed worktree, but it must never
+// silently force-delete an unmerged branch (spec §10/§12).
+pub(crate) use crate::worktree::RemoveOptions;
 
-impl RemoveOptions {
-    /// Builds options from the CLI flags, where `--force` forces both removal
-    /// and unmerged-branch deletion.
-    pub(crate) fn from_args(args: &RemoveArgs) -> Self {
-        RemoveOptions {
-            force_remove: args.force,
-            force_branch: args.force,
-            keep_branch: args.keep_branch,
-            no_hooks: args.no_hooks,
-        }
+/// Builds options from the CLI flags, where `--force` forces both removal and
+/// unmerged-branch deletion.
+fn options_from_args(args: &RemoveArgs) -> RemoveOptions {
+    RemoveOptions {
+        force_remove: args.force,
+        force_branch: args.force,
+        keep_branch: args.keep_branch,
+        no_hooks: args.no_hooks,
     }
 }
 
@@ -52,13 +41,7 @@ pub(crate) fn run(
     args: &RemoveArgs,
     json: bool,
 ) -> Result<u8> {
-    remove_query(
-        cx,
-        hooks,
-        &args.query,
-        &RemoveOptions::from_args(args),
-        json,
-    )
+    remove_query(cx, hooks, &args.query, &options_from_args(args), json)
 }
 
 /// Resolves `query` to a worktree and removes it under the given options.
@@ -111,65 +94,34 @@ pub(crate) fn remove_resolved(
     worktree: &Worktree,
     opts: &RemoveOptions,
 ) -> Result<bool> {
-    let meta = worktree
-        .branch
-        .as_deref()
-        .map(|b| wtconfig::read_meta(session.repo.gix(), b))
-        .unwrap_or_default();
-    let default = default_branch(session.repo.gix());
-
-    // A missing worktree: prune the admin record; no guards or hook apply.
-    if worktree.is_missing {
-        ops::worktree_prune(git, root)?;
-        let deleted = maybe_delete_branch(git, session, worktree, &meta, opts, &default);
-        clear_metadata(git, root, worktree);
-        return Ok(deleted);
-    }
-
-    // Safety guards (spec §10/§12).
-    let guard = guard_status(worktree, session.config.remove_untracked_blocks);
-    if guard.blocks() && !opts.force_remove {
-        let mut reasons = Vec::new();
-        if guard.dirty {
-            reasons.push("has uncommitted changes");
+    let _ = root; // the session's primary root; kept for call-site symmetry
+    // Warn about the data-loss risk *before* the removal runs, as always.
+    if !worktree.is_missing {
+        let guard = guard_status(worktree, session.config.remove_untracked_blocks);
+        if guard.blocks() && opts.force_remove {
+            cx.err
+                .line("warning: removing with uncommitted or unpushed work; data may be lost")?;
         }
-        if guard.unpushed {
-            reasons.push("has unpushed work");
+    }
+
+    let env = cx.env.clone();
+    let removed = remove_in(&session.parts(&env), git, hooks, worktree, opts)?;
+
+    // A pre-remove hook failure only reaches here when `--force` downgraded it.
+    match &removed.pre_remove {
+        HookOutcome::ExitedNonZero(code) => {
+            cx.err.line(&format!(
+                "warning: pre_remove hook exited with status {code}; proceeding due to --force"
+            ))?;
         }
-        return Err(Error::operation(format!(
-            "worktree {}; use --force to remove anyway",
-            reasons.join(" and ")
-        )));
+        HookOutcome::Failed(error) => {
+            cx.err.line(&format!(
+                "warning: pre_remove hook failed: {error}; proceeding due to --force"
+            ))?;
+        }
+        HookOutcome::Skipped | HookOutcome::Succeeded => {}
     }
-    if guard.blocks() && opts.force_remove {
-        cx.err
-            .line("warning: removing with uncommitted or unpushed work; data may be lost")?;
-    }
-
-    // Pre-remove hook (may abort).
-    let ctx = HookContext {
-        worktree_path: worktree.path.clone(),
-        branch: worktree.branch.clone().unwrap_or_default(),
-        repo_root: root.to_path_buf(),
-        base_ref: meta.base_ref.clone(),
-        pr_number: meta.pr_number,
-    };
-    run_pre_remove(
-        hooks,
-        cx,
-        session.config.hooks_pre_remove.as_deref(),
-        &ctx,
-        opts.no_hooks,
-        opts.force_remove,
-    )?;
-
-    // Remove the worktree.
-    let path = worktree.path.to_string_lossy().into_owned();
-    ops::worktree_remove(git, root, &path, opts.force_remove)?;
-
-    let deleted = maybe_delete_branch(git, session, worktree, &meta, opts, &default);
-    clear_metadata(git, root, worktree);
-    Ok(deleted)
+    Ok(removed.branch_deleted)
 }
 
 /// Deletes a local branch that has no worktree — a TUI "branch row" (issue #53),
@@ -236,45 +188,6 @@ pub(crate) fn delete_branch_query(
         cx.err.line(&format!("deleted branch {branch}"))?;
     }
     Ok(0)
-}
-
-/// Deletes the branch if it is wt-created and either fully merged (and the
-/// config allows it) or `force_branch` (for an unmerged branch). Returns whether
-/// the branch was deleted.
-fn maybe_delete_branch(
-    git: &dyn GitCli,
-    session: &Session,
-    worktree: &Worktree,
-    meta: &WtMeta,
-    opts: &RemoveOptions,
-    default: &Option<String>,
-) -> bool {
-    let Some(branch) = &worktree.branch else {
-        return false;
-    };
-    if opts.keep_branch || !meta.created_by_wt {
-        return false;
-    }
-    let base = meta.base_ref.clone().or_else(|| default.clone());
-    let merged = base
-        .as_deref()
-        .is_some_and(|b| is_ancestor(session.repo.gix(), &branch_ref(branch), b));
-    let should_delete = if merged {
-        session.config.remove_delete_merged_branch
-    } else {
-        opts.force_branch
-    };
-    if !should_delete {
-        return false;
-    }
-    ops::delete_branch(git, &session.primary_root, branch, true).is_ok()
-}
-
-/// Clears the worktree's `wt.*` metadata, best-effort.
-fn clear_metadata(git: &dyn GitCli, root: &Path, worktree: &Worktree) {
-    if let Some(branch) = &worktree.branch {
-        let _ = wtconfig::clear_meta(git, root, branch);
-    }
 }
 
 /// Emits the removal result.

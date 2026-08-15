@@ -23,16 +23,19 @@ pub mod sync;
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{self, Config, SubmoduleInit};
-use crate::cx::{Cx, Env};
+use crate::config::{Config, SubmoduleInit};
+use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::hooks::{HookContext, HookRunner};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
-use crate::template::{self, TemplateVars};
-use crate::worktree_service::build_worktrees;
+use crate::worktree::{Workspace, WorkspaceParts, build_worktrees};
+
+// Path/template helpers shared with the service layer, re-exported so command
+// modules keep their historical import paths.
+pub(crate) use crate::worktree::{resolve_target, rollback_worktree, run_best_effort, same_path};
 
 /// A discovered repository plus its resolved configuration, set up once per
 /// repo-scoped command.
@@ -45,22 +48,23 @@ pub(crate) struct Session {
     pub(crate) config: Config,
 }
 
+impl Session {
+    /// The borrowed parts view the worktree service functions take.
+    pub(crate) fn parts<'a>(&'a self, env: &'a crate::cx::Env) -> WorkspaceParts<'a> {
+        WorkspaceParts {
+            repo: &self.repo,
+            config: &self.config,
+            root: &self.primary_root,
+            env,
+        }
+    }
+}
+
 /// Discovers the repository from the context's working directory, resolves the
 /// primary root via `git rev-parse`, and loads the merged configuration.
 pub(crate) fn open_session(cx: &Cx, git: &dyn GitCli) -> Result<Session> {
-    let repo = Repo::discover(&cx.cwd)?;
-    let dir = repo.current_workdir().unwrap_or_else(|| repo.git_dir());
-    let common = git.run(
-        &dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = PathBuf::from(common.trim());
-    let primary_root = if repo.is_bare() {
-        common
-    } else {
-        common.parent().map(Path::to_path_buf).unwrap_or(common)
-    };
-    let config = config::load(Some(&primary_root), &cx.env)?;
+    let ws = Workspace::discover(&cx.cwd, &cx.env, git)?;
+    let (repo, primary_root, config) = ws.into_session_parts();
     Ok(Session {
         repo,
         primary_root,
@@ -145,13 +149,6 @@ pub(crate) fn candidate_label(worktree: &Worktree) -> String {
         Some(branch) => branch.clone(),
         None => worktree.path.display().to_string(),
     }
-}
-
-/// Whether two paths refer to the same location, comparing canonicalized forms
-/// when possible (handles `/private` symlinks on macOS).
-pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(a) == canon(b)
 }
 
 /// Echoes `prompt` on stderr followed by the answer `-y`/`--yes` supplies, so a
@@ -303,128 +300,6 @@ fn init_submodules(cx: &mut Cx, git: &dyn GitCli, dir: &Path, count: usize) {
         let _ = cx
             .err
             .line(&format!("warning: failed to initialize submodules: {e}"));
-    }
-}
-
-/// The git directory used for the `.git`-containment check (spec §6).
-pub(crate) fn git_dir_of(root: &Path, is_bare: bool) -> PathBuf {
-    if is_bare {
-        root.to_path_buf()
-    } else {
-        root.join(".git")
-    }
-}
-
-/// Renders the worktree store path for a branch with the given slug (spec §6).
-pub(crate) fn render_target(
-    config: &Config,
-    root: &Path,
-    branch: &str,
-    slug: &str,
-    env: &Env,
-) -> Result<PathBuf> {
-    let vars = TemplateVars {
-        repo_parent: root
-            .parent()
-            .map_or_else(|| root.to_path_buf(), Path::to_path_buf),
-        repo: root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        repo_root: root.to_path_buf(),
-        branch: branch.to_string(),
-        branch_slug: slug.to_string(),
-        home: env
-            .get("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("~")),
-    };
-    template::render(&config.path_template, &vars)
-}
-
-/// Resolves the final target path: renders it, rejects the `.git` directory, and
-/// on collision with an unrelated path appends `-<short_hash>` (erroring if both
-/// are occupied). Spec §6.
-pub(crate) fn resolve_target(
-    config: &Config,
-    root: &Path,
-    branch: &str,
-    slug: &str,
-    short_hash: &str,
-    env: &Env,
-    is_bare: bool,
-) -> Result<PathBuf> {
-    let target = render_target(config, root, branch, slug, env)?;
-    template::ensure_outside_git(&target, &git_dir_of(root, is_bare))?;
-    if !target.exists() {
-        return Ok(target);
-    }
-    let alt = render_target(config, root, branch, &format!("{slug}-{short_hash}"), env)?;
-    if alt.exists() {
-        return Err(Error::operation(format!(
-            "target path already exists: {}",
-            target.display()
-        )));
-    }
-    Ok(alt)
-}
-
-/// Runs a best-effort cleanup git command: on failure it logs a breadcrumb and
-/// continues rather than aborting the caller. Used by the rollback and prune
-/// cleanup paths, where a failed step must not stop the wider operation. `step`
-/// is a short label identifying the command in the log.
-pub(crate) fn run_best_effort(git: &dyn GitCli, root: &Path, args: &[&str], step: &str) {
-    match git.run_raw(root, args) {
-        Ok(out) if out.success => {}
-        Ok(out) => {
-            tracing::debug!(step, stderr = %out.stderr.trim(), "best-effort cleanup step failed");
-        }
-        Err(error) => {
-            tracing::debug!(step, %error, "best-effort cleanup step could not run");
-        }
-    }
-}
-
-/// Rolls back a partially-created worktree (spec §13): removes the worktree and
-/// prunes, optionally deletes the branch (only when it was created here), and
-/// optionally clears the `wt.*` metadata written during the operation, so
-/// nothing half-created is left behind. The two flags are independent: `wt pr`
-/// on a *pre-existing* branch keeps the branch but still clears the metadata it
-/// wrote. Best-effort.
-pub(crate) fn rollback_worktree(
-    git: &dyn GitCli,
-    root: &Path,
-    target: &Path,
-    branch: &str,
-    delete_branch: bool,
-    clear_metadata: bool,
-) {
-    let target_str = target.to_string_lossy();
-    run_best_effort(
-        git,
-        root,
-        &["worktree", "remove", "--force", &target_str],
-        "rollback: worktree remove",
-    );
-    run_best_effort(
-        git,
-        root,
-        &["worktree", "prune"],
-        "rollback: worktree prune",
-    );
-    if delete_branch {
-        run_best_effort(
-            git,
-            root,
-            &["branch", "-D", branch],
-            "rollback: branch delete",
-        );
-    }
-    if clear_metadata {
-        // Remove the metadata written before the failure (else a later worktree
-        // on this branch name would show stale PR/base info, or a wrongly-set
-        // `createdByWt` could cause its branch to be deleted on remove).
-        let _ = crate::config::wtconfig::clear_meta(git, root, branch);
     }
 }
 

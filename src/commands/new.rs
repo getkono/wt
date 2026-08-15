@@ -1,24 +1,13 @@
 //! `wt new <branch>` — create a linked worktree (spec §6/§7/§8/§13).
 
-use std::path::{Path, PathBuf};
-
 use crate::cli::NewArgs;
-use crate::commands::{
-    Nav, finish_worktree, maybe_init_submodules_interactive, open_session, render_target,
-    resolve_target, rollback_worktree, same_path,
-};
-use crate::config::wtconfig;
-use crate::copy::copy_ignored_files;
+use crate::commands::{Nav, finish_worktree, maybe_init_submodules_interactive, open_session};
 use crate::cx::Cx;
-use crate::error::{Error, Result};
-use crate::git::cli::GitCli;
+use crate::error::Result;
 use crate::git::discover::Repo;
-use crate::git::{branch_ref, default_branch, ops, resolve_hex};
-use crate::hooks::{HookContext, HookRunner, run_post_create};
-use crate::model::Worktree;
-use crate::query::{self, Resolved};
-use crate::slug::slugify_with_fallback;
-use crate::worktree_service::enumerate_worktrees;
+use crate::git::{branch_ref, resolve_hex};
+use crate::hooks::{HookContext, HookRunner};
+use crate::worktree::{CreateOptions, HookOutcome, create_in, resolve_base};
 
 /// Creates a linked worktree for `branch`, prompting first when the base it would
 /// fork from is behind its origin counterpart (issue #56): the user can update the
@@ -85,189 +74,81 @@ pub(crate) fn run_core(
     let git = cx.git.clone();
     let git = git.as_ref();
     let session = open_session(cx, git)?;
-    let repo = &session.repo;
     let root = session.primary_root.clone();
-    let branch = args.branch.clone();
 
-    let worktrees = enumerate_worktrees(repo, git)?;
-    let branch_exists = resolve_hex(repo.gix(), &branch_ref(&branch)).is_some();
-
-    let base_ref = if branch_exists {
-        None
-    } else {
-        Some(resolve_base_ref(
-            cx,
-            repo,
-            args.from.as_deref(),
-            &session.config.default_base,
-        ))
+    // Resolve the base for a new branch up front so the HEAD-fallback warning
+    // (in `prospective_base`) still lands before anything is created.
+    let base = prospective_base(cx, &session.repo, args, &session.config);
+    let options = CreateOptions {
+        branch: args.branch.clone(),
+        base,
+        track: args.track.clone(),
+        copy_from: args.copy_from.clone(),
+        // The service never prompts; the interactive policy handling below
+        // (issue #50) decides about submodules on the CLI/TUI paths.
+        init_submodules: false,
+        no_hooks: args.no_hooks,
     };
-    let base_commit = match &base_ref {
-        Some(base) => resolve_hex(repo.gix(), base)
-            .ok_or_else(|| Error::operation(format!("base ref {base:?} not found")))?,
-        None => resolve_hex(repo.gix(), &branch_ref(&branch)).unwrap_or_default(),
-    };
-    let short_hash = base_commit.get(..7).unwrap_or(&base_commit).to_string();
-    let slug = slugify_with_fallback(&branch, &short_hash);
 
-    // If the branch is already checked out, either no-op (same target) or refuse.
-    if let Some(existing) = worktrees
-        .iter()
-        .find(|w| w.branch.as_deref() == Some(branch.as_str()))
-    {
-        let preview = render_target(&session.config, &root, &branch, &slug, &cx.env)?;
-        if same_path(&existing.path, &preview) {
-            let path = existing.path.clone();
-            // Idempotent: the worktree is already initialized, so `--start` runs
-            // here too — `wt new x --start cmd` behaves the same whether or not
-            // the worktree happens to exist.
-            let ctx = hook_context(&path, &branch, &root, &base_ref);
-            return finish_worktree(
-                cx,
-                hooks,
-                &path,
-                &ctx,
-                Nav {
-                    json,
-                    no_switch: args.no_switch,
-                    note: "worktree already exists at",
-                    start: args.start.as_deref(),
-                },
-            );
+    let env = cx.env.clone();
+    let created = create_in(&session.parts(&env), git, hooks, &options)?;
+
+    crate::commands::log_copy_outcome(cx, &created.copy);
+    // The post-create hook already ran in the service; a failure is a warning,
+    // not a rollback (§8).
+    match &created.post_create {
+        HookOutcome::ExitedNonZero(code) => {
+            cx.err.line(&format!(
+                "warning: post_create hook exited with status {code}"
+            ))?;
         }
-        return Err(Error::operation(format!(
-            "branch {branch:?} is already checked out at {}",
-            existing.path.display()
-        )));
-    }
-
-    let target = resolve_target(
-        &session.config,
-        &root,
-        &branch,
-        &slug,
-        &short_hash,
-        &cx.env,
-        repo.is_bare(),
-    )?;
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Create the worktree (git is atomic here).
-    let target_str = target.to_string_lossy().into_owned();
-    if let Some(base) = &base_ref {
-        // `--no-track` keeps the new branch from inheriting the base as its
-        // upstream (issue #43): git's `branch.autoSetupMerge` would otherwise make
-        // a remote-tracking base the upstream. `--track` opts into an explicit one.
-        ops::worktree_add_branch(git, &root, &branch, &target_str, base, true)?;
-    } else {
-        ops::worktree_add(git, &root, &target_str, &branch)?;
-    }
-
-    // Steps after creation but before the hook are rolled back on failure (§13).
-    let copy_outcome = match post_create_steps(
-        git,
-        repo,
-        &worktrees,
-        &session.config,
-        &root,
-        &branch,
-        &base_ref,
-        &target,
-        args.track.as_deref(),
-        args.copy_from.as_deref(),
-    ) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            // Metadata is written only for a wt-created branch, so delete the
-            // branch and clear metadata together on that condition.
-            let created = base_ref.is_some();
-            rollback_worktree(git, &root, &target, &branch, created, created);
-            return Err(e);
+        HookOutcome::Failed(error) => {
+            cx.err
+                .line(&format!("warning: post_create hook failed: {error}"))?;
         }
-    };
-    crate::commands::log_copy_outcome(cx, &copy_outcome);
-
-    // The post-create hook: a failure is a warning, not a rollback (§8).
-    let ctx = hook_context(&target, &branch, &root, &base_ref);
-    run_post_create(
-        hooks,
-        cx,
-        session.config.hooks_post_create.as_deref(),
-        &ctx,
-        args.no_hooks,
-    )?;
+        HookOutcome::Skipped | HookOutcome::Succeeded => {}
+    }
 
     // Initialize submodules per the policy/flag, prompting (default yes) at an
     // interactive terminal when the policy is left at its default (issue #50).
-    // Non-fatal — the worktree already exists.
-    maybe_init_submodules_interactive(
-        cx,
-        git,
-        &target,
-        session.config.submodules_init,
-        args.submodule_override(),
-        prompt,
-    )?;
+    // Non-fatal — the worktree already exists. The idempotent reuse path skips
+    // this, exactly as it always has.
+    if !created.reused {
+        maybe_init_submodules_interactive(
+            cx,
+            git,
+            &created.path,
+            session.config.submodules_init,
+            args.submodule_override(),
+            prompt,
+        )?;
+    }
 
+    let ctx = HookContext {
+        worktree_path: created.path.clone(),
+        branch: created.branch.clone(),
+        repo_root: root,
+        base_ref: created.base_ref.clone(),
+        pr_number: None,
+    };
     finish_worktree(
         cx,
         hooks,
-        &target,
+        &created.path,
         &ctx,
         Nav {
             json,
             no_switch: args.no_switch,
-            note: "created worktree at",
+            // Idempotent: the worktree is already initialized, so `--start`
+            // runs on the reuse path too.
+            note: if created.reused {
+                "worktree already exists at"
+            } else {
+                "created worktree at"
+            },
             start: args.start.as_deref(),
         },
     )
-}
-
-/// The `WT_*` context for the `post_create` hook and the `--start` command.
-fn hook_context(
-    target: &Path,
-    branch: &str,
-    root: &Path,
-    base_ref: &Option<String>,
-) -> HookContext {
-    HookContext {
-        worktree_path: target.to_path_buf(),
-        branch: branch.to_string(),
-        repo_root: root.to_path_buf(),
-        base_ref: base_ref.clone(),
-        pr_number: None,
-    }
-}
-
-/// Records metadata and runs the copy step (rolled back on error), returning the
-/// copy outcome for `-v` logging.
-#[allow(clippy::too_many_arguments)]
-fn post_create_steps(
-    git: &dyn GitCli,
-    repo: &Repo,
-    worktrees: &[Worktree],
-    config: &crate::config::Config,
-    root: &Path,
-    branch: &str,
-    base_ref: &Option<String>,
-    target: &Path,
-    track: Option<&str>,
-    copy_from: Option<&str>,
-) -> Result<crate::copy::CopyOutcome> {
-    if let Some(base) = base_ref {
-        // A wt-created branch records its base and "created by wt" (§3/§10).
-        wtconfig::write_base_ref(git, root, branch, base)?;
-        wtconfig::mark_created_by_wt(git, root, branch)?;
-    }
-    // `--track <REF>` sets an explicit upstream (issue #43); a bad ref fails here,
-    // inside the rolled-back region, so the half-created worktree is torn down.
-    if let Some(upstream) = track {
-        ops::set_upstream(git, root, branch, upstream)?;
-    }
-    let source = copy_source(repo, worktrees, copy_from, root)?;
-    copy_ignored_files(git, &source, target, &config.copy)
 }
 
 /// The base ref a `new` invocation would fork from, for the pre-flight staleness
@@ -282,12 +163,13 @@ pub(crate) fn prospective_base(
     if resolve_hex(repo.gix(), &branch_ref(&args.branch)).is_some() {
         return None;
     }
-    Some(resolve_base_ref(
-        cx,
-        repo,
-        args.from.as_deref(),
-        &config.default_base,
-    ))
+    let (base, defaulted_to_head) = resolve_base(repo, config, args.from.as_deref());
+    if defaulted_to_head {
+        let _ = cx
+            .err
+            .line("warning: no default branch; basing the new branch on HEAD");
+    }
+    Some(base)
 }
 
 /// Detects whether the base `args` would fork from is behind its upstream (issue
@@ -336,51 +218,6 @@ pub(crate) fn update_stale_base(cx: &mut Cx, args: &NewArgs) -> Result<()> {
         )?;
     }
     Ok(())
-}
-
-/// Resolves the base ref for a new branch: `--from`, then `default_base`, then
-/// the repo default branch, then `HEAD` (warning when falling back).
-fn resolve_base_ref(
-    cx: &mut Cx,
-    repo: &Repo,
-    from: Option<&str>,
-    default_base: &Option<String>,
-) -> String {
-    if let Some(from) = from {
-        return from.to_string();
-    }
-    if let Some(base) = default_base {
-        return base.clone();
-    }
-    if let Some(branch) = default_branch(repo.gix()) {
-        return branch;
-    }
-    let _ = cx
-        .err
-        .line("warning: no default branch; basing the new branch on HEAD");
-    "HEAD".to_string()
-}
-
-/// Resolves the copy source worktree: `--copy-from`, else the current worktree,
-/// else the primary root (spec §8).
-fn copy_source(
-    repo: &Repo,
-    worktrees: &[Worktree],
-    copy_from: Option<&str>,
-    root: &Path,
-) -> Result<PathBuf> {
-    if let Some(query) = copy_from {
-        return match query::resolve(worktrees, query) {
-            Resolved::One(index) => Ok(worktrees[index].path.clone()),
-            Resolved::Ambiguous(_) => Err(Error::operation(format!(
-                "--copy-from {query:?} is ambiguous"
-            ))),
-            Resolved::NotFound => Err(Error::NotFound {
-                query: query.to_string(),
-            }),
-        };
-    }
-    Ok(repo.current_workdir().unwrap_or_else(|| root.to_path_buf()))
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ pub mod time;
 pub mod tui;
 pub mod util;
 pub mod version;
-pub(crate) mod worktree_service;
+pub mod worktree;
 
 #[cfg(test)]
 mod testutil;

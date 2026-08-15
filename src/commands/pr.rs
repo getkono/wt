@@ -18,7 +18,7 @@ use crate::git::{branch_ref, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::slug::slugify_with_fallback;
 use crate::time::{now_unix, parse_iso8601, relative};
-use crate::worktree_service::enumerate_worktrees;
+use crate::worktree::enumerate_worktrees;
 
 /// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
 pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {

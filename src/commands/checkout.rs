@@ -23,7 +23,7 @@ use crate::git::{
     validate_branch_name,
 };
 use crate::hooks::{HookContext, HookRunner};
-use crate::worktree_service::enumerate_worktrees;
+use crate::worktree::enumerate_worktrees;
 
 /// What the post-checkout origin sync did, for the caller's messaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

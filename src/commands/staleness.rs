@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{ahead_behind, branch_ref, is_ancestor, ops, resolve_hex, upstream_of};
-use crate::worktree_service::enumerate_worktrees;
+use crate::worktree::enumerate_worktrees;
 
 /// A base branch found to be behind its upstream (issue #56).
 #[derive(Debug, Clone, PartialEq, Eq)]

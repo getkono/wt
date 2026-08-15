@@ -716,7 +716,7 @@ impl App {
     /// Sorts `worktrees` by the current spec, keeping the base (primary)
     /// worktree pinned first (issue #4).
     fn apply_sort(&mut self) {
-        crate::worktree_service::sort_worktrees_base_first(&mut self.worktrees, self.sort);
+        crate::worktree::sort_worktrees_base_first(&mut self.worktrees, self.sort);
     }
 
     /// Recomputes `visible` from the filter, clamping the selection.
