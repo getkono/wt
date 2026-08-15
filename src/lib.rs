@@ -21,6 +21,7 @@ pub mod git;
 pub mod hooks;
 pub mod keys;
 pub mod model;
+pub mod naming;
 pub mod output;
 pub mod query;
 pub mod slug;
