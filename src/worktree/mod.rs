@@ -34,6 +34,6 @@ pub use service::{
 };
 #[cfg(feature = "cli")]
 pub(crate) use service::{
-    WorkspaceParts, create_in, remove_in, resolve_base, resolve_target, rollback_worktree,
-    run_best_effort, same_path,
+    WorkspaceParts, apply_meta, create_in, lock_repo, remove_in, resolve_base, resolve_target,
+    rollback_worktree, run_best_effort, same_path,
 };

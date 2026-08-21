@@ -17,7 +17,6 @@ use crate::agent::{AgentClient, AgentKind, AgentModel, AgentOptions, Effort};
 use crate::cli::PrOpenArgs;
 use crate::commands::open_session;
 use crate::config::Config;
-use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::gh::{GhClient, OpenPr};
@@ -25,6 +24,7 @@ use crate::git::cli::GitCli;
 use crate::git::refs::current_branch;
 use crate::git::{origin_head_branch, resolve_hex, upstream_of};
 use crate::tui::ComposeSeed;
+use crate::worktree::{MetaUpdate, apply_meta, lock_repo};
 
 /// Dispatches `wt pr open`: gather context, then either open the TUI compose form
 /// (interactive) or submit directly (non-interactive / the global `--yes`), and
@@ -417,7 +417,8 @@ pub(crate) fn submit_pr(
 
 /// Records the new PR's metadata for `branch` (so `wt list`/TUI show it offline,
 /// like a PR checkout does). Skips when no PR number could be parsed; never
-/// marks the branch "created by wt" (it is the user's branch).
+/// marks the branch "created by wt" (it is the user's branch). The snapshot is
+/// written under the advisory repo lock (issue #99) so it lands whole.
 pub(crate) fn record_pr_metadata(
     git: &dyn GitCli,
     root: &Path,
@@ -430,12 +431,18 @@ pub(crate) fn record_pr_metadata(
         return Ok(());
     };
     let state = if outcome.draft { "draft" } else { "open" };
-    wtconfig::write_pr(git, root, branch, number, state, title)?;
-    if !outcome.url.is_empty() {
-        wtconfig::write_pr_url(git, root, branch, &outcome.url)?;
-    }
-    wtconfig::write_base_ref(git, root, branch, trunk)?;
-    Ok(())
+    let update = MetaUpdate {
+        base_ref: Some(trunk.to_string()),
+        pr_number: Some(number),
+        pr_state: Some(state.to_string()),
+        pr_title: Some(title.to_string()),
+        // An empty URL means sendit could not report one; leave the key alone
+        // rather than recording a blank.
+        pr_url: (!outcome.url.is_empty()).then(|| outcome.url.clone()),
+        created_by_wt: false,
+    };
+    let _lock = lock_repo(root)?;
+    apply_meta(git, root, branch, &update)
 }
 
 #[cfg(test)]

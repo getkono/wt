@@ -11,7 +11,9 @@ use crate::git::cli::GitCli;
 use crate::git::{branch_ref, ops, resolve_hex};
 use crate::hooks::HookRunner;
 use crate::model::{RemovedResult, Worktree};
-use crate::worktree::{HookOutcome, build_worktrees, enumerate_worktrees, guard_status, remove_in};
+use crate::worktree::{
+    HookOutcome, build_worktrees, enumerate_worktrees, guard_status, lock_repo, remove_in,
+};
 
 // The CLI shares the service's removal options; re-exported so `drop` and the
 // TUI keep their historical import path. The worktree-removal force is
@@ -163,6 +165,9 @@ pub(crate) fn delete_branch_query(
         )));
     }
 
+    // Deleting the branch and clearing its metadata is one mutation region
+    // under the advisory repo lock (issue #99); no hook runs on this path.
+    let _lock = lock_repo(&root)?;
     let out = ops::delete_branch(git, &root, branch, force)?;
     if !out.success {
         // `git branch -d` refuses an unmerged branch; preserve the "not fully

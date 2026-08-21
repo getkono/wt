@@ -71,6 +71,15 @@ pub(crate) fn acquire_repo_lock(root: &Path, timeout: Duration) -> Result<RepoLo
     Ok(RepoLock { _marker: marker })
 }
 
+/// Acquires the repo-level advisory mutation lock with the standard timeout.
+/// This is the form the command handlers use: they hold the repo root inside a
+/// `Session` rather than a [`Workspace`], which is what [`Workspace::lock`]
+/// serves for library consumers.
+#[cfg(feature = "cli")]
+pub(crate) fn lock_repo(root: &Path) -> Result<RepoLock> {
+    acquire_repo_lock(root, LOCK_TIMEOUT)
+}
+
 /// A discovered repository with its resolved configuration and environment
 /// snapshot: the entry point of the stateless worktree API.
 pub struct Workspace {

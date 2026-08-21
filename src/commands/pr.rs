@@ -8,7 +8,6 @@ use crate::commands::{
     Nav, Session, finish_worktree, maybe_init_submodules_interactive, open_session, resolve_target,
     rollback_worktree,
 };
-use crate::config::wtconfig;
 use crate::copy::copy_ignored_files;
 use crate::cx::Cx;
 use crate::error::Result;
@@ -18,7 +17,7 @@ use crate::git::{branch_ref, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner, run_post_create};
 use crate::slug::slugify_with_fallback;
 use crate::time::{now_unix, parse_iso8601, relative};
-use crate::worktree::enumerate_worktrees;
+use crate::worktree::{MetaUpdate, apply_meta, enumerate_worktrees, lock_repo};
 
 /// Dispatches `pr list`, `pr <target>` (checkout), or `pr` (picker, TUI).
 pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &PrArgs, json: bool) -> Result<u8> {
@@ -201,7 +200,6 @@ pub(crate) fn checkout_pr_worktree(
     let branch = view.head_ref_name.clone();
     let base = view.base_ref_name.clone();
     let number = view.number;
-    let state = view.pr_state();
 
     // If the PR's head branch is already a worktree, record/refresh its PR
     // metadata (§7) and switch to it. The worktree was not necessarily created
@@ -212,9 +210,11 @@ pub(crate) fn checkout_pr_worktree(
         .find(|w| w.branch.as_deref() == Some(branch.as_str()))
     {
         let path = existing.path.clone();
-        wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
-        wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
-        wtconfig::write_base_ref(git, &root, &branch, &base)?;
+        // The whole snapshot lands under the advisory repo lock (issue #99):
+        // no other writer may see half of it.
+        let lock = lock_repo(&root)?;
+        apply_meta(git, &root, &branch, &pr_meta(&view, &base, false))?;
+        drop(lock);
         let ctx = pr_hook_context(&path, &branch, &root, &base, number);
         return Ok(PrCheckout {
             path,
@@ -240,6 +240,7 @@ pub(crate) fn checkout_pr_worktree(
     // it out as-is rather than failing on `-b` (mirrors `wt new`).
     let branch_exists = resolve_hex(session.repo.gix(), &branch_ref(&branch)).is_some();
 
+    let lock = lock_repo(&root)?;
     let worktree_path = resolve_target(
         &session.config,
         &root,
@@ -259,17 +260,12 @@ pub(crate) fn checkout_pr_worktree(
         ops::worktree_add_branch(git, &root, &branch, &target_str, "FETCH_HEAD", false)?;
     }
 
-    // Record metadata + copy, rolling back on failure (§13).
+    // Record metadata + copy, rolling back on failure (§13). Only mark "created
+    // by wt" when we actually created the branch here; a pre-existing branch
+    // belongs to the user and must not be branch-deleted by a later `remove`
+    // (spec §10).
     let copy_outcome = match (|| -> Result<crate::copy::CopyOutcome> {
-        wtconfig::write_pr(git, &root, &branch, number, state.as_str(), &view.title)?;
-        wtconfig::write_pr_url(git, &root, &branch, &view.url)?;
-        wtconfig::write_base_ref(git, &root, &branch, &base)?;
-        // Only mark "created by wt" when we actually created the branch here; a
-        // pre-existing branch belongs to the user and must not be branch-deleted
-        // by a later `remove` (spec §10).
-        if !branch_exists {
-            wtconfig::mark_created_by_wt(git, &root, &branch)?;
-        }
+        apply_meta(git, &root, &branch, &pr_meta(&view, &base, !branch_exists))?;
         let source = session
             .repo
             .current_workdir()
@@ -284,6 +280,10 @@ pub(crate) fn checkout_pr_worktree(
             return Err(e);
         }
     };
+    // Everything from target resolution to the copy step is one mutation region
+    // (issue #99). The lock is released before the `post_create` hook, which may
+    // re-enter `wt` — exactly as `Workspace::create` does.
+    drop(lock);
     crate::commands::log_copy_outcome(cx, &copy_outcome);
 
     let ctx = pr_hook_context(&worktree_path, &branch, &root, &base, number);
@@ -312,6 +312,20 @@ pub(crate) fn checkout_pr_worktree(
         existed: false,
         ctx,
     })
+}
+
+/// The `wt.*` metadata a PR checkout records for its head branch (§7): the
+/// cached PR snapshot plus the base ref, and "created by wt" only when this
+/// command created the branch.
+fn pr_meta(view: &crate::gh::PrView, base: &str, created_here: bool) -> MetaUpdate {
+    MetaUpdate {
+        base_ref: Some(base.to_string()),
+        pr_number: Some(view.number),
+        pr_state: Some(view.pr_state().as_str().to_string()),
+        pr_title: Some(view.title.clone()),
+        pr_url: Some(view.url.clone()),
+        created_by_wt: created_here,
+    }
 }
 
 /// The `WT_*` context for a PR worktree's `post_create` hook and `--start`
@@ -434,6 +448,31 @@ mod tests {
             repo.git(&["config", "--get", "wt.pr-feature.prUrl"])
                 .contains("pull/123")
         );
+    }
+
+    #[test]
+    fn pr_checkout_releases_the_lock_before_the_post_create_hook() {
+        // The `wt pr` mutation region takes the advisory repo lock (issue #99),
+        // but a hook may re-enter `wt`, so the lock must be gone by the time it
+        // runs. The hook itself proves the lock file is absent.
+        let repo = repo_with_pr(77);
+        repo.write(
+            ".wt.toml",
+            "[hooks]\npost_create = \"test ! -e \\\"$WT_REPO_ROOT/.git/wt-mutation.lock\\\" && touch unlocked\"\n",
+        );
+        repo.commit_all("config");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = Arc::new(FakeGh::with_view(view(77, "pr-feature", "main")));
+        let mut a = pr_args(Some("77"), None);
+        a.no_hooks = false;
+        let code = super::run(&mut t.cx, &RealHookRunner, &a, false).unwrap();
+        assert_eq!(code, 0);
+        // The marker proves the hook ran *and* saw no lock file; a failing hook
+        // is non-fatal, so the exit code alone would not.
+        let path = std::path::PathBuf::from(t.out.contents().trim());
+        assert!(path.join("unlocked").exists(), "{}", t.err.contents());
+        // ...and the lock is not left behind afterwards either.
+        assert!(!repo.root().join(".git/wt-mutation.lock").exists());
     }
 
     #[test]
