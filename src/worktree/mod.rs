@@ -29,8 +29,8 @@ pub(crate) use rows::{
 #[cfg(feature = "tui")]
 pub(crate) use rows::{enumerate_rows, sort_worktrees_base_first};
 pub use service::{
-    CreateOptions, CreatedWorktree, HookOutcome, RemoveOptions, RemovedWorktree, RepoLock,
-    SubmodulesOutcome, Workspace,
+    CreateOptions, CreatedWorktree, HookOutcome, MetaUpdate, RemoveOptions, RemovedWorktree,
+    RepoLock, SubmodulesOutcome, Workspace,
 };
 #[cfg(feature = "cli")]
 pub(crate) use service::{

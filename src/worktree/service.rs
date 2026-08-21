@@ -161,10 +161,33 @@ impl Workspace {
         rows::build_worktrees(&self.fresh_repo()?, git)
     }
 
-    /// Reads the `wt.*` metadata recorded for `branch`. Writes go through the
-    /// [`wtconfig`] functions with [`Workspace::root`] as the repo root.
+    /// Reads the `wt.*` metadata recorded for `branch`.
     pub fn read_meta(&self, branch: &str) -> Result<WtMeta> {
         Ok(wtconfig::read_meta(self.fresh_repo()?.gix(), branch))
+    }
+
+    /// Writes the `Some` fields of `update` to `branch`'s `wt.*` metadata,
+    /// leaving every other recorded key alone (issue #95).
+    ///
+    /// The whole update is applied under the advisory repository lock (issue
+    /// #99), so a concurrent writer never observes half a bundle — do not call
+    /// this while already holding a [`RepoLock`]. To make a read-check-write
+    /// sequence atomic, take [`Workspace::lock`] and drive the [`wtconfig`]
+    /// setters directly instead.
+    pub fn write_meta(&self, git: &dyn GitCli, branch: &str, update: &MetaUpdate) -> Result<()> {
+        let repo = self.fresh_repo()?;
+        wtconfig::ensure_schema_supported(repo.gix())?;
+        let _lock = self.lock()?;
+        apply_meta(git, &self.primary_root, branch, update)
+    }
+
+    /// Removes every `wt.<branch>.*` key, under the advisory repository lock.
+    /// A branch with no recorded metadata is not an error.
+    pub fn clear_meta(&self, git: &dyn GitCli, branch: &str) -> Result<()> {
+        let repo = self.fresh_repo()?;
+        wtconfig::ensure_schema_supported(repo.gix())?;
+        let _lock = self.lock()?;
+        wtconfig::clear_meta(git, &self.primary_root, branch)
     }
 
     /// Creates (or reuses) a linked worktree per `options`: resolves the target
@@ -225,6 +248,56 @@ impl Workspace {
     pub(crate) fn into_session_parts(self) -> (Repo, PathBuf, Config) {
         (self.repo, self.primary_root, self.config)
     }
+}
+
+/// A `wt.<branch>.*` metadata update for [`Workspace::write_meta`]: every
+/// `Some` field is written and every `None` field leaves the recorded value
+/// untouched, so a caller refreshing one key cannot clobber the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetaUpdate {
+    /// The base ref the branch was created from (spec §3).
+    pub base_ref: Option<String>,
+    /// The associated PR number (spec §7).
+    pub pr_number: Option<u64>,
+    /// The cached PR state, so `wt list` can show it offline.
+    pub pr_state: Option<String>,
+    /// The cached PR title.
+    pub pr_title: Option<String>,
+    /// The cached PR URL.
+    pub pr_url: Option<String>,
+    /// Marks the branch as created by `wt` (spec §10), which is what allows a
+    /// later remove to delete it. There is no un-marking: `false` leaves the
+    /// recorded flag as it is.
+    pub created_by_wt: bool,
+}
+
+/// Applies a [`MetaUpdate`] with no locking, for callers already inside a
+/// locked mutation region ([`create_in`], the `wt pr` checkout path).
+pub(crate) fn apply_meta(
+    git: &dyn GitCli,
+    root: &Path,
+    branch: &str,
+    update: &MetaUpdate,
+) -> Result<()> {
+    if let Some(base_ref) = &update.base_ref {
+        wtconfig::write_base_ref(git, root, branch, base_ref)?;
+    }
+    if let Some(number) = update.pr_number {
+        wtconfig::write_pr_number(git, root, branch, number)?;
+    }
+    if let Some(state) = &update.pr_state {
+        wtconfig::write_pr_state(git, root, branch, state)?;
+    }
+    if let Some(title) = &update.pr_title {
+        wtconfig::write_pr_title(git, root, branch, title)?;
+    }
+    if let Some(url) = &update.pr_url {
+        wtconfig::write_pr_url(git, root, branch, url)?;
+    }
+    if update.created_by_wt {
+        wtconfig::mark_created_by_wt(git, root, branch)?;
+    }
+    Ok(())
 }
 
 /// Options for [`Workspace::create`].
@@ -499,8 +572,18 @@ fn post_create_steps(
 ) -> Result<CopyOutcome> {
     if let Some(base) = base_ref {
         // A wt-created branch records its base and "created by wt" (§3/§10).
-        wtconfig::write_base_ref(git, ws.root, branch, base)?;
-        wtconfig::mark_created_by_wt(git, ws.root, branch)?;
+        // The caller already holds the repo lock, so this applies the bundle
+        // directly rather than through `Workspace::write_meta`.
+        apply_meta(
+            git,
+            ws.root,
+            branch,
+            &MetaUpdate {
+                base_ref: Some(base.clone()),
+                created_by_wt: true,
+                ..MetaUpdate::default()
+            },
+        )?;
     }
     // `--track <REF>` sets an explicit upstream (issue #43); a bad ref fails
     // here, inside the rolled-back region.
@@ -1006,6 +1089,132 @@ mod tests {
         let feat = row_for(&ws, "feature/x");
         assert_eq!(feat.dirty, Some(false));
         assert_eq!(feat.base_ref.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn write_meta_applies_only_the_set_fields() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        ws.create(&RealGit, &RealHookRunner, &create_opts("feature/x"))
+            .unwrap();
+        ws.write_meta(
+            &RealGit,
+            "feature/x",
+            &MetaUpdate {
+                pr_number: Some(7),
+                pr_state: Some("open".into()),
+                pr_title: Some("Add x".into()),
+                pr_url: Some("https://example.test/7".into()),
+                ..MetaUpdate::default()
+            },
+        )
+        .unwrap();
+        let meta = ws.read_meta("feature/x").unwrap();
+        assert_eq!(meta.pr_number, Some(7));
+        assert_eq!(meta.pr_state.as_deref(), Some("open"));
+        assert_eq!(meta.pr_title.as_deref(), Some("Add x"));
+        assert_eq!(meta.pr_url.as_deref(), Some("https://example.test/7"));
+        // The keys `create` recorded survive an update that does not name them.
+        assert_eq!(meta.base_ref.as_deref(), Some("main"));
+        assert!(meta.created_by_wt);
+
+        // A narrower update refreshes one key and leaves the rest.
+        ws.write_meta(
+            &RealGit,
+            "feature/x",
+            &MetaUpdate {
+                pr_state: Some("merged".into()),
+                ..MetaUpdate::default()
+            },
+        )
+        .unwrap();
+        let meta = ws.read_meta("feature/x").unwrap();
+        assert_eq!(meta.pr_state.as_deref(), Some("merged"));
+        assert_eq!(meta.pr_number, Some(7));
+        assert_eq!(meta.pr_title.as_deref(), Some("Add x"));
+    }
+
+    #[test]
+    fn write_meta_marks_created_by_wt_but_never_unmarks() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["branch", "solo"]);
+        // An empty update writes nothing at all.
+        ws.write_meta(&RealGit, "solo", &MetaUpdate::default())
+            .unwrap();
+        assert_eq!(ws.read_meta("solo").unwrap(), WtMeta::default());
+
+        ws.write_meta(
+            &RealGit,
+            "solo",
+            &MetaUpdate {
+                created_by_wt: true,
+                ..MetaUpdate::default()
+            },
+        )
+        .unwrap();
+        assert!(ws.read_meta("solo").unwrap().created_by_wt);
+        // `false` is "leave it alone", not "un-mark".
+        ws.write_meta(&RealGit, "solo", &MetaUpdate::default())
+            .unwrap();
+        assert!(ws.read_meta("solo").unwrap().created_by_wt);
+    }
+
+    #[test]
+    fn clear_meta_removes_the_section_and_tolerates_a_missing_one() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        ws.create(&RealGit, &RealHookRunner, &create_opts("feature/x"))
+            .unwrap();
+        assert!(ws.read_meta("feature/x").unwrap().created_by_wt);
+        ws.clear_meta(&RealGit, "feature/x").unwrap();
+        assert_eq!(ws.read_meta("feature/x").unwrap(), WtMeta::default());
+        // Clearing a branch that never had metadata is not an error.
+        ws.clear_meta(&RealGit, "never-recorded").unwrap();
+    }
+
+    #[test]
+    fn metadata_writes_take_the_repo_lock() {
+        // The bundle must not interleave with another writer (issue #99).
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["branch", "locked"]);
+        let held = ws.lock().unwrap();
+        let err = ws
+            .write_meta(
+                &RealGit,
+                "locked",
+                &MetaUpdate {
+                    pr_number: Some(1),
+                    ..MetaUpdate::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::LockUnavailable { .. }), "{err:?}");
+        let err = ws.clear_meta(&RealGit, "locked").unwrap_err();
+        assert!(matches!(err, Error::LockUnavailable { .. }), "{err:?}");
+        drop(held);
+        ws.clear_meta(&RealGit, "locked").unwrap();
+    }
+
+    #[test]
+    fn metadata_writes_refuse_a_future_schema() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["branch", "stamped"]);
+        repo.git(&["config", "wt.schema", "3"]);
+        let err = ws
+            .write_meta(&RealGit, "stamped", &MetaUpdate::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::SchemaTooNew { found: 3, .. }),
+            "{err:?}"
+        );
+        let err = ws.clear_meta(&RealGit, "stamped").unwrap_err();
+        assert!(
+            matches!(err, Error::SchemaTooNew { found: 3, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]

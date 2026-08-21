@@ -122,7 +122,19 @@ pub fn write_pr(
     title: &str,
 ) -> Result<()> {
     write_pr_number(git, repo_root, branch, number)?;
+    write_pr_state(git, repo_root, branch, state)?;
+    write_pr_title(git, repo_root, branch, title)?;
+    Ok(())
+}
+
+/// Records the cached PR state for `branch`, so `wt list` can show it offline.
+pub fn write_pr_state(git: &dyn GitCli, repo_root: &Path, branch: &str, state: &str) -> Result<()> {
     git.run(repo_root, &["config", &key(branch, "prState"), state])?;
+    Ok(())
+}
+
+/// Records the cached PR title for `branch`.
+pub fn write_pr_title(git: &dyn GitCli, repo_root: &Path, branch: &str, title: &str) -> Result<()> {
     git.run(repo_root, &["config", &key(branch, "prTitle"), title])?;
     Ok(())
 }
