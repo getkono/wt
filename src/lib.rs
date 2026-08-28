@@ -10,7 +10,9 @@
 //! whole dispatch path testable without touching the real terminal.
 
 pub mod agent;
+#[cfg(feature = "cli")]
 pub(crate) mod cli;
+#[cfg(feature = "cli")]
 pub(crate) mod commands;
 pub mod config;
 pub mod copy;
@@ -19,17 +21,20 @@ pub mod error;
 pub mod gh;
 pub mod git;
 pub mod hooks;
+#[cfg(feature = "tui")]
 pub mod keys;
 pub mod model;
+pub mod naming;
 pub mod output;
 pub mod query;
 pub mod slug;
 pub mod template;
 pub mod time;
+#[cfg(feature = "tui")]
 pub mod tui;
 pub mod util;
 pub mod version;
-pub(crate) mod worktree_service;
+pub mod worktree;
 
 #[cfg(test)]
 mod testutil;
@@ -39,12 +44,14 @@ pub use error::{Error, Result};
 
 /// Runs `wt` with the given command-line arguments (excluding `argv[0]`),
 /// writing through the provided [`Cx`], and returns the process exit code.
+#[cfg(feature = "cli")]
 pub fn run(args: Vec<String>, cx: &mut Cx) -> u8 {
     let result = cli::dispatch(args, cx);
     finish(result, &mut cx.err)
 }
 
 /// Maps a command result to an exit code, reporting any error to `err`.
+#[cfg(feature = "cli")]
 fn finish(result: Result<u8>, err: &mut Stream) -> u8 {
     match result {
         Ok(code) => code,
@@ -55,7 +62,9 @@ fn finish(result: Result<u8>, err: &mut Stream) -> u8 {
     }
 }
 
-#[cfg(test)]
+// The dispatch tests exercise the full application surface (`run` with no
+// subcommand reaches the TUI), so they need the default feature set.
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
     use crate::testutil::test_cx;

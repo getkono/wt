@@ -30,7 +30,8 @@ pub fn paint(text: &str, code: &str, enabled: bool) -> String {
 }
 
 /// How to colorize output, as selected by `--color` or the `ui.color` config.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 pub enum ColorChoice {
     /// Color when the relevant stream is a TTY.
     Auto,

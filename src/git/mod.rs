@@ -23,9 +23,14 @@ pub(crate) use aheadbehind::ahead_behind;
 pub use cli::{GitCli, GitOutput, RealGit};
 pub(crate) use commit::{CommitInfo, abbrev_len, commit_info, recent_commits};
 pub(crate) use refs::{
-    Upstream, all_branches, branch_ref, current_branch, default_base_ref, default_branch,
-    is_ancestor, local_branches, origin_head_branch, remote_branches, resolve_hex, upstream_of,
+    Upstream, branch_ref, default_branch, is_ancestor, local_branches, resolve_hex, upstream_of,
     validate_branch_name,
 };
+// Only the command handlers reach for these; the core library does not.
+#[cfg(feature = "cli")]
+pub(crate) use refs::{all_branches, current_branch, remote_branches};
+// Only the TUI reaches for these.
+#[cfg(feature = "tui")]
+pub(crate) use refs::{default_base_ref, origin_head_branch};
 pub(crate) use status::status_of;
 pub(crate) use worktrees::enumerate;

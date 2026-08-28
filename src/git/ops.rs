@@ -79,6 +79,7 @@ pub(crate) fn delete_branch(
 }
 
 /// Points `branch` at `to` without checking it out (`git branch -f`).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn set_branch_ref(
     git: &dyn GitCli,
     root: &Path,
@@ -100,11 +101,13 @@ pub(crate) fn set_upstream(
 
 /// Fetches `remote` (`git fetch <remote>`), returning the raw [`GitOutput`] so the
 /// caller can treat a failure as non-fatal (an offline best-effort sync).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn fetch(git: &dyn GitCli, dir: &Path, remote: &str) -> Result<GitOutput> {
     git.run_raw(dir, &["fetch", remote])
 }
 
 /// Fetches a single `refspec` from `remote` (`git fetch <remote> <refspec>`).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn fetch_refspec(
     git: &dyn GitCli,
     dir: &Path,
@@ -116,6 +119,7 @@ pub(crate) fn fetch_refspec(
 
 /// Fast-forwards the branch checked out at `dir` to `tracking_ref`
 /// (`git merge --ff-only`). Errors if the merge is not a fast-forward.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn merge_ff_only(git: &dyn GitCli, dir: &Path, tracking_ref: &str) -> Result<String> {
     git.run(dir, &["merge", "--ff-only", tracking_ref])
 }
@@ -124,6 +128,7 @@ pub(crate) fn merge_ff_only(git: &dyn GitCli, dir: &Path, tracking_ref: &str) ->
 /// [`GitOutput`] so the caller can interpret a rejected (non-fast-forward) push
 /// as a sentinel rather than a hard error. Never force-pushes, and always pushes
 /// the named branch explicitly (independent of `push.default`).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn push(git: &dyn GitCli, dir: &Path, remote: &str, branch: &str) -> Result<GitOutput> {
     git.run_raw(dir, &["push", remote, branch])
 }

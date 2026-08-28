@@ -23,7 +23,7 @@ use crate::git::{
     validate_branch_name,
 };
 use crate::hooks::{HookContext, HookRunner};
-use crate::worktree_service::enumerate_worktrees;
+use crate::worktree::enumerate_worktrees;
 
 /// What the post-checkout origin sync did, for the caller's messaging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +290,7 @@ pub(crate) fn remote_configured(repo: &gix::Repository, remote: &str) -> bool {
 }
 
 /// A human suffix describing the sync outcome, for the TUI status line.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn sync_suffix(outcome: SyncOutcome) -> &'static str {
     match outcome {
         SyncOutcome::FastForwarded => " (fast-forwarded)",

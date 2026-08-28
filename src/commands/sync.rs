@@ -23,7 +23,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::{branch_ref, current_branch, enumerate, is_ancestor, ops, status_of, upstream_of};
-use crate::worktree_service::{build_rows, build_worktrees};
+use crate::worktree::{build_rows, build_worktrees};
 
 /// What a sync did to a worktree's branch, for the caller's messaging (CLI + TUI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +371,7 @@ fn outcome_note(outcome: SyncOutcome) -> &'static str {
 }
 
 /// A human suffix describing the sync outcome, for the TUI status line.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn sync_suffix(outcome: SyncOutcome) -> &'static str {
     match outcome {
         SyncOutcome::FastForwarded => " (fast-forwarded)",

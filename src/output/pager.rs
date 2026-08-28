@@ -32,10 +32,18 @@ pub fn should_page(is_tty: bool, no_pager: bool, content: &str, rows: usize) -> 
 }
 
 /// The terminal height, or a default.
+#[cfg(feature = "tui")]
 fn terminal_rows() -> usize {
     crossterm::terminal::size()
         .map(|(_, h)| usize::from(h))
         .unwrap_or(DEFAULT_ROWS)
+}
+
+/// The terminal height, or a default. Without the TUI feature there is no
+/// terminal backend to probe, so the default stands in.
+#[cfg(not(feature = "tui"))]
+fn terminal_rows() -> usize {
+    DEFAULT_ROWS
 }
 
 /// Spawns the pager and feeds it `content`.

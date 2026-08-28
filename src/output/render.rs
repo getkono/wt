@@ -107,6 +107,7 @@ pub fn cell(worktree: &Worktree, column: Column, ctx: &RenderCtx) -> String {
 }
 
 /// Renders the detailed `wt status` block for one worktree (spec §7).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "worktree: {}", worktree.path.display());

@@ -15,7 +15,7 @@ use crate::git::{
     branch_ref, current_branch, default_branch, is_ancestor, local_branches, ops, upstream_of,
 };
 use crate::model::Worktree;
-use crate::worktree_service::{build_worktrees, guard_status};
+use crate::worktree::{build_worktrees, guard_status, lock_repo};
 
 /// A prune target: an existing worktree (an index into the worktree list) or a
 /// bare local branch — one with no worktree — that qualified for removal.
@@ -92,6 +92,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     if candidates.is_empty() {
         cx.err.line("nothing to prune")?;
+        let _lock = lock_repo(&root)?;
         ops::worktree_prune(git, &root)?;
         return Ok(0);
     }
@@ -109,6 +110,10 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         }
     }
 
+    // Every removal below deletes worktrees, branches, and `wt.*` metadata, so
+    // the whole loop is one mutation region under the advisory repo lock (issue
+    // #99). `prune` runs no hooks, so nothing inside can re-enter `wt`.
+    let lock = lock_repo(&root)?;
     let mut removed = 0_usize;
     for candidate in &candidates {
         let pruned = match candidate {
@@ -126,6 +131,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     // Reconcile Git's worktree admin metadata (equivalent to `git worktree prune`).
     ops::worktree_prune(git, &root)?;
+    drop(lock);
     tracing::debug!(removed, "prune: done");
     cx.err.line(&format!("pruned {removed} item(s)"))?;
     Ok(0)
@@ -331,6 +337,8 @@ fn delete_merged_branch(
 #[cfg(test)]
 mod tests {
     use crate::cli::PruneArgs;
+    use crate::error::Error;
+    use crate::git::cli::RealGit;
     use crate::testutil::{CannedInput, TestRepo, make_wt, wt_dir};
 
     fn prune_args(merged: bool, gone: bool, dry_run: bool, force: bool) -> PruneArgs {
@@ -421,6 +429,23 @@ mod tests {
                 .trim()
                 .is_empty()
         );
+    }
+
+    /// Prune's removal loop deletes worktrees, branches, and `wt.*` metadata,
+    /// so it runs under the advisory repo lock (issue #99). A concurrent holder
+    /// blocks it outright rather than letting it interleave — and nothing is
+    /// removed when it does.
+    #[test]
+    fn prune_is_excluded_by_a_concurrent_lock_holder() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "merged-wt");
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let ws = crate::worktree::Workspace::discover(repo.root(), &t.cx.env, &RealGit).unwrap();
+        let held = ws.lock().unwrap();
+        let err = super::run(&mut t.cx, &prune_args(true, false, false, true), false).unwrap_err();
+        drop(held);
+        assert!(matches!(err, Error::LockUnavailable { .. }), "{err:?}");
+        assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
     }
 
     #[test]

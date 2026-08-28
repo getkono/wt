@@ -1,14 +1,17 @@
 //! The resolved [`Config`] and the per-layer [`ConfigLayer`], plus the merge
 //! semantics (spec §11).
 
+#[cfg(feature = "tui")]
 use ratatui::style::Color;
 
 use crate::agent::{AgentModel, Effort};
 use crate::cx::Env;
+#[cfg(feature = "tui")]
 use crate::keys::{KeyAction, KeyChord, Keymap};
 use crate::model::Column;
 use crate::output::color::{ColorChoice, resolve_color};
 use crate::template::DEFAULT_TEMPLATE;
+#[cfg(feature = "tui")]
 use crate::tui::theme::{Palette, ThemePreset};
 
 /// When to initialize git submodules after a worktree is created or a branch is
@@ -84,10 +87,13 @@ pub struct Config {
     /// Color output setting (reconciled with `--color`/`NO_COLOR`).
     pub ui_color: ColorChoice,
     /// Built-in theme preset (the base TUI palette).
+    #[cfg(feature = "tui")]
     pub ui_theme: ThemePreset,
     /// Per-color overrides layered on top of the preset (`[ui.theme]`).
+    #[cfg(feature = "tui")]
     pub theme_overrides: ThemeOverrides,
     /// Accumulated `ui.keybindings` overrides (applied over the defaults).
+    #[cfg(feature = "tui")]
     pub keybinding_overrides: Vec<(KeyAction, KeyChord)>,
 }
 
@@ -111,8 +117,11 @@ impl Default for Config {
             ui_nerd_fonts: false,
             ui_mouse: true,
             ui_color: ColorChoice::Auto,
+            #[cfg(feature = "tui")]
             ui_theme: ThemePreset::default(),
+            #[cfg(feature = "tui")]
             theme_overrides: ThemeOverrides::default(),
+            #[cfg(feature = "tui")]
             keybinding_overrides: Vec::new(),
         }
     }
@@ -176,15 +185,19 @@ impl Config {
         if let Some(v) = layer.ui_color {
             self.ui_color = v;
         }
-        if let Some(v) = layer.ui_theme {
-            self.ui_theme = v;
+        #[cfg(feature = "tui")]
+        {
+            if let Some(v) = layer.ui_theme {
+                self.ui_theme = v;
+            }
+            self.theme_overrides.merge(layer.theme_overrides);
+            self.keybinding_overrides.extend(layer.ui_keybindings);
         }
-        self.theme_overrides.merge(layer.theme_overrides);
-        self.keybinding_overrides.extend(layer.ui_keybindings);
     }
 
     /// Resolves the effective TUI [`Palette`]: the selected preset's base palette
     /// with any `[ui.theme]` per-color overrides applied on top.
+    #[cfg(feature = "tui")]
     pub fn palette(&self) -> Palette {
         let mut palette = self.ui_theme.palette();
         self.theme_overrides.apply_to(&mut palette);
@@ -193,6 +206,7 @@ impl Config {
 
     /// Builds the effective TUI keymap: the defaults with the configured
     /// overrides applied in order.
+    #[cfg(feature = "tui")]
     pub fn keymap(&self) -> Keymap {
         let mut keymap = Keymap::defaults();
         for (action, chord) in &self.keybinding_overrides {
@@ -252,15 +266,19 @@ pub struct ConfigLayer {
     /// `ui.color`.
     pub ui_color: Option<ColorChoice>,
     /// `ui.theme.preset`.
+    #[cfg(feature = "tui")]
     pub ui_theme: Option<ThemePreset>,
     /// `[ui.theme]` per-color overrides present in this layer.
+    #[cfg(feature = "tui")]
     pub theme_overrides: ThemeOverrides,
     /// `ui.keybindings` (action → chord) overrides.
+    #[cfg(feature = "tui")]
     pub ui_keybindings: Vec<(KeyAction, KeyChord)>,
 }
 
 /// Per-color overrides for the TUI palette (`[ui.theme]`). Each field mirrors a
 /// [`Palette`] slot; `None` leaves the preset's color untouched.
+#[cfg(feature = "tui")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ThemeOverrides {
     /// `ui.theme.accent`.
@@ -285,6 +303,7 @@ pub struct ThemeOverrides {
     pub chip_fg: Option<Color>,
 }
 
+#[cfg(feature = "tui")]
 impl ThemeOverrides {
     /// Merges another layer's overrides on top of these (set slots win).
     pub fn merge(&mut self, other: ThemeOverrides) {
@@ -338,6 +357,7 @@ impl ThemeOverrides {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tui")]
     use crossterm::event::KeyCode;
 
     #[test]
@@ -448,6 +468,7 @@ mod tests {
         assert!(!c.color_enabled(None, &no_color, true));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn keybindings_deep_merge_per_action() {
         let mut c = Config::default();
@@ -482,6 +503,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn theme_defaults_to_one_dark() {
         let c = Config::default();
@@ -490,6 +512,7 @@ mod tests {
         assert_eq!(c.palette(), Palette::one_dark());
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn theme_preset_and_overrides_apply_and_merge() {
         let mut c = Config::default();
@@ -519,6 +542,7 @@ mod tests {
         assert_eq!(p.green, Palette::solarized().green);
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn later_theme_override_wins_for_same_slot() {
         let mut o = ThemeOverrides {

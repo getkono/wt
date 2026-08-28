@@ -28,7 +28,7 @@ use crate::tui::app::{
 use crate::tui::event::{CreateDecision, Effect};
 use crate::tui::terminal::{Tui, install_panic_hook};
 use crate::util::editor::{editor_argv, resolve_editor};
-use crate::worktree_service::{build_rows, enumerate_rows, enumerate_worktrees};
+use crate::worktree::{build_rows, enumerate_rows, enumerate_worktrees};
 
 mod effects;
 use effects::*;

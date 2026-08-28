@@ -7,7 +7,7 @@ use crate::cx::Cx;
 use crate::error::Result;
 use crate::git::discover::Repo;
 use crate::git::{all_branches, local_branches};
-use crate::worktree_service::enumerate_worktrees;
+use crate::worktree::enumerate_worktrees;
 
 /// Prints completion candidates for the requested kind, filtered by the partial
 /// token. Any failure results in no output (silent degradation).

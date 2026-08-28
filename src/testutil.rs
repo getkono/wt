@@ -246,6 +246,7 @@ pub(crate) struct CannedInput(VecDeque<String>);
 
 impl CannedInput {
     /// Builds a canned input from the given responses (newlines are appended).
+    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
     pub(crate) fn new(lines: &[&str]) -> Self {
         CannedInput(lines.iter().map(|l| format!("{l}\n")).collect())
     }
@@ -446,6 +447,7 @@ impl TestRepo {
 
 /// Creates a wt-managed worktree on `branch` via the real `new` command, in a
 /// throwaway context. Shared by the prune/remove/checkout test modules.
+#[cfg(feature = "cli")]
 pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
     let mut t = test_cx(&[], repo.root().to_str().unwrap());
     crate::commands::new::run(
@@ -470,6 +472,7 @@ pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
 
 /// The path `wt new <branch>` produces for `repo` — the
 /// `<repo>.worktrees/<repo>-<branch>` sibling — without creating it.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn wt_dir(repo: &TestRepo, branch: &str) -> PathBuf {
     let repo_name = repo.root().file_name().unwrap().to_string_lossy();
     repo.root()
@@ -480,6 +483,7 @@ pub(crate) fn wt_dir(repo: &TestRepo, branch: &str) -> PathBuf {
 
 /// Gives `branch` an upstream at its current tip (ahead/behind 0), so the
 /// no-upstream "unpushed" guard does not apply.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn give_upstream(repo: &TestRepo, branch: &str) {
     repo.git(&[
         "update-ref",

@@ -15,6 +15,7 @@ pub(crate) struct Upstream {
 }
 
 /// Lists local branch names (without the `refs/heads/` prefix).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let platform = repo
         .references()
@@ -35,6 +36,7 @@ pub(crate) fn local_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// Lists remote-tracking branch names (e.g. `origin/main`), skipping the
 /// symbolic `<remote>/HEAD` pointers (which alias a real branch, not a fork
 /// candidate). Names keep their remote prefix so they read unambiguously.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let platform = repo
         .references()
@@ -60,6 +62,7 @@ pub(crate) fn remote_branches(repo: &gix::Repository) -> Result<Vec<String>> {
 /// Lists every branch a new worktree can fork from or check out: local branches
 /// first (sorted), then remote-tracking branches (sorted). Best-effort — used to
 /// populate the TUI create-prompt options dropdown (issue #25).
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn all_branches(repo: &gix::Repository) -> Result<Vec<String>> {
     let mut names = local_branches(repo)?;
     names.extend(remote_branches(repo)?);
@@ -144,6 +147,7 @@ pub(crate) fn default_branch(repo: &gix::Repository) -> Option<String> {
 /// remote tip keeps new branches based on the up-to-date default rather than a
 /// possibly-stale local copy. `None` when `origin/HEAD` is unset (no remote, or
 /// the repo was never cloned) — callers then fall back to their own default.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn default_base_ref(repo: &gix::Repository) -> Option<String> {
     origin_head_tracking(repo)
 }
@@ -156,6 +160,7 @@ pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
 
 /// The branch that `refs/remotes/origin/HEAD` points to, if any (the short name,
 /// e.g. `main`). Drives default-branch resolution and PR trunk detection.
+#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub(crate) fn origin_head_branch(repo: &gix::Repository) -> Option<String> {
     // The tracking form is `origin/<branch>`; drop the remote to get the branch
     // (handles slashes in branch names).

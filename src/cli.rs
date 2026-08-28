@@ -910,6 +910,7 @@ mod tests {
         assert_eq!(t.cx.cwd, PathBuf::from("/abs"));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn repo_scoped_commands_fail_outside_a_repo() {
         // From a non-repo dir, switch/ui (TUI) and the no-subcommand launch all

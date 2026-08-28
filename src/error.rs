@@ -73,6 +73,41 @@ pub enum Error {
     #[error("{0}")]
     AgentUnavailable(String),
 
+    /// The repository's `wt.schema` was written by a newer `wt` (or embedder)
+    /// than this one; reading it could silently misinterpret metadata, so the
+    /// operation is refused (issue #99).
+    #[error(
+        "repository metadata schema (wt.schema = {found}) is newer than this wt supports \
+         (up to {supported}); upgrade wt to work with this repository"
+    )]
+    SchemaTooNew {
+        /// The `wt.schema` value recorded in the repository.
+        found: u64,
+        /// The highest schema this build understands.
+        supported: u64,
+    },
+
+    /// The repository's advisory mutation lock could not be acquired (issue
+    /// #99) — usually another `wt` (or embedder) operation is in flight.
+    #[error("could not acquire the wt repository lock at {path}: {reason}")]
+    LockUnavailable {
+        /// The lock file path.
+        path: String,
+        /// Why acquisition failed (e.g. a timeout while another holder ran).
+        reason: String,
+    },
+
+    /// Worktree removal was blocked by the dirty/unpushed safety guards
+    /// (spec §10/§12); force-removal overrides them.
+    #[error("worktree {}; use --force to remove anyway", guard_reasons(*dirty, *unpushed))]
+    RemoveGuarded {
+        /// Modified/staged tracked files (or untracked files when the config
+        /// counts them).
+        dirty: bool,
+        /// Local commits ahead of upstream, or no upstream configured.
+        unpushed: bool,
+    },
+
     /// An operation failed for the reason described by the message.
     #[error("{0}")]
     Operation(String),
@@ -84,6 +119,19 @@ pub enum Error {
     /// A JSON serialization or deserialization error.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Renders the blocking guard reasons for [`Error::RemoveGuarded`], matching
+/// the CLI's historical wording.
+fn guard_reasons(dirty: bool, unpushed: bool) -> String {
+    let mut reasons = Vec::new();
+    if dirty {
+        reasons.push("has uncommitted changes");
+    }
+    if unpushed {
+        reasons.push("has unpushed work");
+    }
+    reasons.join(" and ")
 }
 
 impl Error {
@@ -144,6 +192,14 @@ mod tests {
             .exit_code(),
             1
         );
+        assert_eq!(
+            Error::RemoveGuarded {
+                dirty: true,
+                unpushed: false,
+            }
+            .exit_code(),
+            1
+        );
         assert_eq!(Error::GhUnavailable("gh".into()).exit_code(), 1);
         assert_eq!(Error::AgentUnavailable("a".into()).exit_code(), 1);
         assert_eq!(Error::operation("op").exit_code(), 1);
@@ -191,6 +247,22 @@ mod tests {
             }
             .to_string(),
             "gh failed: no auth"
+        );
+        assert_eq!(
+            Error::RemoveGuarded {
+                dirty: true,
+                unpushed: true,
+            }
+            .to_string(),
+            "worktree has uncommitted changes and has unpushed work; use --force to remove anyway"
+        );
+        assert_eq!(
+            Error::RemoveGuarded {
+                dirty: false,
+                unpushed: true,
+            }
+            .to_string(),
+            "worktree has unpushed work; use --force to remove anyway"
         );
         assert_eq!(Error::GhUnavailable("nope".into()).to_string(), "nope");
         assert_eq!(Error::AgentUnavailable("nope".into()).to_string(), "nope");

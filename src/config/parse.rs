@@ -3,15 +3,18 @@
 //! `list.columns` identifiers, and bad `ui.keybindings` action names or key
 //! strings are rejected with a precise `{file, key, reason}` error.
 
+#[cfg(feature = "tui")]
 use ratatui::style::Color;
 use toml::Value;
 
 use crate::agent::{AgentModel, Effort};
 use crate::config::schema::{ConfigLayer, SubmoduleInit};
 use crate::error::{Error, Result};
+#[cfg(feature = "tui")]
 use crate::keys::{KeyAction, KeyChord};
 use crate::model::Column;
 use crate::output::color::ColorChoice;
+#[cfg(feature = "tui")]
 use crate::tui::theme::ThemePreset;
 
 /// Builds a configuration error with file/key/reason context.
@@ -199,8 +202,15 @@ fn parse_ui(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
                     .ok_or_else(|| cfg_err(file, &key, "expected one of: auto, always, never"))?;
                 layer.ui_color = Some(choice);
             }
+            #[cfg(feature = "tui")]
             "theme" => parse_theme(file, val, layer)?,
+            #[cfg(feature = "tui")]
             "keybindings" => parse_keybindings(file, val, layer)?,
+            // Without the TUI feature these keys belong to a fuller build of
+            // `wt`; accept and ignore them so an embedder can still read a
+            // repository configured for the complete tool.
+            #[cfg(not(feature = "tui"))]
+            "theme" | "keybindings" => {}
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
@@ -210,6 +220,7 @@ fn parse_ui(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
 /// Parses `ui.theme`: either a string shorthand selecting a preset
 /// (`theme = "solarized"`) or a `[ui.theme]` table with a `preset` key and
 /// per-color overrides.
+#[cfg(feature = "tui")]
 fn parse_theme(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     // String shorthand selects the base preset.
     if let Some(name) = value.as_str() {
@@ -246,6 +257,7 @@ fn parse_theme(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()>
 
 /// Parses a color string: `#rrggbb` hex, a named color (e.g. `cyan`,
 /// `light-blue`), or a 0–255 ANSI index, via ratatui's [`Color`] parser.
+#[cfg(feature = "tui")]
 fn parse_color(file: &str, key: &str, value: &Value) -> Result<Color> {
     let text = as_string(file, key, value)?;
     text.parse::<Color>()
@@ -253,6 +265,7 @@ fn parse_color(file: &str, key: &str, value: &Value) -> Result<Color> {
 }
 
 /// Parses the `[ui.keybindings]` table (action name → key string).
+#[cfg(feature = "tui")]
 fn parse_keybindings(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     for (action_name, val) in as_table(file, "ui.keybindings", value)? {
         let key = format!("ui.keybindings.{action_name}");
@@ -269,6 +282,7 @@ fn parse_keybindings(file: &str, value: &Value, layer: &mut ConfigLayer) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "tui")]
     use crossterm::event::KeyCode;
 
     fn parse(text: &str) -> Result<ConfigLayer> {
@@ -282,6 +296,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn parses_a_full_valid_file() {
         let text = r#"
@@ -349,6 +364,16 @@ mod tests {
                 (KeyAction::Quit, KeyChord::ctrl('c')),
             ]
         );
+    }
+
+    /// A repository configured for the full tool must still parse in a core
+    /// (no-`tui`) build: the TUI-owned keys are accepted and ignored.
+    #[cfg(not(feature = "tui"))]
+    #[test]
+    fn theme_and_keybindings_are_tolerated_without_the_tui() {
+        let layer =
+            parse("[ui.theme]\naccent = \"#ff8800\"\n[ui.keybindings]\nquit = \"ctrl+c\"").unwrap();
+        assert_eq!(layer, ConfigLayer::default());
     }
 
     #[test]
@@ -428,6 +453,7 @@ mod tests {
         assert_eq!(key, "submodules.wiggle");
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn invalid_keybinding_action_and_key_rejected() {
         let (key, reason) = config_reason(parse("[ui.keybindings]\nfly = \"x\"").unwrap_err());
@@ -445,6 +471,7 @@ mod tests {
         assert!(reason.contains("invalid TOML"));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn parses_theme_table_with_preset_and_overrides() {
         let layer =
@@ -460,6 +487,7 @@ mod tests {
         assert_eq!(layer.theme_overrides.green, None);
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn parses_theme_string_shorthand() {
         let layer = parse("[ui]\ntheme = \"solarized\"").unwrap();
@@ -467,6 +495,7 @@ mod tests {
         assert_eq!(layer.theme_overrides, Default::default());
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn invalid_theme_preset_rejected() {
         let (key, reason) = config_reason(parse("[ui.theme]\npreset = \"dracula\"").unwrap_err());
@@ -477,6 +506,7 @@ mod tests {
         assert_eq!(key, "ui.theme");
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn invalid_theme_color_rejected() {
         let (key, reason) = config_reason(parse("[ui.theme]\naccent = \"notacolor\"").unwrap_err());
@@ -484,6 +514,7 @@ mod tests {
         assert!(reason.contains("invalid color"));
     }
 
+    #[cfg(feature = "tui")]
     #[test]
     fn unknown_theme_key_rejected() {
         let (key, _) = config_reason(parse("[ui.theme]\nsparkle = \"#fff\"").unwrap_err());
