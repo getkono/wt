@@ -1475,6 +1475,15 @@ mod tests {
         // of asking for a CoW clone, and because it is ignored the new worktree
         // is still clean.
         repo.write("build.out", "artifact\n");
+        // Untracked work-in-progress, which belongs to the source worktree
+        // alone. Copying it would hand the new worktree a dirty status it never
+        // earned, and bypass the `copy` patterns that decide what travels.
+        repo.write("scratch.txt", "unsaved\n");
+        std::fs::create_dir_all(repo.root().join("wip")).unwrap();
+        repo.write("wip/notes.md", "later\n");
+        // A repository that hides untracked files from `git status` must not
+        // thereby switch the protection off.
+        repo.git(&["config", "status.showUntrackedFiles", "no"]);
 
         let ws = workspace(&repo);
         let created = ws
@@ -1527,8 +1536,16 @@ mod tests {
             origin(&repo.root().join("libs/sub")),
             "the reflinked submodule kept the local mirror as its origin"
         );
-        // And the ignored artifact rode along.
+        // The ignored artifact rode along; the untracked work did not.
         assert!(created.path.join("build.out").exists());
+        assert!(
+            !created.path.join("scratch.txt").exists(),
+            "an untracked source file was cloned into the new worktree"
+        );
+        assert!(
+            !created.path.join("wip/notes.md").exists(),
+            "an untracked source directory was cloned into the new worktree"
+        );
     }
 
     #[test]

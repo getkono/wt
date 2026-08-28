@@ -37,6 +37,7 @@
 //! [`reattach`](crate::git::submodule::reattach) for why skipping it leaves the
 //! submodules pointed at the superproject's own object store.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tracing::debug;
@@ -133,7 +134,14 @@ fn trees_match(git: &dyn GitCli, target: &Path, source: &Path) -> bool {
 fn clone_content(git: &dyn GitCli, target: &Path, plan: &ReflinkPlan) -> Result<()> {
     // `.git` is the worktree's own administrative link and must never be
     // overwritten with the source's.
-    reflink::clone_tree(&plan.source, target, &[".git"])?;
+    let mut skip = HashSet::from([PathBuf::from(".git")]);
+    // Ignored files are the point of asking for a CoW clone — build output you
+    // would otherwise regenerate. The source's *untracked* files are not: they
+    // are unsaved work belonging to that worktree, and copying them would hand
+    // the new worktree a dirty status it never earned. Which non-tracked files
+    // travel is what the `copy` patterns are for.
+    skip.extend(untracked(git, &plan.source)?);
+    reflink::clone_tree(&plan.source, target, &skip)?;
     // Mark the files that already match the index as clean. A non-zero exit
     // just means some file differs, which the checkout below fixes.
     if let Err(e) = git.run(target, &["update-index", "--refresh"]) {
@@ -144,6 +152,26 @@ fn clone_content(git: &dyn GitCli, target: &Path, plan: &ReflinkPlan) -> Result<
     // this writes only what it must.
     git.run(target, &["checkout", "--", "."])?;
     Ok(())
+}
+
+/// The paths `git status` reports as untracked in `source`, relative to it.
+///
+/// `normal` collapses a wholly-untracked directory to the directory itself,
+/// which [`reflink::clone_tree`] then skips as a subtree. The trailing slash git
+/// puts on such an entry is stripped so the path matches. It is passed
+/// explicitly rather than left to the default, because `status.showUntrackedFiles`
+/// would otherwise let a repository's own config switch this protection off.
+/// Ignored files are not listed, which is exactly right — those still travel.
+fn untracked(git: &dyn GitCli, source: &Path) -> Result<Vec<PathBuf>> {
+    let out = git.run(
+        source,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("?? "))
+        .map(|path| PathBuf::from(path.strip_suffix('/').unwrap_or(path)))
+        .collect())
 }
 
 /// Writes the whole tree out with git, the way `worktree add` would have.

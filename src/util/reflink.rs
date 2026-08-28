@@ -10,7 +10,8 @@
 //!
 //! Nothing here is used unless the caller opted in; see `[create] reflink`.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 
@@ -55,24 +56,29 @@ pub fn clone_file(src: &Path, dst: &Path) -> Result<()> {
     })
 }
 
-/// Recursively reflinks the tree at `src` into `dst`, skipping any entry named
-/// by `skip` at the top level.
+/// Recursively reflinks the tree at `src` into `dst`, skipping every entry whose
+/// path relative to `src` is in `skip`.
+///
+/// Skipping a directory skips its whole subtree. Paths are relative and exact,
+/// so `.git` skips only the tree's own git directory and never a nested
+/// repository's.
 ///
 /// Symlinks are recreated as symlinks (never followed — following them would
 /// copy content from outside the tree and turn a relative link into a wrong
 /// absolute one). File permissions ride along with the clone.
-pub fn clone_tree(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
-    clone_into(src, dst, skip)
+pub fn clone_tree(src: &Path, dst: &Path, skip: &HashSet<PathBuf>) -> Result<()> {
+    clone_into(src, dst, Path::new(""), skip)
 }
 
-/// Recursive worker for [`clone_tree`]; `skip` applies only at the top level,
-/// which is where the caller's `.git` lives.
-fn clone_into(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
+/// Recursive worker for [`clone_tree`]. `rel` is the current directory's path
+/// relative to the clone root, which is what `skip` is matched against.
+fn clone_into(src: &Path, dst: &Path, rel: &Path, skip: &HashSet<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
-        if skip.iter().any(|s| name == *s) {
+        let child_rel = rel.join(&name);
+        if skip.contains(&child_rel) {
             continue;
         }
         let from = entry.path();
@@ -84,7 +90,7 @@ fn clone_into(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
             let target = std::fs::read_link(&from)?;
             symlink(&target, &to)?;
         } else if file_type.is_dir() {
-            clone_into(&from, &to, &[])?;
+            clone_into(&from, &to, &child_rel, skip)?;
         } else if file_type.is_file() {
             clone_file(&from, &to)?;
         }
@@ -171,7 +177,7 @@ mod tests {
         std::os::unix::fs::symlink("a.txt", src.join("link")).unwrap();
 
         let dst = dir.path().join("dst");
-        clone_tree(&src, &dst, &[".git"]).unwrap();
+        clone_tree(&src, &dst, &HashSet::from([PathBuf::from(".git")])).unwrap();
 
         assert_eq!(std::fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha");
         assert_eq!(
@@ -206,6 +212,32 @@ mod tests {
     }
 
     #[test]
+    fn skips_nested_paths_and_whole_subtrees() {
+        let Some(dir) = cow_dir() else {
+            return;
+        };
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("keep")).unwrap();
+        std::fs::create_dir_all(src.join("drop/deep")).unwrap();
+        std::fs::write(src.join("keep/yes.txt"), "yes").unwrap();
+        std::fs::write(src.join("keep/no.txt"), "no").unwrap();
+        std::fs::write(src.join("drop/deep/gone.txt"), "gone").unwrap();
+
+        let dst = dir.path().join("dst");
+        let skip = HashSet::from([PathBuf::from("keep/no.txt"), PathBuf::from("drop")]);
+        clone_tree(&src, &dst, &skip).unwrap();
+
+        assert!(dst.join("keep/yes.txt").exists());
+        assert!(
+            !dst.join("keep/no.txt").exists(),
+            "a nested skip was ignored"
+        );
+        // Skipping a directory takes its subtree with it, and does not leave the
+        // directory itself behind either.
+        assert!(!dst.join("drop").exists(), "a skipped subtree was cloned");
+    }
+
+    #[test]
     fn skip_list_applies_only_at_the_top_level() {
         let Some(dir) = cow_dir() else {
             return;
@@ -214,7 +246,7 @@ mod tests {
         std::fs::create_dir_all(src.join("sub/.git")).unwrap();
         std::fs::write(src.join("sub/.git/keep"), "nested").unwrap();
         let dst = dir.path().join("dst");
-        clone_tree(&src, &dst, &[".git"]).unwrap();
+        clone_tree(&src, &dst, &HashSet::from([PathBuf::from(".git")])).unwrap();
         // A nested repo's gitdir is part of the tree being cloned; only the
         // superproject's own `.git` is the caller's business.
         assert!(dst.join("sub/.git/keep").exists());

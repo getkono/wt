@@ -106,10 +106,12 @@ impl SubmoduleSeed {
 /// On a CoW filesystem (btrfs, XFS with `reflink=1`, APFS, ReFS) this shares the
 /// extents of every file, so a new worktree of a large repository costs almost
 /// no disk and almost no writing. It also carries the source's ignored build
-/// output along, which is usually the point and occasionally not.
+/// output along, which is usually the point and occasionally not. The source's
+/// untracked files are left behind, so the new worktree still comes up clean and
+/// [`Config::copy`] still governs which non-tracked files travel.
 ///
 /// Off by default: it only pays off on a CoW filesystem, and copying a source's
-/// untracked and ignored files is a bigger behavioural change than seeding.
+/// ignored files is a bigger behavioural change than seeding.
 /// `auto` uses it when the filesystem supports it and a source worktree is
 /// already at the same tree, and silently checks out normally otherwise.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

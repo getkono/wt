@@ -140,7 +140,9 @@ These are the things worth knowing up front; the rest is discoverable from
   241 MiB repo that was 22 MiB consumed instead of 268 MiB. It applies only
   when a worktree is already at the same commit and the filesystem supports it,
   and quietly falls back to a normal checkout otherwise. It is off by default
-  because carrying ignored files across is a bigger change than seeding.
+  because carrying ignored files across is a bigger change than seeding. The
+  source's *untracked* files stay where they are — the new worktree comes up
+  clean, and `copy` still decides which non-tracked files travel.
 
   Both leave `submodule.fetchJobs` to git if you want parallel fetches.
 - **Run a command after creating a worktree.** `hooks.post_create` (e.g.
