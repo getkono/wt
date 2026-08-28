@@ -87,7 +87,7 @@ fn tracked_files(git: &dyn GitCli, source: &Path) -> Result<HashSet<PathBuf>> {
 }
 
 /// Recursively lists files under `root` (relative paths), skipping the `.git`
-/// directory.
+/// directory and any nested repository.
 fn walk_files(root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     walk_into(root, Path::new(""), &mut files);
@@ -107,11 +107,29 @@ fn walk_into(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
         }
         let child_rel = rel.join(&name);
         match entry.file_type() {
-            Ok(ft) if ft.is_dir() => walk_into(base, &child_rel, out),
+            Ok(ft) if ft.is_dir() => {
+                if is_nested_repo(&base.join(&child_rel)) {
+                    continue;
+                }
+                walk_into(base, &child_rel, out)
+            }
             Ok(ft) if ft.is_file() => out.push(child_rel),
             _ => {}
         }
     }
+}
+
+/// Whether `dir` is the working tree of a nested repository — a submodule, or
+/// any repo that happens to sit inside this one.
+///
+/// A populated submodule holds a `.git` *file* (a gitlink), not a directory, so
+/// the top-level `.git` skip does not stop the walk from descending into it. Its
+/// contents belong to the submodule and are tracked there, meaning `ls-files` on
+/// the superproject does not list them and every one of them would look like an
+/// untracked candidate to copy. On a repo with many populated submodules that is
+/// both a large pointless walk and a source of wrong copies.
+fn is_nested_repo(dir: &Path) -> bool {
+    dir.join(".git").exists()
 }
 
 #[cfg(test)]
@@ -218,5 +236,31 @@ mod tests {
         let err =
             copy_ignored_files(&FailLs, repo.root(), &target, &[".env".to_string()]).unwrap_err();
         assert!(matches!(err, Error::Subprocess { .. }));
+    }
+
+    #[test]
+    fn does_not_copy_out_of_a_populated_submodule() {
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        // A file inside the submodule that matches the copy pattern. It is
+        // untracked *in the superproject* (the submodule owns that subtree), so
+        // without the nested-repo skip it looks like a copy candidate.
+        repo.write("libs/sub/.env", "SUBMODULE=1\n");
+        repo.write(".env", "TOP=1\n");
+
+        let target = repo.root().parent().unwrap().join("nested-target");
+        std::fs::create_dir_all(&target).unwrap();
+        let outcome =
+            copy_ignored_files(&RealGit, repo.root(), &target, &["**/.env".to_string()]).unwrap();
+
+        assert!(outcome.copied.contains(&PathBuf::from(".env")));
+        assert!(
+            !outcome
+                .copied
+                .contains(&PathBuf::from("libs/sub/.env".to_string())),
+            "walked into a submodule: {:?}",
+            outcome.copied
+        );
+        assert!(!target.join("libs/sub/.env").exists());
     }
 }
