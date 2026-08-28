@@ -3,12 +3,18 @@
 //! Wires up error reporting and tracing, builds the runtime context over real
 //! stdio and the process environment, then delegates to the library. This file
 //! is intentionally minimal and is excluded from coverage measurement (see the
-//! `coverage` recipe in the `Justfile`).
+//! `coverage` task in `mise.toml`).
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Must precede any worktree operation: it arms the handlers that release
+    // the advisory repo lock on SIGINT/SIGTERM/SIGQUIT instead of stranding
+    // `wt-mutation.lock`. The TUI is unaffected — crossterm's raw mode clears
+    // `ISIG`, so Ctrl-C reaches it as a key event rather than a signal.
+    wt::install_signal_handlers();
+
     if let Err(error) = color_eyre::install() {
         eprintln!("wt: failed to install error reporter: {error}");
         return ExitCode::FAILURE;

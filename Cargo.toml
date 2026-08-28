@@ -92,6 +92,12 @@ gix = "0.85.0"
 # Advisory repo lock for concurrent metadata/worktree writers (issue #99);
 # already in the tree via gix, so this adds no new code to the build.
 gix-lock = "23.0.1"
+# Pulled in only for its `signals` feature, which arms the handlers that
+# release the advisory lock when a signal terminates us. `gix` already enables
+# it transitively, but relying on that leaves the `signal` module's existence an
+# accident of feature unification. The call itself goes through
+# `gix_lock::tempfile` so it lands on the instance that registers the lock.
+gix-tempfile = { version = "23.0.1", default-features = false, features = ["signals"] }
 globset = "0.4.18"
 jiff = "0.2.28"
 nucleo-matcher = { version = "0.3.1", optional = true }
