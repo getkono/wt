@@ -13,6 +13,7 @@
 //! worktree-less branch rows (issue #47), sorting, and the remove/prune guard
 //! evaluation shared by the CLI and TUI.
 
+pub(crate) mod materialize;
 pub(crate) mod rows;
 mod service;
 

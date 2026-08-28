@@ -349,7 +349,30 @@ pub(crate) struct TestRepo {
 impl TestRepo {
     /// Initializes a normal repo on branch `main` with one initial commit.
     pub(crate) fn init() -> TestRepo {
-        let dir = tempfile::tempdir().expect("tempdir");
+        Self::init_in(tempfile::tempdir().expect("tempdir"))
+    }
+
+    /// Initializes a repo like [`init`](Self::init), but on a filesystem that
+    /// supports reflinks — or `None` when no such filesystem is reachable.
+    ///
+    /// The system temp dir is very often tmpfs, which has no reflink support, so
+    /// a plain `init()` would make every copy-on-write test skip without saying
+    /// so. Falling back to `target/` puts the fixture on whatever filesystem the
+    /// checkout lives on, which is where these tests actually run.
+    pub(crate) fn init_cow() -> Option<TestRepo> {
+        if let Ok(dir) = tempfile::tempdir()
+            && crate::util::reflink::is_supported(dir.path())
+        {
+            return Some(Self::init_in(dir));
+        }
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).ok()?;
+        let dir = tempfile::tempdir_in(&target).ok()?;
+        crate::util::reflink::is_supported(dir.path()).then(|| Self::init_in(dir))
+    }
+
+    /// Builds the standard fixture inside an already-chosen temp directory.
+    fn init_in(dir: TempDir) -> TestRepo {
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).expect("mkdir repo");
         run_git(&root, &["init", "-q", "-b", "main"]);
@@ -529,6 +552,8 @@ pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
             init_submodules: false,
             no_init_submodules: false,
             no_seed_submodules: false,
+            reflink: false,
+            no_reflink: false,
         },
         false,
     )

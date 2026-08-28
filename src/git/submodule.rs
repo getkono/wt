@@ -26,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::porcelain::{Submodule, parse_gitmodules, parse_submodule_status};
 
+pub(crate) mod reattach;
 pub(crate) mod seed;
 
 /// Returns the paths of submodules that are defined but not yet initialized in

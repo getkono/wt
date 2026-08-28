@@ -15,18 +15,27 @@ use crate::error::Result;
 use crate::git::cli::{GitCli, GitOutput};
 
 /// Adds a worktree for the existing `branch` at `target` (`git worktree add`).
+///
+/// `no_checkout` registers the worktree without writing any file content, for
+/// callers that materialize it themselves.
 pub(crate) fn worktree_add(
     git: &dyn GitCli,
     root: &Path,
     target: &str,
     branch: &str,
+    no_checkout: bool,
 ) -> Result<String> {
-    git.run(root, &["worktree", "add", target, branch])
+    let mut argv = vec!["worktree", "add"];
+    if no_checkout {
+        argv.push("--no-checkout");
+    }
+    argv.extend([target, branch]);
+    git.run(root, &argv)
 }
 
 /// Adds a worktree, creating `branch` from `start` (`git worktree add -b`).
 /// `no_track` adds `--no-track` so the new branch does not inherit `start` as its
-/// upstream (issue #43).
+/// upstream (issue #43); `no_checkout` skips writing file content.
 pub(crate) fn worktree_add_branch(
     git: &dyn GitCli,
     root: &Path,
@@ -34,10 +43,14 @@ pub(crate) fn worktree_add_branch(
     target: &str,
     start: &str,
     no_track: bool,
+    no_checkout: bool,
 ) -> Result<String> {
     let mut argv = vec!["worktree", "add"];
     if no_track {
         argv.push("--no-track");
+    }
+    if no_checkout {
+        argv.push("--no-checkout");
     }
     argv.extend(["-b", branch, target, start]);
     git.run(root, &argv)
@@ -180,14 +193,24 @@ mod tests {
     #[test]
     fn worktree_add_builds_plain_add() {
         let git = RecordingGit::new();
-        worktree_add(&git, &root(), "/wt/x", "topic").unwrap();
+        worktree_add(&git, &root(), "/wt/x", "topic", false).unwrap();
         assert_eq!(git.last(), ["worktree", "add", "/wt/x", "topic"]);
+    }
+
+    #[test]
+    fn worktree_add_adds_no_checkout_flag_only_when_asked() {
+        let git = RecordingGit::new();
+        worktree_add(&git, &root(), "/wt/x", "topic", true).unwrap();
+        assert_eq!(
+            git.last(),
+            ["worktree", "add", "--no-checkout", "/wt/x", "topic"]
+        );
     }
 
     #[test]
     fn worktree_add_branch_adds_no_track_flag_only_when_asked() {
         let git = RecordingGit::new();
-        worktree_add_branch(&git, &root(), "topic", "/wt/x", "main", true).unwrap();
+        worktree_add_branch(&git, &root(), "topic", "/wt/x", "main", true, false).unwrap();
         assert_eq!(
             git.last(),
             [
@@ -200,10 +223,29 @@ mod tests {
                 "main"
             ]
         );
-        worktree_add_branch(&git, &root(), "topic", "/wt/x", "FETCH_HEAD", false).unwrap();
+        worktree_add_branch(&git, &root(), "topic", "/wt/x", "FETCH_HEAD", false, false).unwrap();
         assert_eq!(
             git.last(),
             ["worktree", "add", "-b", "topic", "/wt/x", "FETCH_HEAD"]
+        );
+    }
+
+    #[test]
+    fn worktree_add_branch_combines_no_track_and_no_checkout() {
+        let git = RecordingGit::new();
+        worktree_add_branch(&git, &root(), "topic", "/wt/x", "main", true, true).unwrap();
+        assert_eq!(
+            git.last(),
+            [
+                "worktree",
+                "add",
+                "--no-track",
+                "--no-checkout",
+                "-b",
+                "topic",
+                "/wt/x",
+                "main"
+            ]
         );
     }
 

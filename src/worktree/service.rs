@@ -25,7 +25,7 @@ use crate::model::Worktree;
 use crate::query::{self, Resolved};
 use crate::slug::slugify_with_fallback;
 use crate::template::{self, TemplateVars};
-use crate::worktree::rows;
+use crate::worktree::{materialize, rows};
 
 /// How long a mutation waits for the advisory repository lock (issue #99)
 /// before failing with [`Error::LockUnavailable`].
@@ -334,6 +334,11 @@ pub struct CreateOptions {
     /// determines the result, so this cannot change the outcome. Resolved by the
     /// caller from `submodules.seed`. Ignored when `init_submodules` is false.
     pub seed_submodules: bool,
+    /// Materialize the worktree by copy-on-write cloning an existing one's files
+    /// rather than checking them out. Requires a CoW filesystem and a source
+    /// worktree already at the same tree; when either is missing this silently
+    /// uses the normal checkout. Resolved by the caller from `create.reflink`.
+    pub reflink: bool,
     /// Skip the `post_create` hook.
     pub no_hooks: bool,
 }
@@ -436,6 +441,10 @@ pub struct CreatedWorktree {
     pub submodules: SubmodulesOutcome,
     /// What the local-mirror seeding accelerator did, if it ran.
     pub submodule_seeding: SubmoduleSeeding,
+    /// Whether the worktree's content was copy-on-write cloned from an existing
+    /// worktree rather than checked out. `false` covers both "not requested" and
+    /// "requested but unavailable"; the result is identical either way.
+    pub reflinked: bool,
 }
 
 /// The outcome of [`Workspace::remove`].
@@ -518,6 +527,7 @@ pub(crate) fn create_in(
                 post_create: HookOutcome::Skipped,
                 submodules: SubmodulesOutcome::Skipped,
                 submodule_seeding: SubmoduleSeeding::default(),
+                reflinked: false,
             });
         }
         return Err(Error::operation(format!(
@@ -544,15 +554,43 @@ pub(crate) fn create_in(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Decide up front whether the content can be cloned copy-on-write from an
+    // existing worktree instead of checked out. This has to happen before the
+    // add, because the CoW path needs `--no-checkout`. `None` is the normal
+    // checkout and is never an error.
+    let reflink_plan = if options.reflink {
+        let source = copy_source(ws, &worktrees, options.copy_from.as_deref()).ok();
+        target
+            .parent()
+            .and_then(|parent| materialize::plan(git, source.as_deref(), parent, &base_commit))
+    } else {
+        None
+    };
+    let no_checkout = reflink_plan.is_some();
+
     // Create the worktree (git is atomic here).
     let target_str = target.to_string_lossy().into_owned();
     if let Some(base) = &base_ref {
         // `--no-track` keeps the new branch from inheriting the base as its
         // upstream (issue #43); `--track` opts into an explicit one.
-        ops::worktree_add_branch(git, ws.root, &branch, &target_str, base, true)?;
+        ops::worktree_add_branch(git, ws.root, &branch, &target_str, base, true, no_checkout)?;
     } else {
-        ops::worktree_add(git, ws.root, &target_str, &branch)?;
+        ops::worktree_add(git, ws.root, &target_str, &branch, no_checkout)?;
     }
+
+    // Materialize the content. A failure inside falls back to a stock checkout,
+    // so the worktree is populated either way; only a failure to do even that
+    // is fatal, and it rolls back like any other post-add step.
+    let reflinked = match &reflink_plan {
+        Some(plan) => match materialize::apply(git, &target, plan) {
+            Ok(used_cow) => used_cow,
+            Err(e) => {
+                rollback_worktree(git, ws.root, &target, &branch, base_ref.is_some(), false);
+                return Err(e);
+            }
+        },
+        None => false,
+    };
 
     // Steps after creation but before the hook are rolled back on failure (§13).
     let copy = match post_create_steps(ws, git, &worktrees, &branch, &base_ref, &target, options) {
@@ -584,6 +622,18 @@ pub(crate) fn create_in(
         },
     };
 
+    // A copy-on-write materialization also brought the submodules' *files*
+    // across, but their `.git` gitlinks still point into the source worktree.
+    // Give them git directories of their own so the pass below recognizes them
+    // instead of cloning over the top. Best-effort — anything missed is just a
+    // normal clone.
+    if reflinked && let Ok(common) = common_git_dir(git, ws.root) {
+        let attached = materialize::attach_submodules(git, &target, &common);
+        if !attached.is_empty() {
+            tracing::debug!(count = attached.len(), "attached copied submodules");
+        }
+    }
+
     // Submodule initialization, when the caller resolved its policy to "yes".
     // Non-fatal: the worktree already exists.
     let (submodules, seed) = if options.init_submodules {
@@ -601,7 +651,18 @@ pub(crate) fn create_in(
         post_create,
         submodules,
         submodule_seeding: seed.into(),
+        reflinked,
     })
+}
+
+/// The repository's common git directory — the shared `.git` that holds
+/// `modules/`, as opposed to a linked worktree's private git dir.
+fn common_git_dir(git: &dyn GitCli, root: &Path) -> Result<PathBuf> {
+    let out = git.run(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    Ok(PathBuf::from(out.trim()))
 }
 
 /// Populates `target`'s submodules, seeding from the repository's own local
@@ -1365,6 +1426,102 @@ mod tests {
             created.submodules,
             SubmodulesOutcome::Initialized(1)
         ));
+    }
+
+    #[test]
+    fn reflink_materialization_matches_a_normal_checkout() {
+        // The CoW path must be indistinguishable in result from a checkout: same
+        // tracked content, clean status, same submodule state. Skipped where the
+        // filesystem has no reflink support, since there is nothing to assert.
+        let Some(repo) = TestRepo::init_cow() else {
+            return;
+        };
+        repo.add_submodule("libs/sub");
+        repo.write("tracked.txt", "content\n");
+        repo.write(".gitignore", "build.out\n");
+        repo.commit_all("add a tracked file and an ignore rule");
+        // An ignored build artifact. Carrying these across is much of the point
+        // of asking for a CoW clone, and because it is ignored the new worktree
+        // is still clean.
+        repo.write("build.out", "artifact\n");
+
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: true,
+                    reflink: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(created.reflinked, "the CoW path did not run");
+        // Tracked content is right and the worktree is clean.
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("tracked.txt")).unwrap(),
+            "content\n"
+        );
+        let status = repo.git(&["-C", &created.path.to_string_lossy(), "status", "--short"]);
+        assert!(
+            status.trim().is_empty(),
+            "worktree is not clean: {status:?}"
+        );
+        // The submodule came across and is recognized, not left uninitialized.
+        assert!(created.path.join("libs/sub/sub.txt").exists());
+        let subs = repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "submodule",
+            "status",
+            "--recursive",
+        ]);
+        assert!(
+            subs.starts_with(' '),
+            "submodule not in sync after a reflink create: {subs:?}"
+        );
+        // And the untracked artifact rode along.
+        assert!(created.path.join("build.out").exists());
+    }
+
+    #[test]
+    fn reflink_declines_when_the_source_is_at_a_different_tree() {
+        // Falling back must still produce a correct worktree, just not a cloned
+        // one: the new branch is based on the *old* commit, whose tree differs
+        // from the source worktree's current one.
+        let repo = TestRepo::init();
+        let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("only-on-head.txt", "later\n");
+        repo.commit_all("move the source ahead");
+
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    base: Some(base),
+                    reflink: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!created.reflinked, "cloned across differing trees");
+        // The worktree still has the right content for its own base.
+        assert!(!created.path.join("only-on-head.txt").exists());
+        let status = repo.git(&["-C", &created.path.to_string_lossy(), "status", "--short"]);
+        assert!(
+            status.trim().is_empty(),
+            "worktree is not clean: {status:?}"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ const KEYS: &[&str] = &[
     "pr.default_remote",
     "submodules.init",
     "submodules.seed",
+    "create.reflink",
     "agent.model",
     "agent.effort",
     "list.show_untracked",
@@ -202,6 +203,7 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "pr.default_remote"
         | "submodules.init"
         | "submodules.seed"
+        | "create.reflink"
         | "agent.model"
         | "agent.effort"
         | "ui.color"
@@ -241,6 +243,7 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "pr.default_remote" => Some(config.pr_default_remote.clone()),
         "submodules.init" => Some(config.submodules_init.identifier().to_string()),
         "submodules.seed" => Some(config.submodules_seed.identifier().to_string()),
+        "create.reflink" => Some(config.create_reflink.identifier().to_string()),
         "agent.model" => Some(config.agent_model.id().to_string()),
         "agent.effort" => Some(config.agent_effort.id().to_string()),
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),

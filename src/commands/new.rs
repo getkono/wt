@@ -88,6 +88,7 @@ pub(crate) fn run_core(
         // (issue #50) decides about submodules on the CLI/TUI paths.
         init_submodules: false,
         seed_submodules: args.seed_submodules(session.config.submodules_seed),
+        reflink: args.reflink(session.config.create_reflink),
         no_hooks: args.no_hooks,
     };
 
@@ -244,6 +245,8 @@ mod tests {
             init_submodules: false,
             no_init_submodules: false,
             no_seed_submodules: false,
+            reflink: false,
+            no_reflink: false,
         }
     }
 

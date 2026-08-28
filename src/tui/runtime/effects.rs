@@ -24,6 +24,8 @@ pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
         copy_from: None,
         init_submodules: false,
         no_seed_submodules: false,
+        reflink: false,
+        no_reflink: false,
         no_init_submodules: true,
     }
 }

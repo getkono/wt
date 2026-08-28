@@ -8,7 +8,7 @@ use ratatui::style::Color;
 use toml::Value;
 
 use crate::agent::{AgentModel, Effort};
-use crate::config::schema::{ConfigLayer, SubmoduleInit, SubmoduleSeed};
+use crate::config::schema::{ConfigLayer, CreateReflink, SubmoduleInit, SubmoduleSeed};
 use crate::error::{Error, Result};
 #[cfg(feature = "tui")]
 use crate::keys::{KeyAction, KeyChord};
@@ -74,6 +74,7 @@ pub fn parse_layer(text: &str, file: &str) -> Result<ConfigLayer> {
             "hooks" => parse_hooks(file, val, &mut layer)?,
             "remove" => parse_remove(file, val, &mut layer)?,
             "pr" => parse_pr(file, val, &mut layer)?,
+            "create" => parse_create(file, val, &mut layer)?,
             "submodules" => parse_submodules(file, val, &mut layer)?,
             "agent" => parse_agent(file, val, &mut layer)?,
             "list" => parse_list(file, val, &mut layer)?,
@@ -107,6 +108,23 @@ fn parse_remove(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()
             }
             "untracked_blocks" => {
                 layer.remove_untracked_blocks = Some(as_bool(file, &key, val)?);
+            }
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `[create]` table, validating the `reflink` strategy.
+fn parse_create(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "create", value)? {
+        let key = format!("create.{sub}");
+        match sub.as_str() {
+            "reflink" => {
+                let text = as_string(file, &key, val)?;
+                let strategy = CreateReflink::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: auto, never"))?;
+                layer.create_reflink = Some(strategy);
             }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }

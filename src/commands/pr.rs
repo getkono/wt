@@ -255,9 +255,9 @@ pub(crate) fn checkout_pr_worktree(
     }
     let target_str = worktree_path.to_string_lossy().into_owned();
     if branch_exists {
-        ops::worktree_add(git, &root, &target_str, &branch)?;
+        ops::worktree_add(git, &root, &target_str, &branch, false)?;
     } else {
-        ops::worktree_add_branch(git, &root, &branch, &target_str, "FETCH_HEAD", false)?;
+        ops::worktree_add_branch(git, &root, &branch, &target_str, "FETCH_HEAD", false, false)?;
     }
 
     // Record metadata + copy, rolling back on failure (§13). Only mark "created

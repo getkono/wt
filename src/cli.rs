@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
-use crate::config::SubmoduleSeed;
+use crate::config::{CreateReflink, SubmoduleSeed};
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::output::color::ColorChoice;
@@ -145,6 +145,15 @@ pub(crate) struct NewArgs {
     /// repository's local object stores (overrides `[submodules] seed`).
     #[arg(long = "no-seed-submodules")]
     pub(crate) no_seed_submodules: bool,
+    /// Copy-on-write clone the new worktree's files from an existing worktree
+    /// instead of checking them out (overrides `[create] reflink`). Needs a CoW
+    /// filesystem and a source worktree already at the same commit; falls back
+    /// to a normal checkout when either is missing.
+    #[arg(long, conflicts_with = "no_reflink")]
+    pub(crate) reflink: bool,
+    /// Always check the new worktree out, never copy-on-write clone it.
+    #[arg(long = "no-reflink")]
+    pub(crate) no_reflink: bool,
 }
 
 impl NewArgs {
@@ -159,6 +168,16 @@ impl NewArgs {
     /// strategy. `--no-seed-submodules` turns it off; otherwise config decides.
     pub(crate) fn seed_submodules(&self, configured: SubmoduleSeed) -> bool {
         !self.no_seed_submodules && configured.is_enabled()
+    }
+
+    /// Whether to copy-on-write clone the new worktree, given the configured
+    /// strategy. `--reflink`/`--no-reflink` win over config; without either,
+    /// config decides.
+    pub(crate) fn reflink(&self, configured: CreateReflink) -> bool {
+        if self.no_reflink {
+            return false;
+        }
+        self.reflink || configured.is_enabled()
     }
 }
 
