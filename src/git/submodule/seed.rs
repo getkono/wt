@@ -32,6 +32,19 @@
 //!    what stock git would have produced. A failure here is reported, never
 //!    fatal.
 //!
+//! # A rejected alternative
+//!
+//! Making each submodule a *linked worktree of its own mirror*
+//! (`git -C .git/modules/<name> worktree add --detach <wt>/<path> <sha>`) needs
+//! no object copying at all, and every superproject command accepts the result.
+//! It is nonetheless wrong: the first time anyone runs `git submodule update` in
+//! such a worktree, git writes `core.worktree` into the mirror's **shared**
+//! config, computed relative to the per-worktree git directory. That path is
+//! wrong for every other consumer, and it permanently breaks the *primary*
+//! worktree's submodule — every later command against the mirror dies with
+//! `fatal: cannot chdir to '../../../../../../../<wt>/<path>'`. Do not revisit
+//! this approach.
+//!
 //! # Security
 //!
 //! `protocol.file.allow=always` lifts the CVE-2022-39253 protection against

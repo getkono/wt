@@ -120,6 +120,29 @@ These are the things worth knowing up front; the rest is discoverable from
 - **Auto-copy ignored files into new worktrees.** Git-ignored files like `.env`
   don't follow a new worktree. List glob patterns under `copy` to bring them along
   on `wt new`, e.g. `copy = [".env", ".env.local"]`.
+- **Worktrees of submodule-heavy repos, without the re-clone.** A linked
+  worktree does not share the superproject's submodule object stores: git puts
+  its submodule git directories under `worktrees/<id>/modules/`, not the shared
+  `.git/modules/`, so `git submodule update --init --recursive` in a new
+  worktree clones every submodule over the network again. On a repo with a lot
+  of submodules that is the entire cost of making a worktree. `wt` clones them
+  from the object stores already on your disk instead, which git hardlinks — no
+  network, near-zero disk. It is on by default (`[submodules] seed = "auto"`,
+  or `--no-seed-submodules` for one run) and cannot change the result: the
+  stock `git submodule update --init --recursive` still runs afterwards and
+  decides the outcome, so seeding only ever removes work from it.
+
+  For the working tree itself there is a second, opt-in step. On a
+  copy-on-write filesystem (btrfs, XFS with `reflink=1`, APFS, ReFS), set
+  `[create] reflink = "auto"` (or pass `--reflink`) and a new worktree's files
+  are cloned from an existing one by sharing extents rather than being written
+  out — including the ignored build output you would otherwise rebuild. On one
+  241 MiB repo that was 22 MiB consumed instead of 268 MiB. It applies only
+  when a worktree is already at the same commit and the filesystem supports it,
+  and quietly falls back to a normal checkout otherwise. It is off by default
+  because carrying ignored files across is a bigger change than seeding.
+
+  Both leave `submodule.fetchJobs` to git if you want parallel fetches.
 - **Run a command after creating a worktree.** `hooks.post_create` (e.g.
   `npm install`, `direnv allow`) runs inside the new worktree; `hooks.pre_remove`
   runs before removal. Hooks receive `WT_WORKTREE_PATH`, `WT_BRANCH`,
