@@ -23,6 +23,7 @@ pub(super) fn tui_new_args(branch: &str, base: Option<String>) -> NewArgs {
         start: None,
         copy_from: None,
         init_submodules: false,
+        no_seed_submodules: false,
         no_init_submodules: true,
     }
 }
@@ -221,7 +222,13 @@ pub(super) fn run_init_submodules_command(
     worktree_dir: &Path,
 ) -> std::result::Result<(), String> {
     let git = cx.git.clone();
-    crate::git::submodule::update_init(git.as_ref(), worktree_dir).map_err(|e| e.to_string())
+    // The session only supplies the seeding strategy; if it cannot be opened,
+    // fall back to the configured default rather than failing the job.
+    let seed = open_session(cx, git.as_ref())
+        .map(|s| s.config.submodules_seed.is_enabled())
+        .unwrap_or_else(|_| SubmoduleSeed::default().is_enabled());
+    let (_, result) = crate::git::submodule::populate(git.as_ref(), worktree_dir, seed);
+    result.map_err(|e| e.to_string())
 }
 
 /// Spawns a blocking task that builds the fully-enriched worktrees and sends

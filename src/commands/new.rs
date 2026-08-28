@@ -87,6 +87,7 @@ pub(crate) fn run_core(
         // The service never prompts; the interactive policy handling below
         // (issue #50) decides about submodules on the CLI/TUI paths.
         init_submodules: false,
+        seed_submodules: args.seed_submodules(session.config.submodules_seed),
         no_hooks: args.no_hooks,
     };
 
@@ -121,6 +122,7 @@ pub(crate) fn run_core(
             session.config.submodules_init,
             args.submodule_override(),
             prompt,
+            args.seed_submodules(session.config.submodules_seed),
         )?;
     }
 
@@ -241,6 +243,7 @@ mod tests {
             copy_from: None,
             init_submodules: false,
             no_init_submodules: false,
+            no_seed_submodules: false,
         }
     }
 

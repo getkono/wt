@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use clap_complete::Shell;
 
+use crate::config::SubmoduleSeed;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::output::color::ColorChoice;
@@ -140,6 +141,10 @@ pub(crate) struct NewArgs {
     /// Do not initialize git submodules (overrides `[submodules] init`).
     #[arg(long = "no-init-submodules")]
     pub(crate) no_init_submodules: bool,
+    /// Clone submodules from their remotes instead of seeding them from this
+    /// repository's local object stores (overrides `[submodules] seed`).
+    #[arg(long = "no-seed-submodules")]
+    pub(crate) no_seed_submodules: bool,
 }
 
 impl NewArgs {
@@ -148,6 +153,12 @@ impl NewArgs {
     /// `--no-init-submodules`, `None` when neither is given (config decides).
     pub(crate) fn submodule_override(&self) -> Option<bool> {
         submodule_override(self.init_submodules, self.no_init_submodules)
+    }
+
+    /// Whether to seed submodules from local object stores, given the configured
+    /// strategy. `--no-seed-submodules` turns it off; otherwise config decides.
+    pub(crate) fn seed_submodules(&self, configured: SubmoduleSeed) -> bool {
+        !self.no_seed_submodules && configured.is_enabled()
     }
 }
 

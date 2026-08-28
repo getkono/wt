@@ -189,6 +189,7 @@ pub(crate) fn sync_worktree(
                 session.config.submodules_init,
                 submodule_override,
                 prompt,
+                session.config.submodules_seed.is_enabled(),
             )?;
             Ok(SyncOutcome::FastForwarded)
         }
@@ -333,6 +334,7 @@ fn maybe_sync_submodules(
     policy: SubmoduleInit,
     submodule_override: Option<bool>,
     prompt: bool,
+    seed: bool,
 ) -> Result<()> {
     if prompt && cx.err.is_tty() {
         let pending = crate::git::submodule::uninitialized(git, dir)?;
@@ -344,7 +346,7 @@ fn maybe_sync_submodules(
             pending.len()
         );
         if confirm(cx, &ask)?
-            && let Err(e) = crate::git::submodule::update_init(git, dir)
+            && let (_, Err(e)) = crate::git::submodule::populate(git, dir, seed)
         {
             let _ = cx
                 .err
@@ -352,7 +354,7 @@ fn maybe_sync_submodules(
         }
         Ok(())
     } else {
-        maybe_init_submodules(cx, git, dir, policy, submodule_override)
+        maybe_init_submodules(cx, git, dir, policy, submodule_override, seed)
     }
 }
 
@@ -635,6 +637,7 @@ mod tests {
             SubmoduleInit::Never,
             None,
             true,
+            true,
         )
         .unwrap();
         assert!(repo.root().join("libs/sub/sub.txt").exists());
@@ -651,6 +654,7 @@ mod tests {
             repo.root(),
             SubmoduleInit::Never,
             None,
+            true,
             true,
         )
         .unwrap();
@@ -670,6 +674,7 @@ mod tests {
             SubmoduleInit::Never,
             Some(true),
             false,
+            true,
         )
         .unwrap();
         assert!(repo.root().join("libs/sub/sub.txt").exists());

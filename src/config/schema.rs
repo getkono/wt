@@ -44,6 +44,60 @@ impl SubmoduleInit {
             _ => None,
         }
     }
+
+    /// The config identifier this policy round-trips through.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            SubmoduleInit::Prompt => "prompt",
+            SubmoduleInit::Never => "never",
+            SubmoduleInit::Always => "always",
+        }
+    }
+}
+
+/// Whether to populate a new worktree's submodules from the repository's own
+/// local object stores instead of re-cloning them (`[submodules] seed`).
+///
+/// A linked worktree does not share `.git/modules`, so initializing submodules
+/// in one normally re-clones every submodule over the network. Seeding clones
+/// from those existing mirrors instead, which hardlinks the objects.
+///
+/// Seeding never changes the outcome, only the cost: it is always followed by a
+/// stock `git submodule update --init --recursive`, so anything it skips or gets
+/// wrong is reconciled by git itself. That is why [`Auto`] is the default.
+///
+/// [`Auto`]: SubmoduleSeed::Auto
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmoduleSeed {
+    /// Seed from a local mirror whenever one exists (the default).
+    #[default]
+    Auto,
+    /// Never seed; always let git clone submodules from their remotes.
+    Never,
+}
+
+impl SubmoduleSeed {
+    /// Parses a `submodules.seed` value (`auto`, `never`).
+    pub fn parse(value: &str) -> Option<SubmoduleSeed> {
+        match value {
+            "auto" => Some(SubmoduleSeed::Auto),
+            "never" => Some(SubmoduleSeed::Never),
+            _ => None,
+        }
+    }
+
+    /// Whether seeding is enabled.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, SubmoduleSeed::Auto)
+    }
+
+    /// The config identifier this strategy round-trips through.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            SubmoduleSeed::Auto => "auto",
+            SubmoduleSeed::Never => "never",
+        }
+    }
 }
 
 /// The fully-resolved configuration after merging all layers.
@@ -70,6 +124,9 @@ pub struct Config {
     pub pr_default_remote: String,
     /// When to auto-initialize git submodules on create/checkout (issue #50).
     pub submodules_init: SubmoduleInit,
+    /// Whether to seed a new worktree's submodules from the repository's own
+    /// local object stores instead of re-cloning them.
+    pub submodules_seed: SubmoduleSeed,
     /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
     /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
     pub agent_model: AgentModel,
@@ -110,6 +167,7 @@ impl Default for Config {
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
             submodules_init: SubmoduleInit::default(),
+            submodules_seed: SubmoduleSeed::default(),
             agent_model: AgentModel::default(),
             agent_effort: Effort::default(),
             list_show_untracked: true,
@@ -163,6 +221,9 @@ impl Config {
         }
         if let Some(v) = layer.submodules_init {
             self.submodules_init = v;
+        }
+        if let Some(v) = layer.submodules_seed {
+            self.submodules_seed = v;
         }
         if let Some(v) = layer.agent_model {
             self.agent_model = v;
@@ -251,6 +312,8 @@ pub struct ConfigLayer {
     pub pr_default_remote: Option<String>,
     /// `submodules.init`.
     pub submodules_init: Option<SubmoduleInit>,
+    /// `submodules.seed`.
+    pub submodules_seed: Option<SubmoduleSeed>,
     /// `agent.model`.
     pub agent_model: Option<AgentModel>,
     /// `agent.effort`.

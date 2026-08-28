@@ -305,6 +305,7 @@ pub(crate) fn checkout_pr_worktree(
         session.config.submodules_init,
         None,
         prompt,
+        session.config.submodules_seed.is_enabled(),
     )?;
 
     Ok(PrCheckout {

@@ -170,6 +170,63 @@ pub(crate) fn parse_submodule_status(output: &str) -> Vec<SubmoduleStatus> {
     result
 }
 
+/// One submodule as declared in a `.gitmodules` file: git's internal *name* for
+/// it (which is what names its gitdir under `.git/modules/`), the working-tree
+/// *path* it is checked out at, and the *url* it is cloned from.
+///
+/// Name and path are distinct and must not be conflated: a submodule can be
+/// renamed in `.gitmodules` while keeping its path, and `.git/modules/<name>`
+/// follows the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Submodule {
+    /// Git's name for the submodule (the `submodule.<name>.*` config section).
+    pub(crate) name: String,
+    /// Working-tree path relative to the superproject.
+    pub(crate) path: String,
+}
+
+/// Parses `git config -f .gitmodules -z --get-regexp ^submodule\..*` output.
+///
+/// The `-z` format is a NUL-separated list of entries, each `<key>\n<value>`;
+/// a key with no value has no newline. Only `.path` is load-bearing here — the
+/// URL is deliberately not collected, because seeding must never read a URL out
+/// of `.gitmodules` and act on it.
+///
+/// Submodule names may themselves contain dots (`submodule.a.b.path`), so the
+/// name is everything between the `submodule.` prefix and the *final* key
+/// segment — splitting on the first dot would truncate such names.
+pub(crate) fn parse_gitmodules(output: &str) -> Vec<Submodule> {
+    let mut subs: Vec<Submodule> = Vec::new();
+    for entry in output.split('\0') {
+        if entry.is_empty() {
+            continue;
+        }
+        // A valueless key carries no information for us.
+        let Some((key, value)) = entry.split_once('\n') else {
+            continue;
+        };
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some((name, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if field != "path" || name.is_empty() || value.is_empty() {
+            continue;
+        }
+        // Preserve declaration order; a duplicate key means the last one wins,
+        // matching git's own config semantics.
+        match subs.iter_mut().find(|s| s.name == name) {
+            Some(existing) => existing.path = value.to_string(),
+            None => subs.push(Submodule {
+                name: name.to_string(),
+                path: value.to_string(),
+            }),
+        }
+    }
+    subs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +318,42 @@ mod tests {
         assert!(parse_submodule_status("").is_empty());
         assert!(parse_submodule_status("-\n").is_empty());
         assert!(parse_submodule_status("-onlysha\n").is_empty());
+    }
+
+    #[test]
+    fn gitmodules_pairs_names_with_paths_in_declaration_order() {
+        let out = "submodule.vendor/A.path\nvendor/A\0submodule.vendor/A.url\n../a\0\
+                   submodule.vendor/B.path\nvendor/B\0submodule.vendor/B.url\n../b\0";
+        let subs = parse_gitmodules(out);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].name, "vendor/A");
+        assert_eq!(subs[0].path, "vendor/A");
+        assert_eq!(subs[1].name, "vendor/B");
+    }
+
+    #[test]
+    fn gitmodules_keeps_dots_inside_submodule_names() {
+        // `rsplit_once` is what makes this work: splitting on the first dot
+        // would yield the name "libs", losing the rest.
+        let subs = parse_gitmodules("submodule.libs.core.v2.path\nlibs/core\0");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].name, "libs.core.v2");
+        assert_eq!(subs[0].path, "libs/core");
+    }
+
+    #[test]
+    fn gitmodules_skips_entries_without_a_usable_path() {
+        // A url-only entry, a valueless key, a foreign section, an empty path,
+        // and a key with no field segment.
+        let out = "submodule.only.url\n../x\0submodule.bare.path\0core.bare\nfalse\0\
+                   submodule.blank.path\n\0submodule\nx\0";
+        assert!(parse_gitmodules(out).is_empty());
+    }
+
+    #[test]
+    fn gitmodules_last_duplicate_path_wins() {
+        let subs = parse_gitmodules("submodule.a.path\nold\0submodule.a.path\nnew\0");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].path, "new");
     }
 }

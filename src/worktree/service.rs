@@ -18,6 +18,7 @@ use crate::cx::Env;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
+use crate::git::submodule::seed::SeedReport;
 use crate::git::{branch_ref, default_branch, is_ancestor, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner};
 use crate::model::Worktree;
@@ -327,6 +328,12 @@ pub struct CreateOptions {
     /// prompts: callers resolve their `submodules.init` policy (and any flag
     /// override) to a boolean first.
     pub init_submodules: bool,
+    /// Seed those submodules from the repository's own local object stores
+    /// rather than re-cloning them from their remotes. Only an accelerator: the
+    /// stock `submodule update --init --recursive` still runs afterwards and
+    /// determines the result, so this cannot change the outcome. Resolved by the
+    /// caller from `submodules.seed`. Ignored when `init_submodules` is false.
+    pub seed_submodules: bool,
     /// Skip the `post_create` hook.
     pub no_hooks: bool,
 }
@@ -378,8 +385,38 @@ pub enum SubmodulesOutcome {
     },
 }
 
+/// What the local-mirror seeding step managed to do, as counts plus the
+/// failures. Purely informational: seeding is always followed by a stock
+/// `git submodule update --init --recursive`, so a non-empty `failed` here does
+/// not mean the submodules are unpopulated.
+///
+/// Paths are relative to the worktree, so nested submodules read as
+/// `outer/inner`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubmoduleSeeding {
+    /// Submodules populated from a local mirror, sharing its objects.
+    pub seeded: Vec<String>,
+    /// Submodules with no local mirror, left to be cloned from their remote.
+    pub skipped: Vec<String>,
+    /// Submodules whose seeding failed, with the rendered error. The stock pass
+    /// still had its chance to populate these.
+    pub failed: Vec<(String, String)>,
+}
+
+impl From<SeedReport> for SubmoduleSeeding {
+    fn from(report: SeedReport) -> Self {
+        Self {
+            seeded: report.seeded,
+            skipped: report.skipped,
+            failed: report.failed,
+        }
+    }
+}
+
 /// The outcome of [`Workspace::create`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CreatedWorktree {
     /// The worktree's path.
     pub path: PathBuf,
@@ -397,6 +434,8 @@ pub struct CreatedWorktree {
     pub post_create: HookOutcome,
     /// How submodule initialization went. Never fatal.
     pub submodules: SubmodulesOutcome,
+    /// What the local-mirror seeding accelerator did, if it ran.
+    pub submodule_seeding: SubmoduleSeeding,
 }
 
 /// The outcome of [`Workspace::remove`].
@@ -478,6 +517,7 @@ pub(crate) fn create_in(
                 copy: CopyOutcome::default(),
                 post_create: HookOutcome::Skipped,
                 submodules: SubmodulesOutcome::Skipped,
+                submodule_seeding: SubmoduleSeeding::default(),
             });
         }
         return Err(Error::operation(format!(
@@ -546,21 +586,10 @@ pub(crate) fn create_in(
 
     // Submodule initialization, when the caller resolved its policy to "yes".
     // Non-fatal: the worktree already exists.
-    let submodules = if options.init_submodules {
-        let pending = crate::git::submodule::uninitialized(git, &target)?;
-        if pending.is_empty() {
-            SubmodulesOutcome::Skipped
-        } else {
-            match crate::git::submodule::update_init(git, &target) {
-                Ok(()) => SubmodulesOutcome::Initialized(pending.len()),
-                Err(e) => SubmodulesOutcome::Failed {
-                    pending: pending.len(),
-                    error: e.to_string(),
-                },
-            }
-        }
+    let (submodules, seed) = if options.init_submodules {
+        populate_submodules(git, &target, options.seed_submodules)?
     } else {
-        SubmodulesOutcome::Skipped
+        (SubmodulesOutcome::Skipped, SeedReport::default())
     };
 
     Ok(CreatedWorktree {
@@ -571,7 +600,31 @@ pub(crate) fn create_in(
         copy,
         post_create,
         submodules,
+        submodule_seeding: seed.into(),
     })
+}
+
+/// Populates `target`'s submodules, seeding from the repository's own local
+/// mirrors first when enabled. See [`crate::git::submodule::populate`] for why
+/// seeding cannot change the outcome.
+fn populate_submodules(
+    git: &dyn GitCli,
+    target: &Path,
+    seed_enabled: bool,
+) -> Result<(SubmodulesOutcome, SeedReport)> {
+    let pending = crate::git::submodule::uninitialized(git, target)?;
+    if pending.is_empty() {
+        return Ok((SubmodulesOutcome::Skipped, SeedReport::default()));
+    }
+    let (seed, result) = crate::git::submodule::populate(git, target, seed_enabled);
+    let outcome = match result {
+        Ok(()) => SubmodulesOutcome::Initialized(pending.len()),
+        Err(e) => SubmodulesOutcome::Failed {
+            pending: pending.len(),
+            error: e.to_string(),
+        },
+    };
+    Ok((outcome, seed))
 }
 
 /// Records metadata, sets an explicit upstream, and runs the copy step — the
@@ -1273,6 +1326,76 @@ mod tests {
             }
             other => panic!("expected RemoveGuarded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_seeds_submodules_without_reaching_a_remote() {
+        // The user-visible win. The fixture's submodule URL is a file path, and
+        // git denies file-protocol submodule clones, so a worktree that had to
+        // clone from the recorded URL would come up empty. Seeding populates it
+        // from the repository's own object store instead, and the file-protocol
+        // opt-in it needs for that is its own, scoped to the mirror path.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            created.path.join("libs/sub/sub.txt").exists(),
+            "submodule was not populated"
+        );
+        assert_eq!(
+            created.submodule_seeding.seeded,
+            vec!["libs/sub".to_string()]
+        );
+        assert!(created.submodule_seeding.failed.is_empty());
+        assert!(matches!(
+            created.submodules,
+            SubmodulesOutcome::Initialized(1)
+        ));
+    }
+
+    #[test]
+    fn create_without_seeding_leaves_the_clone_to_git() {
+        // The escape hatch. With seeding off, the same fixture falls back to a
+        // real clone from the recorded file:// URL, which git denies — so the
+        // submodule stays unpopulated and the failure is reported rather than
+        // silently swallowed. This is exactly the behaviour before this feature.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: false,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(created.submodule_seeding.seeded.is_empty());
+        assert!(!created.path.join("libs/sub/sub.txt").exists());
+        assert!(matches!(
+            created.submodules,
+            SubmodulesOutcome::Failed { .. }
+        ));
     }
 
     #[test]

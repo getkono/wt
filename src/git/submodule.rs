@@ -22,9 +22,11 @@
 
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
-use crate::git::porcelain::parse_submodule_status;
+use crate::git::porcelain::{Submodule, parse_gitmodules, parse_submodule_status};
+
+pub(crate) mod seed;
 
 /// Returns the paths of submodules that are defined but not yet initialized in
 /// `worktree_dir` (the `-` marker of `git submodule status`). Best-effort: a repo
@@ -64,14 +66,138 @@ pub(crate) fn any_initialized(git: &dyn GitCli, worktree_dir: &Path) -> Result<b
         .any(|s| !s.is_uninitialized()))
 }
 
+/// Returns the submodules declared in `worktree_dir`'s `.gitmodules`, in
+/// declaration order.
+///
+/// Reads the file through `git config -f`, so git's own config parser handles
+/// quoting, comments and line continuations rather than a hand-rolled reader.
+/// Best-effort: no `.gitmodules` (or an unreadable one) yields an empty list,
+/// which is the same shape as "this directory has no submodules".
+pub(crate) fn declared(git: &dyn GitCli, worktree_dir: &Path) -> Result<Vec<Submodule>> {
+    if !worktree_dir.join(".gitmodules").is_file() {
+        return Ok(Vec::new());
+    }
+    let output = git.run_raw(
+        worktree_dir,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "-z",
+            "--get-regexp",
+            "^submodule\\..*",
+        ],
+    )?;
+    if !output.success {
+        return Ok(Vec::new());
+    }
+    Ok(parse_gitmodules(&output.stdout))
+}
+
 /// Initializes and updates all submodules in `worktree_dir`, recursively
 /// (`git submodule update --init --recursive`). Propagates a subprocess error;
 /// callers decide whether that is fatal.
+///
+/// Parallelism is deliberately not a `wt` option: git already honours its own
+/// `submodule.fetchJobs` here, and a second knob for the same thing would only
+/// apply on the paths `wt` happens to own.
 pub fn update_init(git: &dyn GitCli, worktree_dir: &Path) -> Result<()> {
     git.run(
         worktree_dir,
         &["submodule", "update", "--init", "--recursive"],
     )?;
+    Ok(())
+}
+
+/// Populates every submodule in `worktree_dir`, optionally seeding from the
+/// repository's own local mirrors first.
+///
+/// The ordering is the correctness contract:
+///
+/// 1. Seed what has a local mirror (near-instant, hardlinked, no network).
+/// 2. [`sync`] the URLs back to `.gitmodules`, undoing the mirror `origin` the
+///    seed clones left behind.
+/// 3. Run the stock [`update_init`] pass, which decides the result: anything
+///    seeding skipped is cloned normally, anything it got wrong is corrected.
+///
+/// So seeding is only ever an accelerator. If it fails outright the end state is
+/// byte-identical to not seeding at all, just slower. The returned
+/// [`SeedReport`](seed::SeedReport) is informational; the `Result` reflects only
+/// the stock pass.
+pub(crate) fn populate(
+    git: &dyn GitCli,
+    worktree_dir: &Path,
+    seed_from_mirrors: bool,
+) -> (seed::SeedReport, Result<()>) {
+    let span = tracing::info_span!("submodules", worktree = %worktree_dir.display());
+    let _guard = span.enter();
+
+    let mut report = seed::SeedReport::default();
+    if seed_from_mirrors {
+        match linked_worktree_common_dir(git, worktree_dir) {
+            Ok(Some(common)) => report = seed::seed_from_mirrors(git, worktree_dir, &common),
+            // The primary worktree already resolves its submodules to the shared
+            // `.git/modules`, so there is nothing to seed from and nothing to
+            // save — seeding is purely a linked-worktree concern.
+            Ok(None) => tracing::debug!("primary worktree; submodules already share the mirrors"),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not resolve the git dirs; not seeding");
+            }
+        }
+        // Restore the real upstreams before anything can fetch. A failure here
+        // must stop the reconcile pass, which would otherwise fetch through a
+        // mirror path and could persist it as the submodule's origin.
+        if !report.is_empty()
+            && let Err(e) = sync(git, worktree_dir)
+        {
+            return (report, Err(e));
+        }
+    }
+    let result = update_init(git, worktree_dir);
+    (report, result)
+}
+
+/// The repository's common git directory — the shared `.git` holding
+/// `modules/` — but only when `worktree_dir` is a *linked* worktree.
+///
+/// `None` means `worktree_dir` is the primary worktree, where the private and
+/// common git dirs are the same path and submodules already live in the shared
+/// mirrors.
+fn linked_worktree_common_dir(
+    git: &dyn GitCli,
+    worktree_dir: &Path,
+) -> Result<Option<std::path::PathBuf>> {
+    let out = git.run(
+        worktree_dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )?;
+    let mut lines = out.lines();
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return Err(Error::operation(
+            "could not resolve the repository git dirs",
+        ));
+    };
+    if git_dir.trim() == common.trim() {
+        return Ok(None);
+    }
+    Ok(Some(std::path::PathBuf::from(common.trim())))
+}
+
+/// Re-reads every submodule URL from `.gitmodules` into the worktree's config
+/// and into each populated submodule's `remote.origin.url`
+/// (`git submodule sync --recursive`).
+///
+/// Seeding clones a submodule from a local mirror, which leaves that mirror path
+/// as the submodule's `origin`. This restores the real upstream, so it must run
+/// before anything that could contact a remote. Propagates a subprocess error:
+/// leaving mirror paths as origins would be a silently wrong repository.
+pub(crate) fn sync(git: &dyn GitCli, worktree_dir: &Path) -> Result<()> {
+    git.run(worktree_dir, &["submodule", "sync", "--recursive"])?;
     Ok(())
 }
 

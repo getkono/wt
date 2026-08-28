@@ -142,6 +142,7 @@ pub(crate) fn checkout_branch_in_worktree(
         session.config.submodules_init,
         submodule_override,
         prompt,
+        session.config.submodules_seed.is_enabled(),
     )?;
     Ok(outcome)
 }

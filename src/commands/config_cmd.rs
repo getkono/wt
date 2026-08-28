@@ -23,6 +23,8 @@ const KEYS: &[&str] = &[
     "remove.delete_merged_branch",
     "remove.untracked_blocks",
     "pr.default_remote",
+    "submodules.init",
+    "submodules.seed",
     "agent.model",
     "agent.effort",
     "list.show_untracked",
@@ -198,6 +200,8 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "hooks.post_create"
         | "hooks.pre_remove"
         | "pr.default_remote"
+        | "submodules.init"
+        | "submodules.seed"
         | "agent.model"
         | "agent.effort"
         | "ui.color"
@@ -235,6 +239,8 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "remove.delete_merged_branch" => Some(config.remove_delete_merged_branch.to_string()),
         "remove.untracked_blocks" => Some(config.remove_untracked_blocks.to_string()),
         "pr.default_remote" => Some(config.pr_default_remote.clone()),
+        "submodules.init" => Some(config.submodules_init.identifier().to_string()),
+        "submodules.seed" => Some(config.submodules_seed.identifier().to_string()),
         "agent.model" => Some(config.agent_model.id().to_string()),
         "agent.effort" => Some(config.agent_effort.id().to_string()),
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),

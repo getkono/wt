@@ -528,6 +528,7 @@ pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
             copy_from: None,
             init_submodules: false,
             no_init_submodules: false,
+            no_seed_submodules: false,
         },
         false,
     )
