@@ -23,10 +23,15 @@
 //!    already-present files clean. A `checkout` here would rewrite every file
 //!    and undo the saving.
 //!
-//! As with seeding, this is only an accelerator: the caller still runs
-//! [`sync`](super::sync) and a stock
-//! [`update_init`](super::update_init) afterwards, which corrects anything this
-//! did not get right.
+//! As with seeding, this is only an accelerator: the caller still reconciles
+//! afterwards, and anything this did not get right is corrected there.
+//!
+//! One part of that is *not* optional. The clone in step 1 records the mirror as
+//! the submodule's `origin`, and an attached submodule reports as initialized —
+//! so a caller that only reconciles what is still pending would skip it and
+//! leave the mirror path in place, silently fetching from and pushing into the
+//! superproject's own object store. Callers must run [`sync`](super::sync)
+//! whenever this succeeds, whatever else they decide to do.
 
 use std::path::Path;
 

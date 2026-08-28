@@ -627,19 +627,40 @@ pub(crate) fn create_in(
     // Give them git directories of their own so the pass below recognizes them
     // instead of cloning over the top. Best-effort — anything missed is just a
     // normal clone.
-    if reflinked && let Ok(common) = common_git_dir(git, ws.root) {
-        let attached = materialize::attach_submodules(git, &target, &common);
-        if !attached.is_empty() {
-            tracing::debug!(count = attached.len(), "attached copied submodules");
-        }
+    let attached = match reflinked.then(|| common_git_dir(git, ws.root)) {
+        Some(Ok(common)) => materialize::attach_submodules(git, &target, &common),
+        _ => Vec::new(),
+    };
+    if !attached.is_empty() {
+        tracing::debug!(count = attached.len(), "attached copied submodules");
     }
+
+    // Attaching clones each submodule from the repository's own mirror, which
+    // records that mirror path as its `origin`. That has to be undone here, not
+    // left to the pass below: an attached submodule reports as *initialized*, so
+    // the pass sees nothing pending and skips — and mirror paths left as origins
+    // would silently fetch from, and push into, the primary worktree's object
+    // store instead of the real upstream.
+    let attach_sync = if attached.is_empty() {
+        Ok(())
+    } else {
+        crate::git::submodule::sync(git, &target)
+    };
 
     // Submodule initialization, when the caller resolved its policy to "yes".
     // Non-fatal: the worktree already exists.
-    let (submodules, seed) = if options.init_submodules {
-        populate_submodules(git, &target, options.seed_submodules)?
-    } else {
-        (SubmodulesOutcome::Skipped, SeedReport::default())
+    let (submodules, seed) = match attach_sync {
+        Err(e) => (
+            SubmodulesOutcome::Failed {
+                pending: attached.len(),
+                error: e.to_string(),
+            },
+            SeedReport::default(),
+        ),
+        Ok(()) if options.init_submodules => {
+            populate_submodules(git, &target, options.seed_submodules)?
+        }
+        Ok(()) => (SubmodulesOutcome::Skipped, SeedReport::default()),
     };
 
     Ok(CreatedWorktree {
@@ -1485,7 +1506,18 @@ mod tests {
             subs.starts_with(' '),
             "submodule not in sync after a reflink create: {subs:?}"
         );
-        // And the untracked artifact rode along.
+        // And it points at the real upstream. Attaching clones from the
+        // repository's own mirror, so without the follow-up sync `origin` would
+        // be `<repo>/.git/modules/libs/sub` and every later fetch or push in
+        // this submodule would go to the primary worktree's object store.
+        let origin =
+            |dir: &Path| repo.git(&["-C", &dir.to_string_lossy(), "config", "remote.origin.url"]);
+        assert_eq!(
+            origin(&created.path.join("libs/sub")),
+            origin(&repo.root().join("libs/sub")),
+            "the reflinked submodule kept the local mirror as its origin"
+        );
+        // And the ignored artifact rode along.
         assert!(created.path.join("build.out").exists());
     }
 

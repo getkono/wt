@@ -28,9 +28,14 @@
 //! # It cannot change the outcome
 //!
 //! Every failure path falls back to materializing the tree with git
-//! (`checkout-index -a -f`), and submodules still go through the usual
-//! `sync` + `update --init --recursive` reconcile afterwards. The worst case is
-//! that this was a waste of time, never that the worktree is wrong.
+//! (`checkout-index -a -f`), and submodules still go through the usual reconcile
+//! afterwards. The worst case is that this was a waste of time, never that the
+//! worktree is wrong.
+//!
+//! The one thing a caller owes [`attach_submodules`] is a
+//! [`sync`](crate::git::submodule::sync): see
+//! [`reattach`](crate::git::submodule::reattach) for why skipping it leaves the
+//! submodules pointed at the superproject's own object store.
 
 use std::path::{Path, PathBuf};
 
