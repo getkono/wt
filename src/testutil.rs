@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use crate::agent::{AgentClient, AgentKind, AgentOptions, AgentRun, AgentVersion, DetectedAgent};
 use crate::cx::{Cx, Env, Input, Stream};
 use crate::error::Error;
-use crate::gh::{GhClient, OpenPr, PrSummary, PrView, RealGh};
+use crate::gh::{GhClient, IssueSummary, IssueView, OpenPr, PrSummary, PrView, RealGh};
 use crate::git::cli::{GitCli, RealGit};
 
 /// A fake [`GhClient`] returning canned PR data or simulating an unavailable
@@ -33,6 +33,8 @@ pub(crate) struct FakeGh {
     edit_stdout: String,
     create_args: Arc<Mutex<Vec<Vec<String>>>>,
     edit_args: Arc<Mutex<Vec<Vec<String>>>>,
+    issue_list: Vec<IssueSummary>,
+    issue: Option<IssueView>,
 }
 
 #[allow(dead_code)]
@@ -65,6 +67,22 @@ impl FakeGh {
         }
     }
 
+    /// A fake that returns `issue` from `view_issue`.
+    pub(crate) fn with_issue(issue: IssueView) -> Self {
+        FakeGh {
+            issue: Some(issue),
+            available: true,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the issues returned by `list_open_issues`.
+    pub(crate) fn with_issue_list(mut self, list: Vec<IssueSummary>) -> Self {
+        self.issue_list = list;
+        self.available = true;
+        self
+    }
+
     /// A fake simulating a missing/unauthenticated `gh`.
     pub(crate) fn unavailable() -> Self {
         FakeGh::default()
@@ -94,6 +112,23 @@ impl FakeGh {
 }
 
 impl GhClient for FakeGh {
+    fn list_open_issues(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<IssueSummary>> {
+        if self.available {
+            Ok(self.issue_list.clone())
+        } else {
+            Err(Error::GhUnavailable("gh unavailable".into()))
+        }
+    }
+
+    fn view_issue(&self, _dir: &std::path::Path, _target: &str) -> crate::error::Result<IssueView> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.issue
+            .clone()
+            .ok_or_else(|| Error::operation("no issue configured"))
+    }
+
     fn list_open_prs(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<PrSummary>> {
         if self.available {
             Ok(self.list.clone())

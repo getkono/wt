@@ -1,8 +1,95 @@
 //! `gh` JSON shapes and their mapping to the domain model (spec §4).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::model::PrState;
+
+/// A GitHub issue label.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueLabel {
+    /// Label name.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A GitHub issue type (the organization-defined "type" field, distinct from
+/// labels).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueType {
+    /// Issue type name.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// A GitHub issue milestone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueMilestone {
+    /// Milestone title.
+    #[serde(default)]
+    pub title: String,
+}
+
+/// An open issue as returned by `gh issue list --json ...`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueSummary {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue state (`OPEN`/`CLOSED`).
+    pub state: String,
+    /// Labels attached to the issue.
+    #[serde(default)]
+    pub labels: Vec<IssueLabel>,
+    /// Optional organization-defined issue type.
+    #[serde(rename = "issueType", default)]
+    pub issue_type: Option<IssueType>,
+    /// Optional milestone.
+    #[serde(default)]
+    pub milestone: Option<IssueMilestone>,
+    /// ISO-8601 creation time.
+    #[serde(rename = "createdAt", default)]
+    pub created_at: String,
+    /// Issue web URL.
+    #[serde(default)]
+    pub url: String,
+}
+
+/// A full issue as returned by `gh issue view <target> --json ...`.
+///
+/// This carries only the token-efficient issue context the generation step
+/// needs; comments, assignees, reactions and project bookkeeping are
+/// deliberately not requested.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IssueView {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue body.
+    #[serde(default)]
+    pub body: String,
+    /// Issue state (`OPEN`/`CLOSED`).
+    pub state: String,
+    /// Labels attached to the issue.
+    #[serde(default)]
+    pub labels: Vec<IssueLabel>,
+    /// Optional organization-defined issue type.
+    #[serde(rename = "issueType", default)]
+    pub issue_type: Option<IssueType>,
+    /// Optional milestone.
+    #[serde(default)]
+    pub milestone: Option<IssueMilestone>,
+    /// ISO-8601 creation time.
+    #[serde(rename = "createdAt", default)]
+    pub created_at: String,
+    /// ISO-8601 update time.
+    #[serde(rename = "updatedAt", default)]
+    pub updated_at: String,
+    /// Issue web URL.
+    #[serde(default)]
+    pub url: String,
+}
 
 /// A PR author (`{ "login": ... }`).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -123,6 +210,53 @@ pub fn pr_state(state: &str, is_draft: bool) -> PrState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_issue_list_json() {
+        let json = r#"[
+            {"number": 12, "title": "Broken login", "state": "OPEN",
+             "labels": [{"name": "bug"}], "issueType": {"name": "Bug"},
+             "milestone": {"title": "v2"}, "createdAt": "2024-01-15T10:30:00Z",
+             "url": "https://github.com/o/r/issues/12"},
+            {"number": 13, "title": "Bare", "state": "OPEN"}
+        ]"#;
+        let issues: Vec<IssueSummary> = serde_json::from_str(json).unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].number, 12);
+        assert_eq!(issues[0].labels[0].name, "bug");
+        assert_eq!(issues[0].issue_type.as_ref().unwrap().name, "Bug");
+        assert_eq!(issues[0].milestone.as_ref().unwrap().title, "v2");
+        // Every optional field defaults, so a sparse `gh` response still parses.
+        assert!(issues[1].labels.is_empty());
+        assert_eq!(issues[1].issue_type, None);
+        assert_eq!(issues[1].milestone, None);
+        assert_eq!(issues[1].url, "");
+    }
+
+    #[test]
+    fn parses_issue_view_json() {
+        let json = r#"{"number": 7, "title": "Add login", "body": "Please add it.",
+            "state": "OPEN", "labels": [{"name": "enhancement"}],
+            "issueType": null, "milestone": null,
+            "createdAt": "2024-01-15T10:30:00Z", "updatedAt": "2024-02-01T09:00:00Z",
+            "url": "https://github.com/o/r/issues/7"}"#;
+        let issue: IssueView = serde_json::from_str(json).unwrap();
+        assert_eq!(issue.number, 7);
+        assert_eq!(issue.body, "Please add it.");
+        assert_eq!(issue.labels[0].name, "enhancement");
+        assert_eq!(issue.issue_type, None);
+        assert_eq!(issue.url, "https://github.com/o/r/issues/7");
+    }
+
+    #[test]
+    fn issue_view_tolerates_a_body_only_response() {
+        // `gh` omits fields the repository does not use; only number/title/state
+        // are required, so the rest must not make parsing fail.
+        let issue: IssueView =
+            serde_json::from_str(r#"{"number": 1, "title": "T", "state": "OPEN"}"#).unwrap();
+        assert_eq!(issue.body, "");
+        assert_eq!(issue.updated_at, "");
+    }
 
     #[test]
     fn parses_pr_list_json() {
