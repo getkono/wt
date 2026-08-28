@@ -408,6 +408,12 @@ pub struct RemovedWorktree {
     /// overridden by [`RemoveOptions::force_remove`] — the data-loss-risk case
     /// a caller should surface.
     pub forced_past_guards: bool,
+    /// Whether `--force` was passed to `git worktree remove` solely because the
+    /// worktree contained populated submodules, which git refuses to remove
+    /// without it. Distinct from [`Self::forced_past_guards`]: no `wt` guard was
+    /// overridden and there is no data-loss risk to report, so callers must not
+    /// present this as a forced removal.
+    pub forced_for_submodules: bool,
     /// How the `pre_remove` hook went. A failing hook aborts the removal
     /// (with a typed error) unless `force_remove` downgraded it to an outcome
     /// reported here.
@@ -655,6 +661,7 @@ pub(crate) fn remove_in(
         return Ok(RemovedWorktree {
             branch_deleted,
             forced_past_guards: false,
+            forced_for_submodules: false,
             pre_remove: HookOutcome::Skipped,
         });
     }
@@ -697,13 +704,27 @@ pub(crate) fn remove_in(
     // *after* the hook so a hook that re-enters `wt` cannot deadlock.
     let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
     let path = worktree.path.to_string_lossy().into_owned();
-    ops::worktree_remove(git, ws.root, &path, options.force_remove)?;
+
+    // `git worktree remove` refuses outright — `fatal: working trees containing
+    // submodules cannot be moved or removed` — for *any* worktree with a
+    // populated submodule, dirty or not, and only `--force` gets past it. Our own
+    // guards above are the real safety decision, so once they have passed (or
+    // been deliberately overridden) forcing git is not weakening anything.
+    let forced_for_submodules = !options.force_remove
+        && crate::git::submodule::any_initialized(git, &worktree.path).unwrap_or(false);
+    ops::worktree_remove(
+        git,
+        ws.root,
+        &path,
+        options.force_remove || forced_for_submodules,
+    )?;
 
     let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
     clear_metadata(git, ws.root, worktree);
     Ok(RemovedWorktree {
         branch_deleted,
         forced_past_guards,
+        forced_for_submodules,
         pre_remove,
     })
 }
@@ -881,7 +902,7 @@ mod tests {
     use super::*;
     use crate::git::cli::RealGit;
     use crate::hooks::RealHookRunner;
-    use crate::testutil::TestRepo;
+    use crate::testutil::{TestRepo, give_upstream};
     use std::collections::HashMap;
 
     fn env() -> Env {
@@ -1252,6 +1273,82 @@ mod tests {
             }
             other => panic!("expected RemoveGuarded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remove_succeeds_on_a_worktree_containing_submodules() {
+        // `git worktree remove` refuses any worktree with a populated submodule
+        // unless forced, so without the submodule-aware force this removal fails
+        // with `fatal: working trees containing submodules cannot be moved or
+        // removed` even though nothing is dirty.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        // Populate the submodule in the new worktree. A linked worktree does not
+        // share `.git/modules`, so git clones from the recorded URL — which is a
+        // file path here, and file-protocol submodule clones are denied by
+        // default. The fixture opts in; production URLs do not need this.
+        repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ]);
+        assert!(created.path.join("libs/sub/sub.txt").exists());
+        // Clear the unpushed guard so the removal is not blocked for an
+        // unrelated reason.
+        give_upstream(&repo, "topic");
+
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!created.path.exists(), "worktree directory still present");
+        assert!(
+            removed.forced_for_submodules,
+            "removal should record that git needed forcing for submodules"
+        );
+        assert!(
+            !removed.forced_past_guards,
+            "no wt guard was overridden, so this must not read as a forced removal"
+        );
+    }
+
+    #[test]
+    fn remove_without_submodules_does_not_report_a_submodule_force() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        ws.create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        give_upstream(&repo, "topic");
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!removed.forced_for_submodules);
+        assert!(!removed.forced_past_guards);
     }
 
     #[test]

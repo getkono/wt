@@ -436,6 +436,70 @@ impl TestRepo {
         src
     }
 
+    /// Adds a submodule at `outer` that itself contains a submodule at `inner`
+    /// (relative to `outer`), and returns the outer source repo path.
+    ///
+    /// Nesting is what distinguishes recursive submodule handling from the
+    /// single-level kind, and it is fiddly to build: the inner submodule has to
+    /// be committed into the *source* repo before the outer one is added, or the
+    /// superproject records a commit that has no nested gitlink.
+    pub(crate) fn add_nested_submodule(&self, outer: &str, inner: &str) -> PathBuf {
+        let parent = self.root.parent().expect("temp dir");
+        let deep = parent.join(format!("{}-deep-src", outer.replace('/', "-")));
+        std::fs::create_dir_all(&deep).expect("mkdir deep src");
+        run_git(&deep, &["init", "-q", "-b", "main"]);
+        std::fs::write(deep.join("deep.txt"), "deep\n").expect("write deep file");
+        run_git(&deep, &["add", "-A"]);
+        run_git(&deep, &["commit", "-q", "-m", "deep init"]);
+
+        let outer_src = parent.join(format!("{}-src", outer.replace('/', "-")));
+        std::fs::create_dir_all(&outer_src).expect("mkdir outer src");
+        run_git(&outer_src, &["init", "-q", "-b", "main"]);
+        std::fs::write(outer_src.join("sub.txt"), "submodule\n").expect("write sub file");
+        run_git(&outer_src, &["add", "-A"]);
+        run_git(&outer_src, &["commit", "-q", "-m", "submodule init"]);
+        run_git(
+            &outer_src,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &deep.to_string_lossy(),
+                inner,
+            ],
+        );
+        run_git(&outer_src, &["add", "-A"]);
+        run_git(&outer_src, &["commit", "-q", "-m", "add nested submodule"]);
+
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &outer_src.to_string_lossy(),
+                outer,
+            ],
+        );
+        self.commit_all("add submodule");
+        // Populate the nested level too, so the fixture mirrors a fully
+        // initialized checkout.
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        );
+        outer_src
+    }
+
     /// Deinitializes the submodule at `path`: empties its working tree and clears
     /// its configured URL so it reports as uninitialized, while keeping its
     /// objects under `.git/modules` so it can be re-initialized without another
