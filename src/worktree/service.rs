@@ -801,8 +801,20 @@ pub(crate) fn remove_in(
         });
     }
 
-    // Safety guards (spec §10/§12).
-    let guard = rows::guard_status(worktree, ws.config.remove_untracked_blocks);
+    // `git worktree remove` refuses outright — `fatal: working trees containing
+    // submodules cannot be moved or removed` — for *any* worktree with a
+    // populated submodule, dirty or not, and only `--force` gets past it.
+    let needs_submodule_force =
+        crate::git::submodule::any_initialized(git, &worktree.path).unwrap_or(false);
+
+    // Safety guards (spec §10/§12). Forcing git past the submodule refusal also
+    // takes its refusal to delete a worktree holding *untracked* files with it,
+    // and `remove.untracked_blocks` is off by default — so count untracked files
+    // here whenever that force is what we are about to do. Otherwise a worktree
+    // with submodules would quietly lose files that an identical worktree
+    // without them is protected from losing.
+    let untracked_blocks = ws.config.remove_untracked_blocks || needs_submodule_force;
+    let guard = rows::guard_status(worktree, untracked_blocks);
     if guard.blocks() && !options.force_remove {
         return Err(Error::RemoveGuarded {
             dirty: guard.dirty,
@@ -810,6 +822,9 @@ pub(crate) fn remove_in(
         });
     }
     let forced_past_guards = guard.blocks() && options.force_remove;
+    // Git needed forcing, but no `wt` guard was overridden to get there: no
+    // data-loss risk to report, so this must not read as a forced removal.
+    let forced_for_submodules = needs_submodule_force && !options.force_remove;
 
     // The pre-remove hook may abort; `force_remove` downgrades a failure to an
     // outcome and proceeds.
@@ -840,18 +855,13 @@ pub(crate) fn remove_in(
     let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
     let path = worktree.path.to_string_lossy().into_owned();
 
-    // `git worktree remove` refuses outright — `fatal: working trees containing
-    // submodules cannot be moved or removed` — for *any* worktree with a
-    // populated submodule, dirty or not, and only `--force` gets past it. Our own
-    // guards above are the real safety decision, so once they have passed (or
-    // been deliberately overridden) forcing git is not weakening anything.
-    let forced_for_submodules = !options.force_remove
-        && crate::git::submodule::any_initialized(git, &worktree.path).unwrap_or(false);
+    // The guards above are the real safety decision, and they took the submodule
+    // force into account, so passing it to git now weakens nothing.
     ops::worktree_remove(
         git,
         ws.root,
         &path,
-        options.force_remove || forced_for_submodules,
+        options.force_remove || needs_submodule_force,
     )?;
 
     let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
@@ -1638,6 +1648,63 @@ mod tests {
             !removed.forced_past_guards,
             "no wt guard was overridden, so this must not read as a forced removal"
         );
+    }
+
+    #[test]
+    fn remove_guards_untracked_files_when_submodules_force_git() {
+        // Forcing git past `working trees containing submodules cannot be
+        // removed` also discards its refusal to delete untracked files, and
+        // `remove.untracked_blocks` is off by default. Without the guard the
+        // scratch file below would be deleted with nothing having checked.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ]);
+        give_upstream(&repo, "topic");
+        std::fs::write(created.path.join("scratch.txt"), "unsaved\n").unwrap();
+
+        let row = row_for(&ws, "topic");
+        let err = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::RemoveGuarded { dirty: true, .. }));
+        assert!(created.path.join("scratch.txt").exists());
+
+        // `--force` is still the way through, and still reports honestly.
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    force_remove: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!created.path.exists());
+        assert!(removed.forced_past_guards);
     }
 
     #[test]
