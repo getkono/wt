@@ -317,7 +317,7 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
                 "unknown --model {m:?}; expected one of: opus, sonnet, haiku"
             ))
         })?,
-        None => config.agent_model,
+        None => config.agent_generation.model,
     };
     let effort = match &args.effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
@@ -325,7 +325,7 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
                 "unknown --effort {e:?}; expected one of: low, medium, high"
             ))
         })?,
-        None => config.agent_effort,
+        None => config.agent_generation.effort,
     };
     Ok(AgentOptions { model, effort })
 }
@@ -451,6 +451,7 @@ pub(crate) fn record_pr_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GenerationAgentConfig;
     use crate::git::cli::RealGit;
     use crate::git::discover::Repo;
     use crate::testutil::{FakeAgent, FakeGh, TestRepo};
@@ -756,8 +757,11 @@ mod tests {
     #[test]
     fn resolve_agent_options_flags_override_config() {
         let config = Config {
-            agent_model: AgentModel::Haiku,
-            agent_effort: Effort::Low,
+            agent_generation: GenerationAgentConfig {
+                model: AgentModel::Haiku,
+                effort: Effort::Low,
+                ..GenerationAgentConfig::default()
+            },
             ..Config::default()
         };
         // No flags: config defaults win.
