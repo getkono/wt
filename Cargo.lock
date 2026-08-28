@@ -2029,6 +2029,7 @@ dependencies = [
  "futures-util",
  "gix",
  "gix-lock",
+ "gix-tempfile",
  "globset",
  "insta",
  "jiff",

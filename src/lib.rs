@@ -42,6 +42,27 @@ mod testutil;
 pub use cx::{Cx, Env, Stream};
 pub use error::{Error, Result};
 
+/// Arms the signal handlers that release the advisory repository lock.
+///
+/// The lock taken by [`worktree::Workspace`] (and every other `gix` tempfile)
+/// is released by `Drop`, which a terminating signal skips — stranding
+/// `wt-mutation.lock` so the next mutating command waits out its full timeout
+/// and then fails. This installs handlers for `SIGINT`, `SIGTERM` and
+/// `SIGQUIT` that remove those files and then re-raise the signal with its
+/// default disposition, so the process still terminates as the caller expects.
+/// `SIGHUP` is not covered.
+///
+/// The `wt` binary calls this at startup. Embedders that drive the worktree
+/// API themselves should call it once, early: it must run before the first
+/// tempfile is created, and only the first call takes effect.
+pub fn install_signal_handlers() {
+    // Route through `gix-lock`'s own re-export rather than a separate
+    // `gix_tempfile::` path. The tempfile registry and the handler mode are
+    // per-crate-instance statics, so arming any copy other than the one
+    // `gix-lock` registers the lock with would silently do nothing.
+    gix_lock::tempfile::signal::setup(Default::default());
+}
+
 /// Runs `wt` with the given command-line arguments (excluding `argv[0]`),
 /// writing through the provided [`Cx`], and returns the process exit code.
 #[cfg(feature = "cli")]
@@ -100,5 +121,16 @@ mod tests {
         let mut t = test_cx(&[], "/tmp");
         assert_eq!(run(vec![], &mut t.cx), 1);
         assert!(t.err.contents().contains("not in a git repository"));
+    }
+}
+
+#[cfg(test)]
+mod signal_handler_tests {
+    /// Arming must be safe to repeat: only the first call takes effect, and a
+    /// second must not panic or re-register.
+    #[test]
+    fn installing_signal_handlers_is_idempotent() {
+        super::install_signal_handlers();
+        super::install_signal_handlers();
     }
 }

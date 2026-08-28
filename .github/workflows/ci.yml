@@ -40,6 +40,10 @@ jobs:
         run: mise run lint
       - name: Test
         run: mise run test
+      # The lean builds are the epic-#93 library surface; without this they are
+      # never compiled and can rot silently between releases.
+      - name: Lean builds (no default features)
+        run: mise run check-core
 
   coverage:
     name: Coverage
