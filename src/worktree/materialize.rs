@@ -163,10 +163,12 @@ pub(crate) fn attach_submodules(git: &dyn GitCli, target: &Path, common_dir: &Pa
         return Vec::new();
     };
     let mut attached = Vec::new();
+    let mirror_root = common_dir.join("modules");
     walk(
         git,
         target,
-        &common_dir.join("modules"),
+        &mirror_root,
+        &mirror_root,
         &private_modules,
         "",
         &mut attached,
@@ -175,10 +177,14 @@ pub(crate) fn attach_submodules(git: &dyn GitCli, target: &Path, common_dir: &Pa
 }
 
 /// One level of submodules, then into each one that was attached.
+///
+/// `mirror_root` is the repository's `.git/modules`, carried down the recursion
+/// so every resolved mirror can be checked to still sit inside it.
 fn walk(
     git: &dyn GitCli,
     dir: &Path,
     mirror_prefix: &Path,
+    mirror_root: &Path,
     private_modules: &Path,
     rel_prefix: &str,
     attached: &mut Vec<String>,
@@ -212,10 +218,16 @@ fn walk(
             }
             GitlinkState::Absent => {}
         }
-        let mirror = mirror_prefix.join(&sub.name);
-        if !mirror.is_dir() {
+        // `.gitmodules` is untrusted content and this name is about to be joined
+        // onto both the mirror directory to clone from and the git directory to
+        // create. Resolve it the same way seeding does, so a crafted name can
+        // neither read outside `.git/modules` nor write outside the worktree's
+        // own private one.
+        let Some(mirror) = submodule::seed::mirror_within(mirror_prefix, &sub.name, mirror_root)
+        else {
+            debug!(submodule = %rel, "no usable local mirror; leaving it to the reconcile pass");
             continue;
-        }
+        };
         let Ok(sha) = git.run(dir, &["rev-parse", &format!(":{}", sub.path)]) else {
             continue;
         };
@@ -235,6 +247,7 @@ fn walk(
                     git,
                     &work,
                     &mirror.join("modules"),
+                    mirror_root,
                     &private_modules.join(&sub.name).join("modules"),
                     &rel,
                     attached,
@@ -388,6 +401,50 @@ mod tests {
         std::fs::remove_file(work.join(".git")).unwrap();
         std::fs::create_dir_all(work.join(".git")).unwrap();
         assert_eq!(gitlink_state(&work), GitlinkState::Valid);
+    }
+
+    #[test]
+    fn attach_refuses_a_mirror_name_that_escapes_the_modules_directory() {
+        // A submodule *name* out of `.gitmodules` is joined onto both the mirror
+        // to clone from (`.git/modules/<name>`) and the git directory to create
+        // (`.git/worktrees/<id>/modules/<name>`). `.gitmodules` is untrusted
+        // repository content, so a name that climbs out of either must be
+        // refused. The declared path is a real one, so nothing else declines
+        // first, and the escaping name resolves to a genuine repository — an
+        // unclonable target would make this pass for the wrong reason.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let outside = repo.root().parent().unwrap().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        RealGit
+            .run(&outside, &["init", "-q", "-b", "main"])
+            .expect("init the repository the name points at");
+        repo.write(
+            ".gitmodules",
+            "[submodule \"../../../outside\"]\n\tpath = libs/sub\n\turl = ../x\n",
+        );
+        repo.commit_all("point the submodule name out of the repository");
+
+        repo.add_worktree("topic", "../wt-escape");
+        let wt = repo.root().parent().unwrap().join("wt-escape");
+        // Stand in for what the reflink copy leaves behind, so the walk reaches
+        // the name instead of skipping an empty directory.
+        let work = wt.join("libs/sub");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::copy(repo.root().join("libs/sub/sub.txt"), work.join("sub.txt")).unwrap();
+
+        let attached = attach_submodules(&RealGit, &wt, &repo.root().join(".git"));
+        assert!(
+            attached.is_empty(),
+            "attached a submodule through an escaping mirror name: {attached:?}"
+        );
+        // The load-bearing assertion: `<private modules>/../../../outside` is
+        // `<repo>/.git/outside`, which is where the clone would have put its
+        // separate git directory.
+        assert!(
+            !repo.root().join(".git/outside").exists(),
+            "created a git directory outside the worktree's private modules tree"
+        );
     }
 
     #[test]

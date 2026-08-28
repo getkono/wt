@@ -159,23 +159,19 @@ fn walk(
 /// is no usable one.
 ///
 /// Submodule names come from `.gitmodules`, which is repository content and
-/// therefore untrusted, and this path is about to be handed to a clone running
-/// with the file protocol allowed. A name like `../../../elsewhere` would
-/// otherwise walk out of the repository and make `wt` clone from an attacker-
-/// chosen local directory. Git has rejected `..` in submodule names since 2.20,
-/// but this code builds the path itself and must not lean on that.
+/// therefore untrusted, and this path is about to be handed to a clone. A name
+/// like `../../../elsewhere` would otherwise walk out of the repository and make
+/// `wt` clone from an attacker-chosen local directory.
 ///
-/// Two independent checks: reject any name that is not a plain relative path of
-/// normal components, and verify the canonicalized result still sits inside the
-/// canonicalized mirror root (which also catches escapes through a symlink).
-fn mirror_within(prefix: &Path, name: &str, root: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-
-    if name.is_empty()
-        || !Path::new(name)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-    {
+/// Two independent checks: reject any name that is not a
+/// [plain relative path](super::is_plain_relative) of normal components, and
+/// verify the canonicalized result still sits inside the canonicalized mirror
+/// root (which also catches escapes through a symlink). The first is redundant
+/// with the filtering [`declared`](super::declared) does, deliberately — every
+/// path built under `.git/modules` is checked where it is built, not only where
+/// its name was read.
+pub(crate) fn mirror_within(prefix: &Path, name: &str, root: &Path) -> Option<PathBuf> {
+    if !super::is_plain_relative(name) {
         return None;
     }
     let candidate = prefix.join(name);

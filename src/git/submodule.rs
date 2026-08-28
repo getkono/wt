@@ -67,6 +67,25 @@ pub(crate) fn any_initialized(git: &dyn GitCli, worktree_dir: &Path) -> Result<b
         .any(|s| !s.is_uninitialized()))
 }
 
+/// Whether `value` is a plain relative path — non-empty, and made only of
+/// normal components, so it can never climb out of a directory it is joined
+/// onto.
+///
+/// Submodule names and paths come from `.gitmodules`, which is repository
+/// content and therefore untrusted, and callers here join them onto real
+/// directories. Git has rejected `..` in submodule names and paths since 2.20,
+/// but nothing in that check is reachable from
+/// [`git config -f .gitmodules`](declared) — it reads the file as plain config —
+/// so this code must not lean on it.
+pub(crate) fn is_plain_relative(value: &str) -> bool {
+    use std::path::Component;
+
+    !value.is_empty()
+        && Path::new(value)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
+
 /// Returns the submodules declared in `worktree_dir`'s `.gitmodules`, in
 /// declaration order.
 ///
@@ -74,6 +93,12 @@ pub(crate) fn any_initialized(git: &dyn GitCli, worktree_dir: &Path) -> Result<b
 /// quoting, comments and line continuations rather than a hand-rolled reader.
 /// Best-effort: no `.gitmodules` (or an unreadable one) yields an empty list,
 /// which is the same shape as "this directory has no submodules".
+///
+/// Entries whose name or path is not a [plain relative path](is_plain_relative)
+/// are dropped here, at the boundary where the untrusted file is read, so no
+/// caller downstream can join one onto a directory. Git refuses such a
+/// submodule anyway, so dropping it costs nothing: the stock
+/// `update --init --recursive` pass reports it exactly as it would have.
 pub(crate) fn declared(git: &dyn GitCli, worktree_dir: &Path) -> Result<Vec<Submodule>> {
     if !worktree_dir.join(".gitmodules").is_file() {
         return Ok(Vec::new());
@@ -92,7 +117,20 @@ pub(crate) fn declared(git: &dyn GitCli, worktree_dir: &Path) -> Result<Vec<Subm
     if !output.success {
         return Ok(Vec::new());
     }
-    Ok(parse_gitmodules(&output.stdout))
+    Ok(parse_gitmodules(&output.stdout)
+        .into_iter()
+        .filter(|s| {
+            let ok = is_plain_relative(&s.name) && is_plain_relative(&s.path);
+            if !ok {
+                tracing::debug!(
+                    name = %s.name,
+                    path = %s.path,
+                    "ignoring a .gitmodules entry that is not a plain relative path"
+                );
+            }
+            ok
+        })
+        .collect())
 }
 
 /// Initializes and updates all submodules in `worktree_dir`, recursively
@@ -234,6 +272,45 @@ mod tests {
         update_init(&RealGit, repo.root()).unwrap();
         assert!(repo.root().join("libs/sub/sub.txt").exists());
         assert!(uninitialized(&RealGit, repo.root()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_plain_relative_accepts_only_normal_components() {
+        assert!(is_plain_relative("libs/sub"));
+        assert!(is_plain_relative("a.b.c"));
+        assert!(!is_plain_relative(""));
+        assert!(!is_plain_relative(".."));
+        assert!(!is_plain_relative("../outside"));
+        assert!(!is_plain_relative("libs/../../outside"));
+        assert!(!is_plain_relative("/etc"));
+        assert!(!is_plain_relative("./libs"));
+    }
+
+    #[test]
+    fn declared_drops_entries_that_could_escape_the_repository() {
+        // `.gitmodules` is untrusted repository content, and `git config -f`
+        // reads it as plain config — none of git's own submodule name/path
+        // validation is in play. Callers join both fields onto real directories
+        // (`.git/modules/<name>`, `<worktree>/<path>`), so a traversing entry
+        // must not reach them.
+        let repo = TestRepo::init();
+        repo.write(
+            ".gitmodules",
+            concat!(
+                "[submodule \"good\"]\n\tpath = libs/good\n\turl = ../g\n",
+                "[submodule \"../../../../tmp/evil\"]\n\tpath = libs/good2\n\turl = ../e\n",
+                "[submodule \"escaper\"]\n\tpath = ..\n\turl = ../e\n",
+                "[submodule \"absolute\"]\n\tpath = /etc/passwd\n\turl = ../e\n",
+            ),
+        );
+        repo.commit_all("declare hostile submodules");
+
+        let subs = declared(&RealGit, repo.root()).unwrap();
+        assert_eq!(
+            subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["good"],
+            "a traversing name or path survived the .gitmodules read"
+        );
     }
 
     #[test]
