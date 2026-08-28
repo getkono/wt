@@ -53,6 +53,25 @@ run = "cargo clippy --fix --allow-dirty --allow-staged --all-targets"
 description = "Run the test suite"
 run = "cargo test"
 
+[tasks.check-core]
+description = "Lint and test the lean feature-gated builds (the library surface embedders consume)"
+# CI and the default `lint`/`test` tasks only ever build the default feature set,
+# so the `#[cfg(not(feature = ...))]` fallbacks and the tests written for them
+# (e.g. config::parse::tests::theme_and_keybindings_are_tolerated_without_the_tui)
+# were never compiled.
+#
+# Closed under the implication graph (tui => cli+pr, pr => tui, agent => cli) the
+# distinct configurations are {}, {cli}, {cli,agent} and the default set. The two
+# gated below are {} and {cli}; `--all-features` is just `default`. {cli,agent} is
+# omitted only because `agent` currently gates no code, so it is identical to
+# {cli} — add it here the moment a `#[cfg(feature = "agent")]` appears.
+run = [
+    "cargo clippy --no-default-features --all-targets -- -D warnings",
+    "cargo test --no-default-features",
+    "cargo clippy --no-default-features --features cli --all-targets -- -D warnings",
+    "cargo test --no-default-features --features cli",
+]
+
 [tasks.coverage]
 description = "Run tests with coverage (minimum 80% line coverage; the main.rs entry point is excluded)"
 run = '''cargo llvm-cov --ignore-filename-regex 'src/main\.rs' --fail-under-lines 80'''
