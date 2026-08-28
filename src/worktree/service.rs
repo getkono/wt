@@ -18,13 +18,14 @@ use crate::cx::Env;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
+use crate::git::submodule::seed::SeedReport;
 use crate::git::{branch_ref, default_branch, is_ancestor, ops, resolve_hex};
 use crate::hooks::{HookContext, HookRunner};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
 use crate::slug::slugify_with_fallback;
 use crate::template::{self, TemplateVars};
-use crate::worktree::rows;
+use crate::worktree::{materialize, rows};
 
 /// How long a mutation waits for the advisory repository lock (issue #99)
 /// before failing with [`Error::LockUnavailable`].
@@ -327,6 +328,17 @@ pub struct CreateOptions {
     /// prompts: callers resolve their `submodules.init` policy (and any flag
     /// override) to a boolean first.
     pub init_submodules: bool,
+    /// Seed those submodules from the repository's own local object stores
+    /// rather than re-cloning them from their remotes. Only an accelerator: the
+    /// stock `submodule update --init --recursive` still runs afterwards and
+    /// determines the result, so this cannot change the outcome. Resolved by the
+    /// caller from `submodules.seed`. Ignored when `init_submodules` is false.
+    pub seed_submodules: bool,
+    /// Materialize the worktree by copy-on-write cloning an existing one's files
+    /// rather than checking them out. Requires a CoW filesystem and a source
+    /// worktree already at the same tree; when either is missing this silently
+    /// uses the normal checkout. Resolved by the caller from `create.reflink`.
+    pub reflink: bool,
     /// Skip the `post_create` hook.
     pub no_hooks: bool,
 }
@@ -378,8 +390,38 @@ pub enum SubmodulesOutcome {
     },
 }
 
+/// What the local-mirror seeding step managed to do, as counts plus the
+/// failures. Purely informational: seeding is always followed by a stock
+/// `git submodule update --init --recursive`, so a non-empty `failed` here does
+/// not mean the submodules are unpopulated.
+///
+/// Paths are relative to the worktree, so nested submodules read as
+/// `outer/inner`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubmoduleSeeding {
+    /// Submodules populated from a local mirror, sharing its objects.
+    pub seeded: Vec<String>,
+    /// Submodules with no local mirror, left to be cloned from their remote.
+    pub skipped: Vec<String>,
+    /// Submodules whose seeding failed, with the rendered error. The stock pass
+    /// still had its chance to populate these.
+    pub failed: Vec<(String, String)>,
+}
+
+impl From<SeedReport> for SubmoduleSeeding {
+    fn from(report: SeedReport) -> Self {
+        Self {
+            seeded: report.seeded,
+            skipped: report.skipped,
+            failed: report.failed,
+        }
+    }
+}
+
 /// The outcome of [`Workspace::create`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CreatedWorktree {
     /// The worktree's path.
     pub path: PathBuf,
@@ -397,6 +439,12 @@ pub struct CreatedWorktree {
     pub post_create: HookOutcome,
     /// How submodule initialization went. Never fatal.
     pub submodules: SubmodulesOutcome,
+    /// What the local-mirror seeding accelerator did, if it ran.
+    pub submodule_seeding: SubmoduleSeeding,
+    /// Whether the worktree's content was copy-on-write cloned from an existing
+    /// worktree rather than checked out. `false` covers both "not requested" and
+    /// "requested but unavailable"; the result is identical either way.
+    pub reflinked: bool,
 }
 
 /// The outcome of [`Workspace::remove`].
@@ -408,6 +456,12 @@ pub struct RemovedWorktree {
     /// overridden by [`RemoveOptions::force_remove`] — the data-loss-risk case
     /// a caller should surface.
     pub forced_past_guards: bool,
+    /// Whether `--force` was passed to `git worktree remove` solely because the
+    /// worktree contained populated submodules, which git refuses to remove
+    /// without it. Distinct from [`Self::forced_past_guards`]: no `wt` guard was
+    /// overridden and there is no data-loss risk to report, so callers must not
+    /// present this as a forced removal.
+    pub forced_for_submodules: bool,
     /// How the `pre_remove` hook went. A failing hook aborts the removal
     /// (with a typed error) unless `force_remove` downgraded it to an outcome
     /// reported here.
@@ -472,6 +526,8 @@ pub(crate) fn create_in(
                 copy: CopyOutcome::default(),
                 post_create: HookOutcome::Skipped,
                 submodules: SubmodulesOutcome::Skipped,
+                submodule_seeding: SubmoduleSeeding::default(),
+                reflinked: false,
             });
         }
         return Err(Error::operation(format!(
@@ -498,15 +554,43 @@ pub(crate) fn create_in(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Decide up front whether the content can be cloned copy-on-write from an
+    // existing worktree instead of checked out. This has to happen before the
+    // add, because the CoW path needs `--no-checkout`. `None` is the normal
+    // checkout and is never an error.
+    let reflink_plan = if options.reflink {
+        let source = copy_source(ws, &worktrees, options.copy_from.as_deref()).ok();
+        target
+            .parent()
+            .and_then(|parent| materialize::plan(source.as_deref(), parent))
+    } else {
+        None
+    };
+    let no_checkout = reflink_plan.is_some();
+
     // Create the worktree (git is atomic here).
     let target_str = target.to_string_lossy().into_owned();
     if let Some(base) = &base_ref {
         // `--no-track` keeps the new branch from inheriting the base as its
         // upstream (issue #43); `--track` opts into an explicit one.
-        ops::worktree_add_branch(git, ws.root, &branch, &target_str, base, true)?;
+        ops::worktree_add_branch(git, ws.root, &branch, &target_str, base, true, no_checkout)?;
     } else {
-        ops::worktree_add(git, ws.root, &target_str, &branch)?;
+        ops::worktree_add(git, ws.root, &target_str, &branch, no_checkout)?;
     }
+
+    // Materialize the content. A failure inside falls back to a stock checkout,
+    // so the worktree is populated either way; only a failure to do even that
+    // is fatal, and it rolls back like any other post-add step.
+    let reflinked = match &reflink_plan {
+        Some(plan) => match materialize::apply(git, &target, plan) {
+            Ok(used_cow) => used_cow,
+            Err(e) => {
+                rollback_worktree(git, ws.root, &target, &branch, base_ref.is_some(), false);
+                return Err(e);
+            }
+        },
+        None => false,
+    };
 
     // Steps after creation but before the hook are rolled back on failure (§13).
     let copy = match post_create_steps(ws, git, &worktrees, &branch, &base_ref, &target, options) {
@@ -538,23 +622,45 @@ pub(crate) fn create_in(
         },
     };
 
+    // A copy-on-write materialization also brought the submodules' *files*
+    // across, but their `.git` gitlinks still point into the source worktree.
+    // Give them git directories of their own so the pass below recognizes them
+    // instead of cloning over the top. Best-effort — anything missed is just a
+    // normal clone.
+    let attached = match reflinked.then(|| common_git_dir(git, ws.root)) {
+        Some(Ok(common)) => materialize::attach_submodules(git, &target, &common),
+        _ => Vec::new(),
+    };
+    if !attached.is_empty() {
+        tracing::debug!(count = attached.len(), "attached copied submodules");
+    }
+
+    // Attaching clones each submodule from the repository's own mirror, which
+    // records that mirror path as its `origin`. That has to be undone here, not
+    // left to the pass below: an attached submodule reports as *initialized*, so
+    // the pass sees nothing pending and skips — and mirror paths left as origins
+    // would silently fetch from, and push into, the primary worktree's object
+    // store instead of the real upstream.
+    let attach_sync = if attached.is_empty() {
+        Ok(())
+    } else {
+        crate::git::submodule::sync(git, &target)
+    };
+
     // Submodule initialization, when the caller resolved its policy to "yes".
     // Non-fatal: the worktree already exists.
-    let submodules = if options.init_submodules {
-        let pending = crate::git::submodule::uninitialized(git, &target)?;
-        if pending.is_empty() {
-            SubmodulesOutcome::Skipped
-        } else {
-            match crate::git::submodule::update_init(git, &target) {
-                Ok(()) => SubmodulesOutcome::Initialized(pending.len()),
-                Err(e) => SubmodulesOutcome::Failed {
-                    pending: pending.len(),
-                    error: e.to_string(),
-                },
-            }
+    let (submodules, seed) = match attach_sync {
+        Err(e) => (
+            SubmodulesOutcome::Failed {
+                pending: attached.len(),
+                error: e.to_string(),
+            },
+            SeedReport::default(),
+        ),
+        Ok(()) if options.init_submodules => {
+            populate_submodules(git, &target, options.seed_submodules)?
         }
-    } else {
-        SubmodulesOutcome::Skipped
+        Ok(()) => (SubmodulesOutcome::Skipped, SeedReport::default()),
     };
 
     Ok(CreatedWorktree {
@@ -565,7 +671,42 @@ pub(crate) fn create_in(
         copy,
         post_create,
         submodules,
+        submodule_seeding: seed.into(),
+        reflinked,
     })
+}
+
+/// The repository's common git directory — the shared `.git` that holds
+/// `modules/`, as opposed to a linked worktree's private git dir.
+fn common_git_dir(git: &dyn GitCli, root: &Path) -> Result<PathBuf> {
+    let out = git.run(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    Ok(PathBuf::from(out.trim()))
+}
+
+/// Populates `target`'s submodules, seeding from the repository's own local
+/// mirrors first when enabled. See [`crate::git::submodule::populate`] for why
+/// seeding cannot change the outcome.
+fn populate_submodules(
+    git: &dyn GitCli,
+    target: &Path,
+    seed_enabled: bool,
+) -> Result<(SubmodulesOutcome, SeedReport)> {
+    let pending = crate::git::submodule::uninitialized(git, target)?;
+    if pending.is_empty() {
+        return Ok((SubmodulesOutcome::Skipped, SeedReport::default()));
+    }
+    let (seed, result) = crate::git::submodule::populate(git, target, seed_enabled);
+    let outcome = match result {
+        Ok(()) => SubmodulesOutcome::Initialized(pending.len()),
+        Err(e) => SubmodulesOutcome::Failed {
+            pending: pending.len(),
+            error: e.to_string(),
+        },
+    };
+    Ok((outcome, seed))
 }
 
 /// Records metadata, sets an explicit upstream, and runs the copy step — the
@@ -655,12 +796,25 @@ pub(crate) fn remove_in(
         return Ok(RemovedWorktree {
             branch_deleted,
             forced_past_guards: false,
+            forced_for_submodules: false,
             pre_remove: HookOutcome::Skipped,
         });
     }
 
-    // Safety guards (spec §10/§12).
-    let guard = rows::guard_status(worktree, ws.config.remove_untracked_blocks);
+    // `git worktree remove` refuses outright — `fatal: working trees containing
+    // submodules cannot be moved or removed` — for *any* worktree with a
+    // populated submodule, dirty or not, and only `--force` gets past it.
+    let needs_submodule_force =
+        crate::git::submodule::any_initialized(git, &worktree.path).unwrap_or(false);
+
+    // Safety guards (spec §10/§12). Forcing git past the submodule refusal also
+    // takes its refusal to delete a worktree holding *untracked* files with it,
+    // and `remove.untracked_blocks` is off by default — so count untracked files
+    // here whenever that force is what we are about to do. Otherwise a worktree
+    // with submodules would quietly lose files that an identical worktree
+    // without them is protected from losing.
+    let untracked_blocks = ws.config.remove_untracked_blocks || needs_submodule_force;
+    let guard = rows::guard_status(worktree, untracked_blocks);
     if guard.blocks() && !options.force_remove {
         return Err(Error::RemoveGuarded {
             dirty: guard.dirty,
@@ -668,6 +822,9 @@ pub(crate) fn remove_in(
         });
     }
     let forced_past_guards = guard.blocks() && options.force_remove;
+    // Git needed forcing, but no `wt` guard was overridden to get there: no
+    // data-loss risk to report, so this must not read as a forced removal.
+    let forced_for_submodules = needs_submodule_force && !options.force_remove;
 
     // The pre-remove hook may abort; `force_remove` downgrades a failure to an
     // outcome and proceeds.
@@ -697,13 +854,22 @@ pub(crate) fn remove_in(
     // *after* the hook so a hook that re-enters `wt` cannot deadlock.
     let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
     let path = worktree.path.to_string_lossy().into_owned();
-    ops::worktree_remove(git, ws.root, &path, options.force_remove)?;
+
+    // The guards above are the real safety decision, and they took the submodule
+    // force into account, so passing it to git now weakens nothing.
+    ops::worktree_remove(
+        git,
+        ws.root,
+        &path,
+        options.force_remove || needs_submodule_force,
+    )?;
 
     let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
     clear_metadata(git, ws.root, worktree);
     Ok(RemovedWorktree {
         branch_deleted,
         forced_past_guards,
+        forced_for_submodules,
         pre_remove,
     })
 }
@@ -881,7 +1047,7 @@ mod tests {
     use super::*;
     use crate::git::cli::RealGit;
     use crate::hooks::RealHookRunner;
-    use crate::testutil::TestRepo;
+    use crate::testutil::{TestRepo, give_upstream};
     use std::collections::HashMap;
 
     fn env() -> Env {
@@ -1252,6 +1418,333 @@ mod tests {
             }
             other => panic!("expected RemoveGuarded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn create_seeds_submodules_without_reaching_a_remote() {
+        // The user-visible win. The fixture's submodule URL is a file path, and
+        // git denies file-protocol submodule clones, so a worktree that had to
+        // clone from the recorded URL would come up empty. Seeding populates it
+        // from the repository's own object store instead, and the file-protocol
+        // opt-in it needs for that is its own, scoped to the mirror path.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(
+            created.path.join("libs/sub/sub.txt").exists(),
+            "submodule was not populated"
+        );
+        assert_eq!(
+            created.submodule_seeding.seeded,
+            vec!["libs/sub".to_string()]
+        );
+        assert!(created.submodule_seeding.failed.is_empty());
+        assert!(matches!(
+            created.submodules,
+            SubmodulesOutcome::Initialized(1)
+        ));
+    }
+
+    #[test]
+    fn reflink_materialization_matches_a_normal_checkout() {
+        // The CoW path must be indistinguishable in result from a checkout: same
+        // tracked content, clean status, same submodule state. Skipped where the
+        // filesystem has no reflink support, since there is nothing to assert.
+        let Some(repo) = TestRepo::init_cow() else {
+            return;
+        };
+        repo.add_submodule("libs/sub");
+        repo.write("tracked.txt", "content\n");
+        repo.write(".gitignore", "build.out\n");
+        repo.commit_all("add a tracked file and an ignore rule");
+        // An ignored build artifact. Carrying these across is much of the point
+        // of asking for a CoW clone, and because it is ignored the new worktree
+        // is still clean.
+        repo.write("build.out", "artifact\n");
+        // Untracked work-in-progress, which belongs to the source worktree
+        // alone. Copying it would hand the new worktree a dirty status it never
+        // earned, and bypass the `copy` patterns that decide what travels.
+        repo.write("scratch.txt", "unsaved\n");
+        std::fs::create_dir_all(repo.root().join("wip")).unwrap();
+        repo.write("wip/notes.md", "later\n");
+        // A repository that hides untracked files from `git status` must not
+        // thereby switch the protection off.
+        repo.git(&["config", "status.showUntrackedFiles", "no"]);
+
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: true,
+                    reflink: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(created.reflinked, "the CoW path did not run");
+        // Tracked content is right and the worktree is clean.
+        assert_eq!(
+            std::fs::read_to_string(created.path.join("tracked.txt")).unwrap(),
+            "content\n"
+        );
+        let status = repo.git(&["-C", &created.path.to_string_lossy(), "status", "--short"]);
+        assert!(
+            status.trim().is_empty(),
+            "worktree is not clean: {status:?}"
+        );
+        // The submodule came across and is recognized, not left uninitialized.
+        assert!(created.path.join("libs/sub/sub.txt").exists());
+        let subs = repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "submodule",
+            "status",
+            "--recursive",
+        ]);
+        assert!(
+            subs.starts_with(' '),
+            "submodule not in sync after a reflink create: {subs:?}"
+        );
+        // And it points at the real upstream. Attaching clones from the
+        // repository's own mirror, so without the follow-up sync `origin` would
+        // be `<repo>/.git/modules/libs/sub` and every later fetch or push in
+        // this submodule would go to the primary worktree's object store.
+        let origin =
+            |dir: &Path| repo.git(&["-C", &dir.to_string_lossy(), "config", "remote.origin.url"]);
+        assert_eq!(
+            origin(&created.path.join("libs/sub")),
+            origin(&repo.root().join("libs/sub")),
+            "the reflinked submodule kept the local mirror as its origin"
+        );
+        // The ignored artifact rode along; the untracked work did not.
+        assert!(created.path.join("build.out").exists());
+        assert!(
+            !created.path.join("scratch.txt").exists(),
+            "an untracked source file was cloned into the new worktree"
+        );
+        assert!(
+            !created.path.join("wip/notes.md").exists(),
+            "an untracked source directory was cloned into the new worktree"
+        );
+    }
+
+    #[test]
+    fn reflink_declines_when_the_source_is_at_a_different_tree() {
+        // Falling back must still produce a correct worktree, just not a cloned
+        // one: the new branch is based on the *old* commit, whose tree differs
+        // from the source worktree's current one.
+        let repo = TestRepo::init();
+        let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("only-on-head.txt", "later\n");
+        repo.commit_all("move the source ahead");
+
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    base: Some(base),
+                    reflink: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(!created.reflinked, "cloned across differing trees");
+        // The worktree still has the right content for its own base.
+        assert!(!created.path.join("only-on-head.txt").exists());
+        let status = repo.git(&["-C", &created.path.to_string_lossy(), "status", "--short"]);
+        assert!(
+            status.trim().is_empty(),
+            "worktree is not clean: {status:?}"
+        );
+    }
+
+    #[test]
+    fn create_without_seeding_leaves_the_clone_to_git() {
+        // The escape hatch. With seeding off, the same fixture falls back to a
+        // real clone from the recorded file:// URL, which git denies — so the
+        // submodule stays unpopulated and the failure is reported rather than
+        // silently swallowed. This is exactly the behaviour before this feature.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(
+                &RealGit,
+                &RealHookRunner,
+                &CreateOptions {
+                    branch: "topic".to_string(),
+                    init_submodules: true,
+                    seed_submodules: false,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(created.submodule_seeding.seeded.is_empty());
+        assert!(!created.path.join("libs/sub/sub.txt").exists());
+        assert!(matches!(
+            created.submodules,
+            SubmodulesOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn remove_succeeds_on_a_worktree_containing_submodules() {
+        // `git worktree remove` refuses any worktree with a populated submodule
+        // unless forced, so without the submodule-aware force this removal fails
+        // with `fatal: working trees containing submodules cannot be moved or
+        // removed` even though nothing is dirty.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        // Populate the submodule in the new worktree. A linked worktree does not
+        // share `.git/modules`, so git clones from the recorded URL — which is a
+        // file path here, and file-protocol submodule clones are denied by
+        // default. The fixture opts in; production URLs do not need this.
+        repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ]);
+        assert!(created.path.join("libs/sub/sub.txt").exists());
+        // Clear the unpushed guard so the removal is not blocked for an
+        // unrelated reason.
+        give_upstream(&repo, "topic");
+
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!created.path.exists(), "worktree directory still present");
+        assert!(
+            removed.forced_for_submodules,
+            "removal should record that git needed forcing for submodules"
+        );
+        assert!(
+            !removed.forced_past_guards,
+            "no wt guard was overridden, so this must not read as a forced removal"
+        );
+    }
+
+    #[test]
+    fn remove_guards_untracked_files_when_submodules_force_git() {
+        // Forcing git past `working trees containing submodules cannot be
+        // removed` also discards its refusal to delete untracked files, and
+        // `remove.untracked_blocks` is off by default. Without the guard the
+        // scratch file below would be deleted with nothing having checked.
+        let repo = TestRepo::init();
+        repo.add_submodule("libs/sub");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        repo.git(&[
+            "-C",
+            &created.path.to_string_lossy(),
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ]);
+        give_upstream(&repo, "topic");
+        std::fs::write(created.path.join("scratch.txt"), "unsaved\n").unwrap();
+
+        let row = row_for(&ws, "topic");
+        let err = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::RemoveGuarded { dirty: true, .. }));
+        assert!(created.path.join("scratch.txt").exists());
+
+        // `--force` is still the way through, and still reports honestly.
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    force_remove: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!created.path.exists());
+        assert!(removed.forced_past_guards);
+    }
+
+    #[test]
+    fn remove_without_submodules_does_not_report_a_submodule_force() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        ws.create(&RealGit, &RealHookRunner, &create_opts("topic"))
+            .unwrap();
+        give_upstream(&repo, "topic");
+        let row = row_for(&ws, "topic");
+        let removed = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!removed.forced_for_submodules);
+        assert!(!removed.forced_past_guards);
     }
 
     #[test]

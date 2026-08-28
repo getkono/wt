@@ -246,6 +246,7 @@ pub(crate) fn maybe_init_submodules(
     dir: &Path,
     policy: SubmoduleInit,
     flag_override: Option<bool>,
+    seed: bool,
 ) -> Result<()> {
     let enabled = flag_override.unwrap_or(matches!(policy, SubmoduleInit::Always));
     if !enabled {
@@ -255,7 +256,7 @@ pub(crate) fn maybe_init_submodules(
     if pending.is_empty() {
         return Ok(());
     }
-    init_submodules(cx, git, dir, pending.len());
+    init_submodules(cx, git, dir, pending.len(), seed);
     Ok(())
 }
 
@@ -275,10 +276,11 @@ pub(crate) fn maybe_init_submodules_interactive(
     policy: SubmoduleInit,
     flag_override: Option<bool>,
     prompt: bool,
+    seed: bool,
 ) -> Result<()> {
     // An explicit flag or an always/never policy decides without asking.
     if flag_override.is_some() || !matches!(policy, SubmoduleInit::Prompt) {
-        return maybe_init_submodules(cx, git, dir, policy, flag_override);
+        return maybe_init_submodules(cx, git, dir, policy, flag_override, seed);
     }
     // The Prompt default: ask interactively, or take `--yes` as the answer;
     // otherwise leave them be.
@@ -294,17 +296,29 @@ pub(crate) fn maybe_init_submodules_interactive(
         pending.len()
     );
     if confirm_default_yes(cx, &ask)? {
-        init_submodules(cx, git, dir, pending.len());
+        init_submodules(cx, git, dir, pending.len(), seed);
     }
     Ok(())
 }
 
-/// Runs `git submodule update --init --recursive` in `dir`, logging a heads-up on
-/// stderr first (never stdout — the `cd` path must stay clean) since a submodule
-/// clone can block for a while. A failure is surfaced as a warning, not an error.
-fn init_submodules(cx: &mut Cx, git: &dyn GitCli, dir: &Path, count: usize) {
+/// Initializes the submodules in `dir`, logging a heads-up on stderr first
+/// (never stdout — the `cd` path must stay clean) since a submodule clone can
+/// block for a while. A failure is surfaced as a warning, not an error.
+///
+/// `seed` enables populating from the repository's own local object stores
+/// before the stock pass; it cannot change the result, only the cost. When it
+/// does work, the heads-up says so, because "initializing 200 submodule(s)…"
+/// followed by an instant return is otherwise surprising.
+fn init_submodules(cx: &mut Cx, git: &dyn GitCli, dir: &Path, count: usize, seed: bool) {
     let _ = cx.err.line(&format!("initializing {count} submodule(s)…"));
-    if let Err(e) = crate::git::submodule::update_init(git, dir) {
+    let (report, result) = crate::git::submodule::populate(git, dir, seed);
+    if !report.seeded.is_empty() {
+        let _ = cx.err.line(&format!(
+            "seeded {} submodule(s) from local object stores",
+            report.seeded.len()
+        ));
+    }
+    if let Err(e) = result {
         let _ = cx
             .err
             .line(&format!("warning: failed to initialize submodules: {e}"));
@@ -847,8 +861,15 @@ mod tests {
         fn disabled_policy_is_a_noop() {
             let repo = repo_with_uninitialized_submodule();
             let (mut t, err) = cx_with_err_tty(true);
-            maybe_init_submodules(&mut t.cx, &RealGit, repo.root(), SubmoduleInit::Never, None)
-                .unwrap();
+            maybe_init_submodules(
+                &mut t.cx,
+                &RealGit,
+                repo.root(),
+                SubmoduleInit::Never,
+                None,
+                true,
+            )
+            .unwrap();
             assert!(!is_initialized(&repo));
             assert!(err.contents().is_empty());
         }
@@ -863,6 +884,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Always,
                 None,
+                true,
             )
             .unwrap();
             assert!(is_initialized(&repo));
@@ -880,6 +902,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Never,
                 Some(true),
+                true,
             )
             .unwrap();
             assert!(is_initialized(&repo));
@@ -895,6 +918,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Always,
                 Some(false),
+                true,
             )
             .unwrap();
             assert!(!is_initialized(&repo));
@@ -910,6 +934,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Always,
                 None,
+                true,
             )
             .unwrap();
             assert!(err.contents().is_empty());
@@ -945,6 +970,7 @@ mod tests {
                 SubmoduleInit::Prompt,
                 None,
                 true,
+                true,
             )
             .unwrap();
             assert!(is_initialized(&repo));
@@ -962,6 +988,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Prompt,
                 None,
+                true,
                 true,
             )
             .unwrap();
@@ -982,6 +1009,7 @@ mod tests {
                 SubmoduleInit::Prompt,
                 None,
                 true,
+                true,
             )
             .unwrap();
             assert!(err.contents().is_empty());
@@ -997,6 +1025,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Prompt,
                 None,
+                true,
                 true,
             )
             .unwrap();
@@ -1017,6 +1046,7 @@ mod tests {
                 SubmoduleInit::Prompt,
                 None,
                 false,
+                true,
             )
             .unwrap();
             assert!(!is_initialized(&repo));
@@ -1034,6 +1064,7 @@ mod tests {
                 SubmoduleInit::Prompt,
                 Some(false),
                 true,
+                true,
             )
             .unwrap();
             assert!(!is_initialized(&repo));
@@ -1050,6 +1081,7 @@ mod tests {
                 repo.root(),
                 SubmoduleInit::Prompt,
                 Some(true),
+                true,
                 true,
             )
             .unwrap();
@@ -1070,6 +1102,7 @@ mod tests {
                 SubmoduleInit::Never,
                 None,
                 true,
+                true,
             )
             .unwrap();
             assert!(!is_initialized(&repo));
@@ -1086,6 +1119,7 @@ mod tests {
                 Path::new("/work"),
                 SubmoduleInit::Always,
                 None,
+                true,
             )
             .unwrap();
             let out = err.contents();

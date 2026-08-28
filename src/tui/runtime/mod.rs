@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::cli::NewArgs;
 use crate::commands::{self, Session, open_session};
-use crate::config::{Config, SubmoduleInit};
+use crate::config::{Config, SubmoduleInit, SubmoduleSeed};
 use crate::cx::{Cx, SilentInput, Stream};
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;

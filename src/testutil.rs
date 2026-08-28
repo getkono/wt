@@ -349,7 +349,30 @@ pub(crate) struct TestRepo {
 impl TestRepo {
     /// Initializes a normal repo on branch `main` with one initial commit.
     pub(crate) fn init() -> TestRepo {
-        let dir = tempfile::tempdir().expect("tempdir");
+        Self::init_in(tempfile::tempdir().expect("tempdir"))
+    }
+
+    /// Initializes a repo like [`init`](Self::init), but on a filesystem that
+    /// supports reflinks — or `None` when no such filesystem is reachable.
+    ///
+    /// The system temp dir is very often tmpfs, which has no reflink support, so
+    /// a plain `init()` would make every copy-on-write test skip without saying
+    /// so. Falling back to `target/` puts the fixture on whatever filesystem the
+    /// checkout lives on, which is where these tests actually run.
+    pub(crate) fn init_cow() -> Option<TestRepo> {
+        if let Ok(dir) = tempfile::tempdir()
+            && crate::util::reflink::is_supported(dir.path())
+        {
+            return Some(Self::init_in(dir));
+        }
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        std::fs::create_dir_all(&target).ok()?;
+        let dir = tempfile::tempdir_in(&target).ok()?;
+        crate::util::reflink::is_supported(dir.path()).then(|| Self::init_in(dir))
+    }
+
+    /// Builds the standard fixture inside an already-chosen temp directory.
+    fn init_in(dir: TempDir) -> TestRepo {
         let root = dir.path().join("repo");
         std::fs::create_dir_all(&root).expect("mkdir repo");
         run_git(&root, &["init", "-q", "-b", "main"]);
@@ -436,6 +459,70 @@ impl TestRepo {
         src
     }
 
+    /// Adds a submodule at `outer` that itself contains a submodule at `inner`
+    /// (relative to `outer`), and returns the outer source repo path.
+    ///
+    /// Nesting is what distinguishes recursive submodule handling from the
+    /// single-level kind, and it is fiddly to build: the inner submodule has to
+    /// be committed into the *source* repo before the outer one is added, or the
+    /// superproject records a commit that has no nested gitlink.
+    pub(crate) fn add_nested_submodule(&self, outer: &str, inner: &str) -> PathBuf {
+        let parent = self.root.parent().expect("temp dir");
+        let deep = parent.join(format!("{}-deep-src", outer.replace('/', "-")));
+        std::fs::create_dir_all(&deep).expect("mkdir deep src");
+        run_git(&deep, &["init", "-q", "-b", "main"]);
+        std::fs::write(deep.join("deep.txt"), "deep\n").expect("write deep file");
+        run_git(&deep, &["add", "-A"]);
+        run_git(&deep, &["commit", "-q", "-m", "deep init"]);
+
+        let outer_src = parent.join(format!("{}-src", outer.replace('/', "-")));
+        std::fs::create_dir_all(&outer_src).expect("mkdir outer src");
+        run_git(&outer_src, &["init", "-q", "-b", "main"]);
+        std::fs::write(outer_src.join("sub.txt"), "submodule\n").expect("write sub file");
+        run_git(&outer_src, &["add", "-A"]);
+        run_git(&outer_src, &["commit", "-q", "-m", "submodule init"]);
+        run_git(
+            &outer_src,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &deep.to_string_lossy(),
+                inner,
+            ],
+        );
+        run_git(&outer_src, &["add", "-A"]);
+        run_git(&outer_src, &["commit", "-q", "-m", "add nested submodule"]);
+
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &outer_src.to_string_lossy(),
+                outer,
+            ],
+        );
+        self.commit_all("add submodule");
+        // Populate the nested level too, so the fixture mirrors a fully
+        // initialized checkout.
+        run_git(
+            &self.root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ],
+        );
+        outer_src
+    }
+
     /// Deinitializes the submodule at `path`: empties its working tree and clears
     /// its configured URL so it reports as uninitialized, while keeping its
     /// objects under `.git/modules` so it can be re-initialized without another
@@ -464,6 +551,9 @@ pub(crate) fn make_wt(repo: &TestRepo, branch: &str) {
             copy_from: None,
             init_submodules: false,
             no_init_submodules: false,
+            no_seed_submodules: false,
+            reflink: false,
+            no_reflink: false,
         },
         false,
     )

@@ -44,6 +44,107 @@ impl SubmoduleInit {
             _ => None,
         }
     }
+
+    /// The config identifier this policy round-trips through.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            SubmoduleInit::Prompt => "prompt",
+            SubmoduleInit::Never => "never",
+            SubmoduleInit::Always => "always",
+        }
+    }
+}
+
+/// Whether to populate a new worktree's submodules from the repository's own
+/// local object stores instead of re-cloning them (`[submodules] seed`).
+///
+/// A linked worktree does not share `.git/modules`, so initializing submodules
+/// in one normally re-clones every submodule over the network. Seeding clones
+/// from those existing mirrors instead, which hardlinks the objects.
+///
+/// Seeding never changes the outcome, only the cost: it is always followed by a
+/// stock `git submodule update --init --recursive`, so anything it skips or gets
+/// wrong is reconciled by git itself. That is why [`Auto`] is the default.
+///
+/// [`Auto`]: SubmoduleSeed::Auto
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmoduleSeed {
+    /// Seed from a local mirror whenever one exists (the default).
+    #[default]
+    Auto,
+    /// Never seed; always let git clone submodules from their remotes.
+    Never,
+}
+
+impl SubmoduleSeed {
+    /// Parses a `submodules.seed` value (`auto`, `never`).
+    pub fn parse(value: &str) -> Option<SubmoduleSeed> {
+        match value {
+            "auto" => Some(SubmoduleSeed::Auto),
+            "never" => Some(SubmoduleSeed::Never),
+            _ => None,
+        }
+    }
+
+    /// Whether seeding is enabled.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, SubmoduleSeed::Auto)
+    }
+
+    /// The config identifier this strategy round-trips through.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            SubmoduleSeed::Auto => "auto",
+            SubmoduleSeed::Never => "never",
+        }
+    }
+}
+
+/// Whether to materialize a new worktree by copy-on-write cloning an existing
+/// one's files instead of checking them out (`[create] reflink`).
+///
+/// On a CoW filesystem (btrfs, XFS with `reflink=1`, APFS, ReFS) this shares the
+/// extents of every file, so a new worktree of a large repository costs almost
+/// no disk and almost no writing. It also carries the source's ignored build
+/// output along, which is usually the point and occasionally not. The source's
+/// untracked files are left behind, so the new worktree still comes up clean and
+/// [`Config::copy`] still governs which non-tracked files travel.
+///
+/// Off by default: it only pays off on a CoW filesystem, and copying a source's
+/// ignored files is a bigger behavioural change than seeding.
+/// `auto` uses it when the filesystem supports it and a source worktree is
+/// already at the same tree, and silently checks out normally otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CreateReflink {
+    /// Never clone; always check out (the default).
+    #[default]
+    Never,
+    /// Clone when the filesystem and the source worktree allow it.
+    Auto,
+}
+
+impl CreateReflink {
+    /// Parses a `create.reflink` value (`auto`, `never`).
+    pub fn parse(value: &str) -> Option<CreateReflink> {
+        match value {
+            "auto" => Some(CreateReflink::Auto),
+            "never" => Some(CreateReflink::Never),
+            _ => None,
+        }
+    }
+
+    /// Whether copy-on-write materialization is enabled.
+    pub fn is_enabled(self) -> bool {
+        matches!(self, CreateReflink::Auto)
+    }
+
+    /// The config identifier this strategy round-trips through.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            CreateReflink::Auto => "auto",
+            CreateReflink::Never => "never",
+        }
+    }
 }
 
 /// The fully-resolved configuration after merging all layers.
@@ -70,6 +171,12 @@ pub struct Config {
     pub pr_default_remote: String,
     /// When to auto-initialize git submodules on create/checkout (issue #50).
     pub submodules_init: SubmoduleInit,
+    /// Whether to seed a new worktree's submodules from the repository's own
+    /// local object stores instead of re-cloning them.
+    pub submodules_seed: SubmoduleSeed,
+    /// Whether to copy-on-write clone a new worktree's content from an existing
+    /// worktree instead of checking it out.
+    pub create_reflink: CreateReflink,
     /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
     /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
     pub agent_model: AgentModel,
@@ -110,6 +217,8 @@ impl Default for Config {
             remove_untracked_blocks: false,
             pr_default_remote: "origin".to_string(),
             submodules_init: SubmoduleInit::default(),
+            submodules_seed: SubmoduleSeed::default(),
+            create_reflink: CreateReflink::default(),
             agent_model: AgentModel::default(),
             agent_effort: Effort::default(),
             list_show_untracked: true,
@@ -163,6 +272,12 @@ impl Config {
         }
         if let Some(v) = layer.submodules_init {
             self.submodules_init = v;
+        }
+        if let Some(v) = layer.submodules_seed {
+            self.submodules_seed = v;
+        }
+        if let Some(v) = layer.create_reflink {
+            self.create_reflink = v;
         }
         if let Some(v) = layer.agent_model {
             self.agent_model = v;
@@ -251,6 +366,10 @@ pub struct ConfigLayer {
     pub pr_default_remote: Option<String>,
     /// `submodules.init`.
     pub submodules_init: Option<SubmoduleInit>,
+    /// `submodules.seed`.
+    pub submodules_seed: Option<SubmoduleSeed>,
+    /// `create.reflink`.
+    pub create_reflink: Option<CreateReflink>,
     /// `agent.model`.
     pub agent_model: Option<AgentModel>,
     /// `agent.effort`.

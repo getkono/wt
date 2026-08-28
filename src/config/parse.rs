@@ -8,7 +8,7 @@ use ratatui::style::Color;
 use toml::Value;
 
 use crate::agent::{AgentModel, Effort};
-use crate::config::schema::{ConfigLayer, SubmoduleInit};
+use crate::config::schema::{ConfigLayer, CreateReflink, SubmoduleInit, SubmoduleSeed};
 use crate::error::{Error, Result};
 #[cfg(feature = "tui")]
 use crate::keys::{KeyAction, KeyChord};
@@ -74,6 +74,7 @@ pub fn parse_layer(text: &str, file: &str) -> Result<ConfigLayer> {
             "hooks" => parse_hooks(file, val, &mut layer)?,
             "remove" => parse_remove(file, val, &mut layer)?,
             "pr" => parse_pr(file, val, &mut layer)?,
+            "create" => parse_create(file, val, &mut layer)?,
             "submodules" => parse_submodules(file, val, &mut layer)?,
             "agent" => parse_agent(file, val, &mut layer)?,
             "list" => parse_list(file, val, &mut layer)?,
@@ -114,6 +115,23 @@ fn parse_remove(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()
     Ok(())
 }
 
+/// Parses the `[create]` table, validating the `reflink` strategy.
+fn parse_create(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    for (sub, val) in as_table(file, "create", value)? {
+        let key = format!("create.{sub}");
+        match sub.as_str() {
+            "reflink" => {
+                let text = as_string(file, &key, val)?;
+                let strategy = CreateReflink::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: auto, never"))?;
+                layer.create_reflink = Some(strategy);
+            }
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+    Ok(())
+}
+
 /// Parses the `[pr]` table.
 fn parse_pr(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     for (sub, val) in as_table(file, "pr", value)? {
@@ -126,7 +144,8 @@ fn parse_pr(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     Ok(())
 }
 
-/// Parses the `[submodules]` table, validating the `init` policy (issue #50).
+/// Parses the `[submodules]` table, validating the `init` policy (issue #50) and
+/// the `seed` strategy.
 fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
     for (sub, val) in as_table(file, "submodules", value)? {
         let key = format!("submodules.{sub}");
@@ -136,6 +155,12 @@ fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Resul
                 let policy = SubmoduleInit::parse(&text)
                     .ok_or_else(|| cfg_err(file, &key, "expected one of: prompt, never, always"))?;
                 layer.submodules_init = Some(policy);
+            }
+            "seed" => {
+                let text = as_string(file, &key, val)?;
+                let strategy = SubmoduleSeed::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: auto, never"))?;
+                layer.submodules_seed = Some(strategy);
             }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
@@ -451,6 +476,33 @@ mod tests {
         assert!(reason.contains("prompt, never, always"));
         let (key, _) = config_reason(parse("[submodules]\nwiggle = true").unwrap_err());
         assert_eq!(key, "submodules.wiggle");
+    }
+
+    #[test]
+    fn submodules_seed_parses_and_validates() {
+        assert_eq!(
+            parse("[submodules]\nseed = \"never\"")
+                .unwrap()
+                .submodules_seed,
+            Some(SubmoduleSeed::Never)
+        );
+        assert_eq!(
+            parse("[submodules]\nseed = \"auto\"")
+                .unwrap()
+                .submodules_seed,
+            Some(SubmoduleSeed::Auto)
+        );
+        // Unset in a layer, so a layer that only sets `init` does not silently
+        // reset the strategy when merged.
+        assert_eq!(
+            parse("[submodules]\ninit = \"always\"")
+                .unwrap()
+                .submodules_seed,
+            None
+        );
+        let (key, reason) = config_reason(parse("[submodules]\nseed = \"maybe\"").unwrap_err());
+        assert_eq!(key, "submodules.seed");
+        assert!(reason.contains("auto, never"));
     }
 
     #[cfg(feature = "tui")]
