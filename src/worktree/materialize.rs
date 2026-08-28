@@ -48,33 +48,22 @@ pub(crate) struct ReflinkPlan {
     pub(crate) source: PathBuf,
 }
 
-/// Decides whether `target` can be materialized by cloning `source`, given the
-/// commit the new worktree will be checked out at.
+/// Decides whether a copy-on-write materialization is worth attempting at all.
 ///
-/// `None` means "use the normal checkout", and every `None` is a legitimate
-/// answer rather than an error: no source, trees differ, or the filesystem has
-/// no reflink support.
-pub(crate) fn plan(
-    git: &dyn GitCli,
-    source: Option<&Path>,
-    target_parent: &Path,
-    start_commit: &str,
-) -> Option<ReflinkPlan> {
+/// This runs *before* `git worktree add`, so it can only check what is knowable
+/// then: that there is a source worktree and that the filesystem supports
+/// reflinks. Whether the trees actually match is settled later, in [`apply`],
+/// against the worktree git really created.
+///
+/// `None` means "use the normal checkout", and is a legitimate answer rather
+/// than an error.
+pub(crate) fn plan(source: Option<&Path>, target_parent: &Path) -> Option<ReflinkPlan> {
     let source = source?;
     if !source.is_dir() {
         return None;
     }
     if !reflink::is_supported(target_parent) {
         debug!("no reflink support at the target; using a normal checkout");
-        return None;
-    }
-    let source_tree = tree_of(git, source, "HEAD")?;
-    let target_tree = tree_of(git, source, start_commit)?;
-    if source_tree != target_tree {
-        debug!(
-            source = %source.display(),
-            "source worktree is at a different tree; using a normal checkout"
-        );
         return None;
     }
     Some(ReflinkPlan {
@@ -92,14 +81,29 @@ fn tree_of(git: &dyn GitCli, dir: &Path, rev: &str) -> Option<String> {
 
 /// Materializes `target`'s content from the plan's source worktree.
 ///
-/// Falls back to a stock checkout on any failure, so the caller always ends up
-/// with a correctly populated worktree. Returns whether the CoW path was the one
-/// that produced it.
+/// Falls back to a stock checkout whenever the CoW path does not apply or does
+/// not work, so the caller always ends up with a correctly populated worktree.
+/// Returns whether the CoW path was the one that produced it.
 pub(crate) fn apply(git: &dyn GitCli, target: &Path, plan: &ReflinkPlan) -> Result<bool> {
     // The index has to exist before anything reads it — `--no-checkout` leaves
     // it empty, and `submodule` commands then fail with "pathspec did not match
     // any file(s) known to git".
     git.run(target, &["read-tree", "HEAD"])?;
+
+    // Ask the *new worktree* what it is actually at, rather than trusting a
+    // commit resolved earlier. `git worktree add` resolves its start-point
+    // argument in the primary worktree, so a symbolic base like `HEAD` can land
+    // somewhere other than where the caller resolved it — and cloning the
+    // source's files over a different tree leaves every file that exists in only
+    // one of them as a stray.
+    if !trees_match(git, target, &plan.source) {
+        debug!(
+            source = %plan.source.display(),
+            "source worktree is at a different tree; checking out normally"
+        );
+        checkout_everything(git, target)?;
+        return Ok(false);
+    }
 
     if let Err(e) = clone_content(git, target, plan) {
         debug!(error = %e, "reflink materialization failed; checking out normally");
@@ -107,6 +111,17 @@ pub(crate) fn apply(git: &dyn GitCli, target: &Path, plan: &ReflinkPlan) -> Resu
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Whether the new worktree and the source worktree are at the same tree.
+///
+/// An unreadable tree on either side answers `false`: without both, there is no
+/// evidence the copy would be correct.
+fn trees_match(git: &dyn GitCli, target: &Path, source: &Path) -> bool {
+    match (tree_of(git, target, "HEAD"), tree_of(git, source, "HEAD")) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// The CoW half: clone the files in, adopt what matches, correct what does not.
@@ -299,28 +314,46 @@ mod tests {
     #[test]
     fn plan_declines_without_a_source() {
         let repo = TestRepo::init();
-        assert!(plan(&RealGit, None, repo.root(), "HEAD").is_none());
+        assert!(plan(None, repo.root()).is_none());
     }
 
     #[test]
-    fn plan_declines_when_the_trees_differ() {
+    fn plan_declines_for_a_source_that_is_not_a_directory() {
         let repo = TestRepo::init();
-        let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
-        repo.write("new.txt", "content\n");
-        repo.commit_all("diverge");
-        // The source worktree is now ahead of `base`, so its files are not the
-        // content a worktree at `base` should have.
-        assert!(plan(&RealGit, Some(repo.root()), repo.root(), &base).is_none());
+        assert!(plan(Some(&repo.root().join("README.md")), repo.root()).is_none());
     }
 
     #[test]
-    fn plan_accepts_a_source_at_the_same_tree() {
+    fn plan_accepts_a_real_source_on_a_cow_filesystem() {
         let repo = TestRepo::init();
         if !cow(&repo) {
             return;
         }
-        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
-        assert!(plan(&RealGit, Some(repo.root()), repo.root(), &head).is_some());
+        assert!(plan(Some(repo.root()), repo.root()).is_some());
+    }
+
+    #[test]
+    fn trees_match_compares_the_two_worktrees_not_a_resolved_base() {
+        // The regression this guards: `git worktree add` resolves its start
+        // point in the *primary* worktree, so a symbolic base can land on a
+        // different commit than the caller resolved. Comparing the worktrees
+        // themselves is immune to that.
+        let repo = TestRepo::init();
+        repo.add_worktree("topic", "../wt-same");
+        let same = repo.root().parent().unwrap().join("wt-same");
+        assert!(trees_match(&RealGit, &same, repo.root()));
+
+        repo.write("only-here.txt", "content\n");
+        repo.commit_all("move the source ahead");
+        assert!(!trees_match(&RealGit, &same, repo.root()));
+    }
+
+    #[test]
+    fn trees_match_is_false_when_either_side_is_unreadable() {
+        let repo = TestRepo::init();
+        let missing = repo.root().parent().unwrap().join("not-a-repo");
+        assert!(!trees_match(&RealGit, &missing, repo.root()));
+        assert!(!trees_match(&RealGit, repo.root(), &missing));
     }
 
     #[test]

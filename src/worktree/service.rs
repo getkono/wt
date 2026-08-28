@@ -562,7 +562,7 @@ pub(crate) fn create_in(
         let source = copy_source(ws, &worktrees, options.copy_from.as_deref()).ok();
         target
             .parent()
-            .and_then(|parent| materialize::plan(git, source.as_deref(), parent, &base_commit))
+            .and_then(|parent| materialize::plan(source.as_deref(), parent))
     } else {
         None
     };
