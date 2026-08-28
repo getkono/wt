@@ -64,6 +64,7 @@ fn cell_color(column: Column, value: &str) -> Option<&'static str> {
             _ if trimmed.contains("(draft)") => Some(ansi::DIM),
             _ => None,
         },
+        Column::Issue if !trimmed.is_empty() => Some(ansi::CYAN),
         _ => None,
     }
 }

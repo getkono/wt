@@ -53,6 +53,8 @@ pub struct Worktree {
     pub commit: Option<Commit>,
     /// Recorded pull request; `None` when none.
     pub pr: Option<Pr>,
+    /// Linked GitHub issue; `None` when none (issue #100).
+    pub issue: Option<IssueLink>,
     /// Whether a checked-out worktree exists for this row. `false` marks a
     /// "branch row": a local branch with no worktree, listed beneath the real
     /// worktrees with its ahead/behind relative to its base (issue #47). Not part
@@ -103,6 +105,7 @@ impl Worktree {
             base_ref: None,
             commit: None,
             pr: None,
+            issue: None,
             has_worktree: true,
             recent_commits: Vec::new(),
             pr_url: None,
@@ -164,6 +167,21 @@ pub struct Pr {
     pub state: PrState,
     /// PR title.
     pub title: String,
+}
+
+/// A linked GitHub issue, recorded by `wt issue` (issue #100).
+///
+/// The link lives in `wt.<branch>.issue*` git config rather than in the branch
+/// name, so a branch that does not follow the `TYPE/{number}-SLUG` convention is
+/// still resolvable back to its issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IssueLink {
+    /// Issue number.
+    pub number: u64,
+    /// Issue title.
+    pub title: String,
+    /// Issue web URL.
+    pub url: String,
 }
 
 /// Pull-request state, mirroring `gh` (spec §7).
@@ -293,6 +311,9 @@ pub enum Column {
     Commit,
     /// PR number and state.
     Pr,
+    /// Linked issue number. Deliberately absent from [`Column::ALL`]: it is
+    /// opt-in via `list.columns`, so the default table is unchanged.
+    Issue,
 }
 
 impl Column {
@@ -317,6 +338,7 @@ impl Column {
             "ahead-behind" => Column::AheadBehind,
             "commit" => Column::Commit,
             "pr" => Column::Pr,
+            "issue" => Column::Issue,
             _ => return None,
         })
     }
@@ -331,6 +353,7 @@ impl Column {
             Column::AheadBehind => "ahead-behind",
             Column::Commit => "commit",
             Column::Pr => "pr",
+            Column::Issue => "issue",
         }
     }
 }
@@ -361,7 +384,8 @@ mod tests {
             "author": "Alice",
             "timestamp": "2024-01-15T10:30:00Z"
         },
-        "pr": { "number": 42, "state": "open", "title": "Add login page" }
+        "pr": { "number": 42, "state": "open", "title": "Add login page" },
+        "issue": null
     }"#;
 
     fn spec_example_worktree() -> Worktree {
@@ -391,11 +415,21 @@ mod tests {
                 state: PrState::Open,
                 title: "Add login page".into(),
             }),
+            issue: None,
             has_worktree: true,
             recent_commits: Vec::new(),
             pr_url: None,
             merge_state: None,
         }
+    }
+
+    #[test]
+    fn issue_column_parses_but_is_not_a_default_column() {
+        assert_eq!(Column::parse("issue"), Some(Column::Issue));
+        assert_eq!(Column::Issue.identifier(), "issue");
+        // Deliberate: `issue` is opt-in via `list.columns`, so adding it to
+        // `ALL` would silently widen every default table (issue #100).
+        assert!(!Column::ALL.contains(&Column::Issue));
     }
 
     #[test]

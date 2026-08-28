@@ -275,6 +275,14 @@ pub struct MetaUpdate {
     pub pr_title: Option<String>,
     /// The cached PR URL.
     pub pr_url: Option<String>,
+    /// The linked GitHub issue number (issue #100).
+    pub issue_number: Option<u64>,
+    /// The cached issue title.
+    pub issue_title: Option<String>,
+    /// The cached issue URL.
+    pub issue_url: Option<String>,
+    /// The generated implementation brief, persisted for embedders.
+    pub issue_brief: Option<String>,
     /// Marks the branch as created by `wt` (spec §10), which is what allows a
     /// later remove to delete it. There is no un-marking: `false` leaves the
     /// recorded flag as it is.
@@ -303,6 +311,18 @@ pub(crate) fn apply_meta(
     }
     if let Some(url) = &update.pr_url {
         wtconfig::write_pr_url(git, root, branch, url)?;
+    }
+    if let Some(number) = update.issue_number {
+        wtconfig::write_issue_number(git, root, branch, number)?;
+    }
+    if let Some(title) = &update.issue_title {
+        wtconfig::write_issue_title(git, root, branch, title)?;
+    }
+    if let Some(url) = &update.issue_url {
+        wtconfig::write_issue_url(git, root, branch, url)?;
+    }
+    if let Some(brief) = &update.issue_brief {
+        wtconfig::write_issue_brief(git, root, branch, brief)?;
     }
     if update.created_by_wt {
         wtconfig::mark_created_by_wt(git, root, branch)?;

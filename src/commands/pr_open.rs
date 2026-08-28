@@ -440,6 +440,9 @@ pub(crate) fn record_pr_metadata(
         // rather than recording a blank.
         pr_url: (!outcome.url.is_empty()).then(|| outcome.url.clone()),
         created_by_wt: false,
+        // Opening a PR records no issue link; `None` leaves any existing one
+        // (e.g. from `wt issue`) untouched.
+        ..MetaUpdate::default()
     };
     let _lock = lock_repo(root)?;
     apply_meta(git, root, branch, &update)

@@ -74,6 +74,15 @@ pub struct WtMeta {
     pub pr_url: Option<String>,
     /// Whether the branch/worktree was created by `wt` (§10).
     pub created_by_wt: bool,
+    /// Linked GitHub issue number, for issue worktrees (issue #100).
+    pub issue_number: Option<u64>,
+    /// Cached issue title, so `wt list` can show it offline.
+    pub issue_title: Option<String>,
+    /// Cached issue URL.
+    pub issue_url: Option<String>,
+    /// The generated implementation brief. Persisted so an embedder (karet)
+    /// can read it instead of regenerating it.
+    pub issue_brief: Option<String>,
 }
 
 /// The config key for `wt.<branch>.<name>`.
@@ -102,6 +111,18 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
     let created_by_wt = config
         .boolean(key(branch, "createdByWt").as_str())
         .unwrap_or(false);
+    let issue_number = config
+        .string(key(branch, "issueNumber").as_str())
+        .and_then(|v| v.to_string().parse::<u64>().ok());
+    let issue_title = config
+        .string(key(branch, "issueTitle").as_str())
+        .map(|v| v.to_string());
+    let issue_url = config
+        .string(key(branch, "issueUrl").as_str())
+        .map(|v| v.to_string());
+    let issue_brief = config
+        .string(key(branch, "issueBrief").as_str())
+        .map(|v| v.to_string());
     WtMeta {
         base_ref,
         pr_number,
@@ -109,6 +130,10 @@ pub fn read_meta(repo: &gix::Repository, branch: &str) -> WtMeta {
         pr_title,
         pr_url,
         created_by_wt,
+        issue_number,
+        issue_title,
+        issue_url,
+        issue_brief,
     }
 }
 
@@ -167,6 +192,48 @@ pub fn write_pr_number(
         repo_root,
         &["config", &key(branch, "prNumber"), &number.to_string()],
     )?;
+    Ok(())
+}
+
+/// Records the linked issue number for `branch`.
+pub fn write_issue_number(
+    git: &dyn GitCli,
+    repo_root: &Path,
+    branch: &str,
+    number: u64,
+) -> Result<()> {
+    git.run(
+        repo_root,
+        &["config", &key(branch, "issueNumber"), &number.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Records the cached issue title for `branch`.
+pub fn write_issue_title(
+    git: &dyn GitCli,
+    repo_root: &Path,
+    branch: &str,
+    title: &str,
+) -> Result<()> {
+    git.run(repo_root, &["config", &key(branch, "issueTitle"), title])?;
+    Ok(())
+}
+
+/// Records the issue URL for `branch`.
+pub fn write_issue_url(git: &dyn GitCli, repo_root: &Path, branch: &str, url: &str) -> Result<()> {
+    git.run(repo_root, &["config", &key(branch, "issueUrl"), url])?;
+    Ok(())
+}
+
+/// Records the generated implementation brief for `branch`.
+pub fn write_issue_brief(
+    git: &dyn GitCli,
+    repo_root: &Path,
+    branch: &str,
+    brief: &str,
+) -> Result<()> {
+    git.run(repo_root, &["config", &key(branch, "issueBrief"), brief])?;
     Ok(())
 }
 
@@ -299,10 +366,46 @@ mod tests {
     }
 
     #[test]
+    fn issue_link_round_trips() {
+        let repo = TestRepo::init();
+        write_issue_number(&RealGit, repo.root(), "topic", 7).unwrap();
+        write_issue_title(&RealGit, repo.root(), "topic", "Add login").unwrap();
+        write_issue_url(&RealGit, repo.root(), "topic", "https://example.com/7").unwrap();
+        write_issue_brief(&RealGit, repo.root(), "topic", "Wire up the form.").unwrap();
+        let got = meta(&repo, "topic");
+        assert_eq!(got.issue_number, Some(7));
+        assert_eq!(got.issue_title.as_deref(), Some("Add login"));
+        assert_eq!(got.issue_url.as_deref(), Some("https://example.com/7"));
+        assert_eq!(got.issue_brief.as_deref(), Some("Wire up the form."));
+    }
+
+    #[test]
+    fn issue_keys_are_absent_until_written() {
+        // The issue keys are purely additive: a repository written by an older
+        // build has none of them, and every one must read back as `None` rather
+        // than fail. This is what makes them safe without a `wt.schema` bump.
+        let repo = TestRepo::init();
+        write_base_ref(&RealGit, repo.root(), "topic", "main").unwrap();
+        let got = meta(&repo, "topic");
+        assert_eq!(got.issue_number, None);
+        assert_eq!(got.issue_title, None);
+        assert_eq!(got.issue_url, None);
+        assert_eq!(got.issue_brief, None);
+    }
+
+    #[test]
     fn clear_removes_all_metadata() {
         let repo = TestRepo::init();
         write_base_ref(&RealGit, repo.root(), "topic", "main").unwrap();
         mark_created_by_wt(&RealGit, repo.root(), "topic").unwrap();
+        // Every key the section can hold, so `--remove-section` is proven to
+        // clear the issue keys too and not just the ones it predates.
+        write_pr(&RealGit, repo.root(), "topic", 42, "open", "Title").unwrap();
+        write_pr_url(&RealGit, repo.root(), "topic", "https://example.com/42").unwrap();
+        write_issue_number(&RealGit, repo.root(), "topic", 7).unwrap();
+        write_issue_title(&RealGit, repo.root(), "topic", "Add login").unwrap();
+        write_issue_url(&RealGit, repo.root(), "topic", "https://example.com/7").unwrap();
+        write_issue_brief(&RealGit, repo.root(), "topic", "Wire up the form.").unwrap();
         clear_meta(&RealGit, repo.root(), "topic").unwrap();
         assert_eq!(meta(&repo, "topic"), WtMeta::default());
         // Clearing again (no section) is not an error.
