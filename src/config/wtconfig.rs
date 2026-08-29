@@ -4,6 +4,35 @@
 //! Metadata is keyed by branch (`[wt "<branch>"]`), so it is shared across the
 //! repo yet unambiguous per worktree. Reads use `gix`; writes use `git config`
 //! (a sanctioned §4 fallback — `gix`'s config file-writing is not yet stable).
+//!
+//! # The metadata contract
+//!
+//! Every key lives under `wt.<branch>.*` in the repository's git config, and
+//! all of them are optional:
+//!
+//! | Key | Type | Meaning |
+//! | --- | --- | --- |
+//! | `baseRef` | string | The ref the branch was created from |
+//! | `createdByWt` | bool | `wt` created the branch, so `wt` may delete it |
+//! | `prNumber` | integer | The originating pull request |
+//! | `prState` | string | Cached PR state, so listing works offline |
+//! | `prTitle` | string | Cached PR title |
+//! | `prUrl` | string | Cached PR URL |
+//! | `issueNumber` | integer | The linked GitHub issue |
+//! | `issueTitle` | string | Cached issue title |
+//! | `issueUrl` | string | Cached issue URL |
+//! | `issueBrief` | string | The generated implementation brief |
+//!
+//! Two rules make the namespace safe to share with an embedder: [`read_meta`]
+//! maps a missing key to `None`, and it ignores keys it does not know. So
+//! *adding* a key never breaks an older reader, and an embedder may keep its
+//! own keys in its own namespace without `wt` disturbing them. What is **not**
+//! safe is changing what an existing key means — that is what
+//! [`SCHEMA_VERSION`] exists to gate, and why [`ensure_schema_supported`]
+//! should run before reading or writing.
+//!
+//! [`clear_meta`] removes the whole `wt.<branch>` section, so it also removes
+//! keys this build has never heard of.
 
 use std::path::Path;
 

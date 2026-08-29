@@ -228,6 +228,160 @@ These are the things worth knowing up front; the rest is discoverable from
   branch that isn't also merged may hold unmerged commits, so it is skipped unless
   you pass `--force`. The current and default branches are never touched.
 
+## Using wt as a library
+
+Everything the CLI and TUI do sits on a worktree engine that is usable on its
+own. [karet](https://github.com/getkono/karet) drives it directly; the contract
+below is what it depends on.
+
+### Consuming it
+
+```toml
+[dependencies]
+kono-wt = { version = "1", default-features = false }
+```
+
+The package is `kono-wt`, but the library target is named `wt`, so the import
+path is `wt::…` either way (the same rename that leaves the installed binary
+called `wt`).
+
+`default-features = false` drops the application surface — argument parsing, the
+TUI, the PR compose flow, the agent integration — and with it `clap`,
+`clap_complete`, `ratatui`, `crossterm`, `nucleo-matcher`, `futures-util`,
+`tokio`, `sendit`, `color-eyre`, `eyre` and `tracing-subscriber`. What remains is
+the engine: the worktree service, config, git, branch naming, path templating and
+the typed error enum. Turn features back on individually (`cli`, `tui`, `pr`,
+`agent`) if you want part of the application surface too.
+
+### The worktree service
+
+`wt::worktree::Workspace` is the entry point. Discover a repository, then
+enumerate, create and remove worktrees:
+
+```rust
+use std::path::Path;
+
+use wt::git::RealGit;
+use wt::hooks::RealHookRunner;
+use wt::worktree::{CreateOptions, Workspace};
+use wt::{Env, install_signal_handlers};
+
+fn main() -> Result<(), wt::Error> {
+    install_signal_handlers();
+
+    let env = Env::from_real();
+    let ws = Workspace::discover(Path::new("."), &env, &RealGit)?;
+
+    // Detached worktrees have no branch, so `branch` is an `Option`.
+    for worktree in ws.list(&RealGit)? {
+        let branch = worktree.branch.as_deref().unwrap_or("(detached)");
+        println!("{branch}\t{}", worktree.path.display());
+    }
+
+    let created = ws.create(
+        &RealGit,
+        &RealHookRunner,
+        &CreateOptions {
+            branch: "feat/login".into(),
+            ..CreateOptions::default()
+        },
+    )?;
+    println!("{}", created.path.display());
+    Ok(())
+}
+```
+
+**The service never prompts and never writes to stdout or stderr.** That is the
+property that makes it embeddable: everything a user might need to see comes back
+as data on the outcome structs — hook results (`HookOutcome`), what the copy step
+did, how submodule initialization went, and whether a removal was forced past the
+dirty/unpushed guards. The caller decides how, or whether, to present any of it.
+Failures are typed variants of `wt::Error`, not messages.
+
+`Workspace::create` is idempotent: an existing worktree at the configured target
+comes back with `reused: true` rather than an error.
+
+### Where worktrees live
+
+Layout is repository configuration, not a convention:
+
+```rust
+use wt::template::{self, DEFAULT_TEMPLATE, TemplateVars};
+```
+
+`DEFAULT_TEMPLATE` is `{repo_parent}/{repo}.worktrees/{repo}-{branch_slug}`, but
+a repository's `.wt.toml` may set `path_template` to anything, using
+`{repo_parent}`, `{repo}`, `{repo_root}`, `{branch}`, `{branch_slug}` and
+`{home}`.
+
+**Resolve paths through this library — never reimplement the template.** Two
+tools that guess independently will disagree about where a repository's worktrees
+are, and the user is the one who finds out. `Workspace::create` already renders
+through `template::render` and reports the resulting path, which is the simplest
+way to stay consistent; `template::render` itself is there for resolving a path
+before creating anything.
+
+### The metadata contract
+
+`wt` records per-branch state in the repository's git config under
+`wt.<branch>.*`. Read it with `Workspace::read_meta` and write it with
+`Workspace::write_meta`:
+
+| Key | Meaning |
+| --- | --- |
+| `baseRef` | The ref the branch was created from |
+| `createdByWt` | `wt` created the branch, so `wt` may delete it |
+| `prNumber`, `prState`, `prTitle`, `prUrl` | The originating PR, cached so listing works offline |
+| `issueNumber`, `issueTitle`, `issueUrl` | The linked GitHub issue |
+| `issueBrief` | The implementation brief `wt issue` generated |
+
+Reads map a missing key to `None` and ignore unknown keys, so *adding* a key
+never breaks an older reader, and an embedder can keep its own state in its own
+config namespace without `wt` disturbing it. `MetaUpdate` writes only its `Some`
+fields, so refreshing one key cannot clobber the rest.
+
+Changing what an existing key *means* is the case that needs coordination, and
+`wt.schema` gates it. A repository with no `wt.schema` is version 1;
+`wt::worktree::SCHEMA_VERSION` is what this build understands. A repository
+stamped **higher** than that is refused with `Error::SchemaTooNew` rather than
+read with the wrong meanings — surface it as "upgrade the tool", not as a
+corrupt repository. `Workspace::discover` performs this check, and the mutating
+operations repeat it.
+
+### Locking
+
+Mutations are serialized across every `wt` process and embedder sharing a
+repository by an advisory lock — a `wt-mutation.lock` marker in the common git
+directory, waited on for up to 10 seconds before failing with
+`Error::LockUnavailable`.
+
+`create`, `remove`, `write_meta` and `clear_meta` take it internally, so **do not
+hold a lock across a call to them** — it is not reentrant, and doing so waits out
+the full timeout and then fails. Take one yourself, via `Workspace::lock`, only to
+make a longer read-check-write sequence over `wt.*` metadata atomic; drop it
+before calling back into the service.
+
+Hooks deliberately run *outside* the lock, so a `post_create` or `pre_remove`
+hook that re-enters `wt` cannot deadlock against the operation that invoked it.
+
+Call `wt::install_signal_handlers()` once, early. The lock is released on drop,
+which a terminating signal skips — stranding the marker so the next mutation
+waits out its whole timeout. The handlers clean it up and re-raise. (`SIGHUP` is
+not covered.)
+
+### Generation and work
+
+`wt` owns the short, structured generation steps it needs for its own proposals —
+the `wt pr open --ai` draft and the `wt issue` branch/brief — configured under
+`[agent.generation]`. It deliberately owns nothing else: running a coding agent on
+the work belongs to the embedder, which is why `[agent.work]` is rejected rather
+than accepted and ignored.
+
+`wt issue` reflects the same split. It creates the worktree, records the issue
+link and persists the brief, then stops. Handing the work to an agent is the
+embedder's step, and the persisted `issueBrief` means it need not pay to
+regenerate what `wt` already produced.
+
 ## Development
 
 ### Prerequisites

@@ -112,7 +112,7 @@ pub enum StatusKind {
 /// Identifies the target of a background job so its per-row spinner can be found
 /// and so a second action on the same target can be refused (issue #46 overhaul).
 /// Keyed by the row's stable identity (path or branch name) so it survives a
-/// re-sort/refresh, mirroring [`App::loaded_paths`].
+/// re-sort/refresh, mirroring how `App` keys its loaded paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobKey {
     /// A job targeting the worktree at this path (remove, sync, checkout, submodule

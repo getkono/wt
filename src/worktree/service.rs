@@ -469,6 +469,7 @@ pub struct CreatedWorktree {
 
 /// The outcome of [`Workspace::remove`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RemovedWorktree {
     /// Whether the local branch was deleted along with the worktree.
     pub branch_deleted: bool,

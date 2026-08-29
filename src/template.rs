@@ -4,6 +4,15 @@
 //! variables `{repo_parent}`, `{repo}`, `{repo_root}`, `{branch}`,
 //! `{branch_slug}`, and `{home}`. [`render`] substitutes them; [`ensure_outside_git`]
 //! rejects a rendered path that would land inside the `.git` directory.
+//!
+//! **Embedders must resolve worktree paths through this module.** The template
+//! is repository configuration ([`Config::path_template`](crate::config::Config)),
+//! so it varies per repository and a user may change it at any time.
+//! Hard-coding [`DEFAULT_TEMPLATE`]'s layout — or any other guess at where a
+//! worktree lives — makes two tools that share a repository disagree about
+//! where its worktrees are. [`Workspace::create`](crate::worktree::Workspace::create)
+//! already renders through here and reports the resulting path, which is the
+//! easiest way to stay consistent.
 
 use std::path::{Path, PathBuf};
 
