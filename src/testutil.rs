@@ -193,6 +193,9 @@ pub(crate) enum AgentBehavior {
     Erroring(String),
     /// Agent absent: `detect` returns `Ok(None)` and `run` returns `AgentUnavailable`.
     Unavailable,
+    /// Agent present but unresponsive: `run` returns `AgentTimeout`, as the real
+    /// client does once a run exceeds its deadline.
+    TimingOut,
 }
 
 /// A fake [`AgentClient`] for tests: returns a canned draft, simulates an
@@ -225,6 +228,11 @@ impl FakeAgent {
     /// An absent agent (`detect` → `None`, `run` → `AgentUnavailable`).
     pub(crate) fn unavailable() -> Self {
         FakeAgent::new(AgentBehavior::Unavailable)
+    }
+
+    /// A present but unresponsive agent (`run` → `AgentTimeout`).
+    pub(crate) fn timing_out() -> Self {
+        FakeAgent::new(AgentBehavior::TimingOut)
     }
 
     /// The [`AgentOptions`] passed to the most recent `run`, if any.
@@ -270,6 +278,10 @@ impl AgentClient for FakeAgent {
                 raw: serde_json::Value::Null,
             }),
             AgentBehavior::Unavailable => Err(Error::AgentUnavailable("claude unavailable".into())),
+            AgentBehavior::TimingOut => Err(Error::AgentTimeout {
+                binary: kind.as_str().to_string(),
+                seconds: 120,
+            }),
         }
     }
 }

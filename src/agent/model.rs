@@ -6,6 +6,8 @@
 //! drive the config layer, the CLI flags, and the TUI's live cycle keys without
 //! any process or I/O.
 
+use std::time::Duration;
+
 use serde::Serialize;
 
 /// A selectable model tier for a code agent. The variants currently encode the
@@ -159,13 +161,20 @@ impl Effort {
     }
 }
 
-/// The model and effort selected for a single agent run.
+/// The model, effort, and deadline selected for a single agent run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AgentOptions {
     /// The model tier to drive.
     pub model: AgentModel,
     /// How much effort to spend.
     pub effort: Effort,
+    /// How long to wait before killing the agent. `None` waits indefinitely,
+    /// which is the historical behaviour and remains the default.
+    ///
+    /// Deliberately a [`Duration`] rather than anything owned: `AgentOptions` is
+    /// `Copy`, and the compose form, the TUI and `pr_open`'s tests all rely on
+    /// that.
+    pub timeout: Option<Duration>,
 }
 
 #[cfg(test)]

@@ -11,8 +11,10 @@ pub mod model;
 pub mod spec;
 pub mod types;
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 pub use model::{AgentModel, AgentOptions, Effort};
@@ -70,7 +72,7 @@ impl AgentClient for RealAgent {
 /// [`RealAgent::detect`] so tests can drive every branch with a stand-in
 /// binary. A missing binary maps to `Ok(None)`; other failures propagate.
 fn detect_with(binary: &str, kind: AgentKind, spec: &AgentSpec) -> Result<Option<DetectedAgent>> {
-    match run_agent(binary, None, &spec::version_argv(spec)) {
+    match run_agent(binary, None, &spec::version_argv(spec), None) {
         Ok(stdout) => Ok(Some(DetectedAgent {
             kind,
             binary: binary.to_string(),
@@ -93,38 +95,114 @@ fn run_with(
 ) -> Result<AgentRun> {
     let prompt = spec::apply_effort(opts.effort, prompt);
     let argv = spec::prompt_argv(spec, &prompt, opts.model);
-    let stdout = run_agent(binary, Some(dir), &argv)?;
+    let stdout = run_agent(binary, Some(dir), &argv, opts.timeout)?;
     spec::parse_result(kind, spec.result_format, &stdout)
 }
 
 /// Runs an agent `binary` (optionally in `dir`), mapping a missing binary to
 /// [`Error::AgentUnavailable`] and a non-zero exit to [`Error::Subprocess`].
 /// Mirrors `gh`'s `run_gh` helper.
-fn run_agent(binary: &str, dir: Option<&Path>, args: &[String]) -> Result<String> {
+///
+/// With `timeout` set, the child is killed and [`Error::AgentTimeout`] returned
+/// once the deadline passes. `None` waits indefinitely — the historical
+/// behaviour, kept for version detection and for callers that pass no deadline.
+fn run_agent(
+    binary: &str,
+    dir: Option<&Path>,
+    args: &[String],
+    timeout: Option<Duration>,
+) -> Result<String> {
     let mut cmd = Command::new(binary);
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
     cmd.args(args);
-    let output = match cmd.output() {
-        Ok(output) => output,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::AgentUnavailable(format!(
-                "{binary} is not installed or not on PATH"
-            )));
-        }
-        Err(e) => {
-            return Err(Error::AgentUnavailable(format!(
-                "failed to run {binary}: {e}"
-            )));
-        }
+
+    let Some(limit) = timeout else {
+        return match cmd.output() {
+            Ok(output) => finish(binary, output.status, &output.stdout, &output.stderr),
+            Err(e) => Err(spawn_error(binary, &e)),
+        };
     };
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+
+    // `Command::output()` blocks until the pipes close, so it cannot be given a
+    // deadline. Read the pipes on their own threads and keep the `Child` here,
+    // so this thread still owns the handle it needs to kill.
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return Err(spawn_error(binary, &e)),
+    };
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    // Draining both pipes concurrently matters: a child that fills the stderr
+    // pipe buffer blocks forever if only stdout is being read.
+    let out_reader = std::thread::spawn(move || read_pipe(out_pipe.as_mut()));
+    let err_reader = std::thread::spawn(move || read_pipe(err_pipe.as_mut()));
+
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(spawn_error(binary, &e)),
+        }
+        if Instant::now() >= deadline {
+            // Killing closes the child's pipes, which is what lets the reader
+            // threads below finish rather than block forever.
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+
+    // A panicking reader yields no output rather than poisoning the run.
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+
+    match status {
+        Some(status) => finish(binary, status, &stdout, &stderr),
+        None => Err(Error::AgentTimeout {
+            binary: binary.to_string(),
+            // Sub-second deadlines still report `1s`; the message is for humans,
+            // and "did not respond within 0s" reads as a bug.
+            seconds: limit.as_secs().max(1),
+        }),
+    }
+}
+
+/// How often the deadline loop checks whether the child has exited. Short
+/// enough that a fast agent is not held up perceptibly, long enough not to spin.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Drains a child pipe to end, yielding empty bytes if it is absent or fails.
+fn read_pipe(pipe: Option<&mut impl Read>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buf);
+    }
+    buf
+}
+
+/// Maps a spawn failure to [`Error::AgentUnavailable`], distinguishing a missing
+/// binary from any other launch failure.
+fn spawn_error(binary: &str, e: &std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Error::AgentUnavailable(format!("{binary} is not installed or not on PATH"))
+    } else {
+        Error::AgentUnavailable(format!("failed to run {binary}: {e}"))
+    }
+}
+
+/// Maps a finished process to its stdout, or to [`Error::Subprocess`].
+fn finish(binary: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> Result<String> {
+    if status.success() {
+        return Ok(String::from_utf8_lossy(stdout).into_owned());
     }
     Err(Error::Subprocess {
         program: binary.to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: String::from_utf8_lossy(stderr).trim().to_string(),
     })
 }
 
@@ -205,7 +283,7 @@ mod tests {
 
     #[test]
     fn run_agent_maps_missing_binary_to_unavailable() {
-        let err = run_agent(MISSING, None, &["--version".to_string()]).unwrap_err();
+        let err = run_agent(MISSING, None, &["--version".to_string()], None).unwrap_err();
         assert!(matches!(err, Error::AgentUnavailable(_)));
     }
 
@@ -254,16 +332,83 @@ mod tests {
 
         #[test]
         fn run_agent_returns_stdout_on_success() {
-            let out =
-                run_agent("sh", None, &["-c".to_string(), "printf hello".to_string()]).unwrap();
+            let out = run_agent(
+                "sh",
+                None,
+                &["-c".to_string(), "printf hello".to_string()],
+                None,
+            )
+            .unwrap();
             assert_eq!(out, "hello");
         }
 
         #[test]
         fn run_agent_maps_nonzero_exit_to_subprocess() {
-            let err = run_agent("sh", None, &["-c".to_string(), "exit 3".to_string()]).unwrap_err();
+            let err =
+                run_agent("sh", None, &["-c".to_string(), "exit 3".to_string()], None).unwrap_err();
             match err {
                 Error::Subprocess { program, .. } => assert_eq!(program, "sh"),
+                other => panic!("expected subprocess error, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn run_agent_kills_a_child_that_outlives_its_deadline() {
+            // The real defect this guards: `Command::output()` waits forever, so
+            // an agent that hangs used to hang `wt`. Sleeping far longer than the
+            // deadline proves the deadline — not the sleep — is what ends the run.
+            let started = Instant::now();
+            let err = run_agent(
+                "sh",
+                None,
+                &["-c".to_string(), "sleep 30".to_string()],
+                Some(Duration::from_millis(100)),
+            )
+            .unwrap_err();
+            let elapsed = started.elapsed();
+            match err {
+                Error::AgentTimeout { binary, seconds } => {
+                    assert_eq!(binary, "sh");
+                    // Sub-second deadlines still report a whole second.
+                    assert_eq!(seconds, 1);
+                }
+                other => panic!("expected a timeout, got {other:?}"),
+            }
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "returned after {elapsed:?}; the child was not killed"
+            );
+        }
+
+        #[test]
+        fn a_deadline_does_not_disturb_a_process_that_finishes() {
+            // The deadline path reads the pipes on separate threads, so prove it
+            // still returns stdout intact rather than only working on timeout.
+            let out = run_agent(
+                "sh",
+                None,
+                &["-c".to_string(), "printf hello".to_string()],
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap();
+            assert_eq!(out, "hello");
+        }
+
+        #[test]
+        fn a_deadline_still_maps_a_nonzero_exit_to_subprocess() {
+            let err = run_agent(
+                "sh",
+                None,
+                &["-c".to_string(), "printf oops >&2; exit 3".to_string()],
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap_err();
+            match err {
+                Error::Subprocess { program, stderr } => {
+                    assert_eq!(program, "sh");
+                    // Proves stderr is drained too, not just stdout.
+                    assert_eq!(stderr, "oops");
+                }
                 other => panic!("expected subprocess error, got {other:?}"),
             }
         }

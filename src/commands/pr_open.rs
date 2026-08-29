@@ -327,7 +327,13 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
         })?,
         None => config.agent_generation.effort,
     };
-    Ok(AgentOptions { model, effort })
+    Ok(AgentOptions {
+        model,
+        effort,
+        // The PR auto-fill has always waited indefinitely; `wt issue` is what
+        // introduces a deadline, and only for its own generation step.
+        timeout: None,
+    })
 }
 
 /// Runs the code agent (`claude`) to draft a PR `(title, body)` from `ctx` with
@@ -721,6 +727,7 @@ mod tests {
         let opts = AgentOptions {
             model: AgentModel::Opus,
             effort: Effort::High,
+            timeout: None,
         };
         draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path(), &opts).unwrap();
         assert_eq!(agent.last_opts(), Some(opts));
