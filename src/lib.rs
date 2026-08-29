@@ -33,8 +33,10 @@
 //!   [`worktree::SCHEMA_VERSION`] and the version gate to check before
 //!   mutating.
 //! - [`worktree::RepoLock`] — the advisory lock that serializes mutations
-//!   across every `wt` and embedder in one repository. Call
-//!   [`install_signal_handlers`] once at startup so a signal cannot strand it.
+//!   across every `wt` and embedder in one repository. Taking it re-validates
+//!   the metadata schema under the lock, so an acquisition is also the version
+//!   gate. Call [`install_signal_handlers`] once at startup so a signal cannot
+//!   strand it.
 //!
 //! `wt` owns only the short, structured generation steps it needs for its own
 //! branch and PR proposals (`[agent.generation]`). Running a coding agent on

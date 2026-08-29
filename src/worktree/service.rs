@@ -40,6 +40,10 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 /// re-enters `wt` cannot deadlock) — do not hold a `RepoLock` while calling
 /// them. Take one directly to make your own read-check-write sequence over
 /// `wt.*` metadata atomic against concurrent writers.
+///
+/// Acquiring the lock also validates the repository's metadata schema, so
+/// every acquisition fails with [`Error::SchemaTooNew`] rather than hand back
+/// a lock over a repository this build cannot interpret (issue #106).
 pub struct RepoLock {
     _marker: gix_lock::Marker,
 }
@@ -56,8 +60,27 @@ fn lock_dir(root: &Path) -> PathBuf {
     }
 }
 
+/// Re-reads the repository's metadata schema and refuses a version this build
+/// cannot interpret.
+///
+/// The read goes through a *freshly opened* repository deliberately: `gix`
+/// snapshots the git config when a repository is opened, so a handle obtained
+/// before the lock cannot see a `wt.schema` bump that landed while the caller
+/// waited for it (issue #106).
+fn ensure_schema_supported_now(root: &Path) -> Result<()> {
+    wtconfig::ensure_schema_supported(Repo::discover(root)?.gix())
+}
+
 /// Acquires the repo-level advisory mutation lock, waiting (with backoff) up
 /// to `timeout` for a concurrent holder to finish.
+///
+/// The metadata schema is validated *after* the lock is held (issue #106), so
+/// the gate covers the window it exists to protect: a concurrent `wt.schema`
+/// bump either lands before the check and is refused, or is excluded until the
+/// mutation finishes. Every mutating path takes the lock, so folding the check
+/// in here is what makes "no mutation runs against an unsupported schema" hold
+/// by construction rather than by each call site remembering to ask. A refusal
+/// drops the lock on the way out, leaving nothing held.
 pub(crate) fn acquire_repo_lock(root: &Path, timeout: Duration) -> Result<RepoLock> {
     let resource = lock_dir(root).join("wt-mutation");
     let marker = gix_lock::Marker::acquire_to_hold_resource(
@@ -69,7 +92,9 @@ pub(crate) fn acquire_repo_lock(root: &Path, timeout: Duration) -> Result<RepoLo
         path: format!("{}.lock", resource.display()),
         reason: e.to_string(),
     })?;
-    Ok(RepoLock { _marker: marker })
+    let lock = RepoLock { _marker: marker };
+    ensure_schema_supported_now(root)?;
+    Ok(lock)
 }
 
 /// Acquires the repo-level advisory mutation lock with the standard timeout.
@@ -137,6 +162,11 @@ impl Workspace {
 
     /// Acquires the repository's advisory mutation lock (issue #99). See
     /// [`RepoLock`] for the holding rules.
+    ///
+    /// Fails with [`Error::SchemaTooNew`] when the repository is stamped with a
+    /// metadata schema this build cannot interpret, re-read under the lock
+    /// (issue #106) — so the version an embedder validated at discovery is
+    /// still the version it holds the lock over.
     pub fn lock(&self) -> Result<RepoLock> {
         acquire_repo_lock(&self.primary_root, LOCK_TIMEOUT)
     }
@@ -184,9 +214,10 @@ impl Workspace {
     /// this while already holding a [`RepoLock`]. To make a read-check-write
     /// sequence atomic, take [`Workspace::lock`] and drive the [`wtconfig`]
     /// setters directly instead.
+    ///
+    /// The schema gate is the lock's (issue #106): nothing here runs ahead of
+    /// it, so there is no separate check to keep in step.
     pub fn write_meta(&self, git: &dyn GitCli, branch: &str, update: &MetaUpdate) -> Result<()> {
-        let repo = self.fresh_repo()?;
-        wtconfig::ensure_schema_supported(repo.gix())?;
         let _lock = self.lock()?;
         apply_meta(git, &self.primary_root, branch, update)
     }
@@ -194,8 +225,6 @@ impl Workspace {
     /// Removes every `wt.<branch>.*` key, under the advisory repository lock.
     /// A branch with no recorded metadata is not an error.
     pub fn clear_meta(&self, git: &dyn GitCli, branch: &str) -> Result<()> {
-        let repo = self.fresh_repo()?;
-        wtconfig::ensure_schema_supported(repo.gix())?;
         let _lock = self.lock()?;
         wtconfig::clear_meta(git, &self.primary_root, branch)
     }
@@ -553,6 +582,10 @@ pub(crate) fn create_in(
     hooks: &dyn HookRunner,
     options: &CreateOptions,
 ) -> Result<CreatedWorktree> {
+    // Refuse an unsupported schema before the enumeration and base resolution
+    // below, so a stamped repository fails fast. This is only the fast path:
+    // the authoritative gate runs under the lock (issue #106), because a bump
+    // can still land between here and the acquisition.
     wtconfig::ensure_schema_supported(ws.repo.gix())?;
     let branch = options.branch.clone();
     let worktrees = rows::enumerate_worktrees(ws.repo, git)?;
@@ -834,6 +867,11 @@ pub(crate) fn remove_in(
     worktree: &Worktree,
     options: &RemoveOptions,
 ) -> Result<RemovedWorktree> {
+    // This one is load-bearing outside the lock: the `wt.*` metadata read just
+    // below, the guards, and the `pre_remove` hook all run before the lock is
+    // taken (a hook that re-enters `wt` must not deadlock, issue #99), and
+    // reading `wt.*` under an unsupported schema could misinterpret it. The
+    // mutation itself is gated again under the lock (issue #106).
     wtconfig::ensure_schema_supported(ws.repo.gix())?;
     if worktree.is_main {
         return Err(Error::operation("refusing to remove the primary worktree"));
@@ -2002,6 +2040,91 @@ mod tests {
         // ...and succeeds once the holder is dropped.
         drop(held);
         acquire_repo_lock(ws.root(), Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
+    fn a_schema_refusal_does_not_strand_the_lock() {
+        // The schema gate runs with the lock held (issue #106), so its refusal
+        // has to give the lock back on the way out — otherwise one stamped
+        // repository would wedge every later mutation for the full timeout.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["config", "wt.schema", "2"]);
+        let err = acquire_repo_lock(ws.root(), Duration::from_millis(50))
+            .err()
+            .expect("a future schema must refuse the acquisition");
+        assert!(
+            matches!(err, Error::SchemaTooNew { found: 2, .. }),
+            "{err:?}"
+        );
+        assert!(!ws.root().join(".git/wt-mutation.lock").exists());
+
+        repo.git(&["config", "--unset", "wt.schema"]);
+        acquire_repo_lock(ws.root(), Duration::from_millis(50)).unwrap();
+    }
+
+    #[test]
+    fn the_lock_gate_reads_a_bare_repository_too() {
+        // The gate re-opens the repository from the lock root (issue #106), and
+        // for a bare primary that root *is* the git directory rather than a
+        // worktree containing one — so acquisition must not depend on a
+        // workdir. `wt` supports bare primaries, so this is a real shape.
+        let repo = TestRepo::init_bare();
+        acquire_repo_lock(repo.root(), Duration::from_millis(50)).unwrap();
+
+        repo.git(&["config", "wt.schema", "2"]);
+        let err = acquire_repo_lock(repo.root(), Duration::from_millis(50))
+            .err()
+            .expect("a bare repository is gated like any other");
+        assert!(
+            matches!(err, Error::SchemaTooNew { found: 2, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_schema_bump_landing_during_the_lock_wait_is_refused() {
+        // The window issue #106 is about: a writer that passed the schema gate
+        // and then blocked on the lock must not mutate against the version it
+        // finally holds the lock over. Ordering is forced, not slept on — the
+        // writer signals once it has a Workspace, and this thread holds the
+        // lock across the bump, so the writer can only reach the mutation
+        // after `wt.schema` is already 2.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        repo.git(&["branch", "stamped"]);
+        let held = ws.lock().unwrap();
+
+        let (discovered, wait) = std::sync::mpsc::channel();
+        let root = repo.root().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let ws = Workspace::discover(&root, &env(), &RealGit)?;
+            discovered.send(()).expect("the test thread outlives this");
+            ws.write_meta(
+                &RealGit,
+                "stamped",
+                &MetaUpdate {
+                    pr_number: Some(1),
+                    ..MetaUpdate::default()
+                },
+            )
+        });
+
+        wait.recv().expect("the writer discovers before it blocks");
+        repo.git(&["config", "wt.schema", "2"]);
+        drop(held);
+
+        let err = writer
+            .join()
+            .expect("the writer must not panic")
+            .expect_err("the bumped schema must refuse the blocked write");
+        assert!(
+            matches!(err, Error::SchemaTooNew { found: 2, .. }),
+            "{err:?}"
+        );
+        // The refusal is total: nothing was written on the way to it.
+        repo.git(&["config", "--unset", "wt.schema"]);
+        assert_eq!(ws.read_meta("stamped").unwrap(), WtMeta::default());
     }
 
     #[test]
