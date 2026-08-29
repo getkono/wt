@@ -7,6 +7,7 @@ pub mod completions;
 pub mod config_cmd;
 pub mod drop;
 pub mod init;
+pub mod issue;
 pub mod list;
 pub mod new;
 pub mod path;
@@ -32,7 +33,7 @@ use crate::git::discover::Repo;
 use crate::hooks::{HookContext, HookRunner};
 use crate::model::Worktree;
 use crate::query::{self, Resolved};
-use crate::worktree::{Workspace, WorkspaceParts, build_worktrees};
+use crate::worktree::{CreatedWorktree, HookOutcome, Workspace, WorkspaceParts, build_worktrees};
 
 // Path/template helpers shared with the service layer, re-exported so command
 // modules keep their historical import paths.
@@ -394,6 +395,29 @@ pub(crate) fn finish_worktree(
     }
     cx.err.line(&format!("{} {}", nav.note, target.display()))?;
     crate::hooks::run_start(runner, command, hook_ctx)
+}
+
+/// Reports the non-fatal outcomes of a completed creation: the copy step and
+/// the `post_create` hook.
+///
+/// The hook already ran inside the service, where a failure is a warning rather
+/// than a rollback (spec §8). Shared by `wt new` and `wt issue` so both report
+/// the same way.
+pub(crate) fn report_created(cx: &mut Cx, created: &CreatedWorktree) -> Result<()> {
+    log_copy_outcome(cx, &created.copy);
+    match &created.post_create {
+        HookOutcome::ExitedNonZero(code) => {
+            cx.err.line(&format!(
+                "warning: post_create hook exited with status {code}"
+            ))?;
+        }
+        HookOutcome::Failed(error) => {
+            cx.err
+                .line(&format!("warning: post_create hook failed: {error}"))?;
+        }
+        HookOutcome::Skipped | HookOutcome::Succeeded => {}
+    }
+    Ok(())
 }
 
 /// Writes `target` to the file named by `$WT_CD_FILE` so the shell wrapper can

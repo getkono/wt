@@ -505,6 +505,20 @@ pub(crate) fn resolve_base(repo: &Repo, config: &Config, explicit: Option<&str>)
     ("HEAD".to_string(), true)
 }
 
+/// The path `create_in` would materialize `branch` at, without creating
+/// anything.
+///
+/// Exists so a caller that previews the target before confirming (`wt issue`)
+/// derives it from the same slug and template logic `create_in` uses, rather
+/// than reimplementing it and drifting.
+#[cfg(feature = "cli")]
+pub(crate) fn preview_target(ws: &WorkspaceParts<'_>, branch: &str) -> Result<std::path::PathBuf> {
+    let base_commit = resolve_hex(ws.repo.gix(), &branch_ref(branch)).unwrap_or_default();
+    let short_hash = base_commit.get(..7).unwrap_or(&base_commit).to_string();
+    let slug = slugify_with_fallback(branch, &short_hash);
+    render_target(ws.config, ws.root, branch, &slug, ws.env)
+}
+
 /// Creates (or reuses) a worktree per `options`; see [`Workspace::create`].
 pub(crate) fn create_in(
     ws: &WorkspaceParts<'_>,

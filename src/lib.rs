@@ -26,6 +26,9 @@ pub mod keys;
 pub mod model;
 pub mod naming;
 pub mod output;
+/// Human-facing progress for slow foreground operations (CLI only).
+#[cfg(feature = "cli")]
+pub(crate) mod progress;
 pub mod query;
 pub mod slug;
 pub mod template;

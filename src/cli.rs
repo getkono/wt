@@ -85,6 +85,8 @@ pub(crate) enum Command {
     /// Check out a GitHub PR into its own worktree.
     #[command(args_conflicts_with_subcommands = true)]
     Pr(PrArgs),
+    /// Create a worktree for a GitHub issue, with a generated branch and brief.
+    Issue(IssueArgs),
     /// Detailed status for one or all worktrees.
     Status(StatusArgs),
     /// Print the absolute path of a matching worktree.
@@ -247,6 +249,57 @@ fn submodule_override(init: bool, no_init: bool) -> Option<bool> {
         (true, _) => Some(true),
         (_, true) => Some(false),
         _ => None,
+    }
+}
+
+/// Arguments for `wt issue`.
+///
+/// `wt` proposes a branch and brief and creates the worktree; it does not run a
+/// coding agent, so there are no agent-execution flags here (issue #100). The
+/// `--model`/`--effort` pair tunes only the short generation step, and matches
+/// `wt pr open`'s flags because both drive the same `[agent.generation]`
+/// profile.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct IssueArgs {
+    /// GitHub issue number or URL.
+    pub(crate) target: String,
+    /// Use this branch instead of the generated one.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) branch: Option<String>,
+    /// Base ref for a new branch (default: `origin/HEAD`, then the repo default).
+    #[arg(long, value_name = "REF")]
+    pub(crate) from: Option<String>,
+    /// Use this brief instead of the generated one.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) brief: Option<String>,
+    /// Model for generating the branch and brief (overrides `agent.generation.model`).
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+    /// Effort for generating the branch and brief (overrides `agent.generation.effort`).
+    #[arg(long, value_name = "LEVEL")]
+    pub(crate) effort: Option<String>,
+    /// Do not switch into the new worktree.
+    #[arg(long = "no-switch")]
+    pub(crate) no_switch: bool,
+    /// Skip the post_create hook.
+    #[arg(long = "no-hooks")]
+    pub(crate) no_hooks: bool,
+    /// Worktree to copy configured files from (default: the current one).
+    #[arg(long = "copy-from", value_name = "QUERY")]
+    pub(crate) copy_from: Option<String>,
+    /// Initialize git submodules after creating the worktree.
+    #[arg(long = "init-submodules", conflicts_with = "no_init_submodules")]
+    pub(crate) init_submodules: bool,
+    /// Do not initialize git submodules.
+    #[arg(long = "no-init-submodules")]
+    pub(crate) no_init_submodules: bool,
+}
+
+impl IssueArgs {
+    /// Resolves the submodule-init flags to an override for the config policy
+    /// (see [`NewArgs::submodule_override`]).
+    pub(crate) fn submodule_override(&self) -> Option<bool> {
+        submodule_override(self.init_submodules, self.no_init_submodules)
     }
 }
 
@@ -505,6 +558,7 @@ impl Cli {
             Some(Command::Drop(_)) => "drop",
             Some(Command::Prune(_)) => "prune",
             Some(Command::Pr(_)) => "pr",
+            Some(Command::Issue(_)) => "issue",
             Some(Command::Status(_)) => "status",
             Some(Command::Path(_)) => "path",
             Some(Command::Root) => "root",
@@ -607,6 +661,9 @@ fn route(cli: Cli, cx: &mut Cx) -> Result<u8> {
         Some(Command::Prune(args)) => crate::commands::prune::run(cx, &args, json),
         Some(Command::Pr(args)) => {
             crate::commands::pr::run(cx, &crate::hooks::RealHookRunner, &args, json)
+        }
+        Some(Command::Issue(args)) => {
+            crate::commands::issue::run(cx, &crate::hooks::RealHookRunner, &args)
         }
         Some(Command::Status(args)) => crate::commands::status_cmd::run(cx, &args, json),
         Some(Command::Path(args)) => crate::commands::path::run(cx, &args),

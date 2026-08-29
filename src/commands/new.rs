@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::git::discover::Repo;
 use crate::git::{branch_ref, resolve_hex};
 use crate::hooks::{HookContext, HookRunner};
-use crate::worktree::{CreateOptions, HookOutcome, create_in, resolve_base};
+use crate::worktree::{CreateOptions, create_in, resolve_base};
 
 /// Creates a linked worktree for `branch`, prompting first when the base it would
 /// fork from is behind its origin counterpart (issue #56): the user can update the
@@ -95,21 +95,7 @@ pub(crate) fn run_core(
     let env = cx.env.clone();
     let created = create_in(&session.parts(&env), git, hooks, &options)?;
 
-    crate::commands::log_copy_outcome(cx, &created.copy);
-    // The post-create hook already ran in the service; a failure is a warning,
-    // not a rollback (§8).
-    match &created.post_create {
-        HookOutcome::ExitedNonZero(code) => {
-            cx.err.line(&format!(
-                "warning: post_create hook exited with status {code}"
-            ))?;
-        }
-        HookOutcome::Failed(error) => {
-            cx.err
-                .line(&format!("warning: post_create hook failed: {error}"))?;
-        }
-        HookOutcome::Skipped | HookOutcome::Succeeded => {}
-    }
+    crate::commands::report_created(cx, &created)?;
 
     // Initialize submodules per the policy/flag, prompting (default yes) at an
     // interactive terminal when the policy is left at its default (issue #50).

@@ -27,10 +27,12 @@ pub(crate) use refs::{
     validate_branch_name,
 };
 // Only the command handlers reach for these; the core library does not.
+// `default_base_ref` moved here from the TUI group when `wt issue` (a CLI
+// command) started resolving its base from `origin/HEAD`.
 #[cfg(feature = "cli")]
-pub(crate) use refs::{all_branches, current_branch, remote_branches};
-// Only the TUI reaches for these.
+pub(crate) use refs::{all_branches, current_branch, default_base_ref, remote_branches};
+// Only the TUI reaches for this.
 #[cfg(feature = "tui")]
-pub(crate) use refs::{default_base_ref, origin_head_branch};
+pub(crate) use refs::origin_head_branch;
 pub(crate) use status::status_of;
 pub(crate) use worktrees::enumerate;
