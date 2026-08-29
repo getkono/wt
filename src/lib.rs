@@ -8,6 +8,39 @@
 //! and a [`Cx`] (injected I/O, environment, and working directory) and returns
 //! the process exit code. Keeping the side-effecting handles in `Cx` makes the
 //! whole dispatch path testable without touching the real terminal.
+//!
+//! # Embedding `wt`
+//!
+//! That entry point is the *application*. Embedders skip it and drive the
+//! worktree engine directly. The crate is published as `kono-wt`, but the
+//! library target is named `wt`, so the API is imported as `wt::…` either way:
+//!
+//! ```toml
+//! kono-wt = { version = "1", default-features = false }
+//! ```
+//!
+//! Turning the default features off drops the application surface — argument
+//! parsing, the TUI, the PR compose flow — and with it `clap`, `ratatui`,
+//! `crossterm` and `tokio`. What remains is the engine:
+//!
+//! - [`worktree::Workspace`] — discover a repository, then enumerate, create
+//!   and remove worktrees and read or write their metadata. Nothing on it
+//!   prompts, reads stdin, or writes to stdout; outcomes come back as data.
+//! - [`template`] — where worktrees live. The layout is repository
+//!   configuration, so resolve paths through this module; reimplementing the
+//!   template makes the two products disagree about where worktrees are.
+//! - [`config::wtconfig`] — the `wt.<branch>.*` metadata contract, plus
+//!   [`worktree::SCHEMA_VERSION`] and the version gate to check before
+//!   mutating.
+//! - [`worktree::RepoLock`] — the advisory lock that serializes mutations
+//!   across every `wt` and embedder in one repository. Call
+//!   [`install_signal_handlers`] once at startup so a signal cannot strand it.
+//!
+//! `wt` owns only the short, structured generation steps it needs for its own
+//! branch and PR proposals (`[agent.generation]`). Running a coding agent on
+//! the work itself belongs to the embedder.
+//!
+//! See the "Using wt as a library" section of the README for a worked example.
 
 pub mod agent;
 #[cfg(feature = "cli")]
