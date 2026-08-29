@@ -133,7 +133,7 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &IssueArgs) -> Resu
     }
 
     let env = cx.env.clone();
-    let preview = preview_target(&session.parts(&env), &plan.branch)?;
+    let preview = preview_target(&session.parts(&env), &plan.branch, base.as_deref())?;
     let prompt = format!(
         "Issue #{}: {}\nBranch:  {}\nBase:    {}\nWorktree: {}\nBrief:   {}\n\
          Create this issue worktree? [y/N] ",
@@ -517,7 +517,7 @@ fn prompt_base(cx: &mut Cx, current: Option<&str>, branches: &[String]) -> Resul
 /// The worktree path for `branch`, for tests that assert what was created.
 #[cfg(test)]
 fn target_of(session: &Session, env: &crate::cx::Env, branch: &str) -> std::path::PathBuf {
-    preview_target(&session.parts(env), branch).unwrap_or_default()
+    preview_target(&session.parts(env), branch, None).unwrap_or_default()
 }
 
 #[cfg(test)]
