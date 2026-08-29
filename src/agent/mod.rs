@@ -157,18 +157,29 @@ fn run_agent(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    // A panicking reader yields no output rather than poisoning the run.
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-
     match status {
-        Some(status) => finish(binary, status, &stdout, &stderr),
-        None => Err(Error::AgentTimeout {
-            binary: binary.to_string(),
-            // Sub-second deadlines still report `1s`; the message is for humans,
-            // and "did not respond within 0s" reads as a bug.
-            seconds: limit.as_secs().max(1),
-        }),
+        Some(status) => {
+            // A panicking reader yields no output rather than poisoning the run.
+            let stdout = out_reader.join().unwrap_or_default();
+            let stderr = err_reader.join().unwrap_or_default();
+            finish(binary, status, &stdout, &stderr)
+        }
+        None => {
+            // Deliberately *not* joined. Killing the child does not close the
+            // pipes if it left a grandchild holding them — an agent CLI that is
+            // a wrapper script is exactly that shape — so a reader would block
+            // for as long as the grandchild lives, which is precisely what the
+            // deadline exists to prevent. The output is unwanted anyway, so the
+            // readers are detached; they end on their own when the pipes close.
+            drop(out_reader);
+            drop(err_reader);
+            Err(Error::AgentTimeout {
+                binary: binary.to_string(),
+                // Sub-second deadlines still report `1s`; the message is for
+                // humans, and "did not respond within 0s" reads as a bug.
+                seconds: limit.as_secs().max(1),
+            })
+        }
     }
 }
 
@@ -354,14 +365,24 @@ mod tests {
 
         #[test]
         fn run_agent_kills_a_child_that_outlives_its_deadline() {
-            // The real defect this guards: `Command::output()` waits forever, so
-            // an agent that hangs used to hang `wt`. Sleeping far longer than the
-            // deadline proves the deadline — not the sleep — is what ends the run.
+            // Two defects in one test.
+            //
+            // First: `Command::output()` waits forever, so an agent that hangs
+            // used to hang `wt`. Sleeping far longer than the deadline proves the
+            // deadline — not the sleep — is what ends the run.
+            //
+            // Second, and the subtler one: `sleep 30 & wait` makes `sh` fork a
+            // *grandchild* that inherits the stdout/stderr pipes. Killing the
+            // child does not close them, so joining the reader threads blocks
+            // until the grandchild dies — reintroducing the full 30s wait behind
+            // a timeout that appears to work. An agent CLI that is a wrapper
+            // script has exactly this shape, so the plain `sleep 30` this test
+            // first used was too weak: it passes on a shell that `exec`s.
             let started = Instant::now();
             let err = run_agent(
                 "sh",
                 None,
-                &["-c".to_string(), "sleep 30".to_string()],
+                &["-c".to_string(), "sleep 30 & wait".to_string()],
                 Some(Duration::from_millis(100)),
             )
             .unwrap_err();
