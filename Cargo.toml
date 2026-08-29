@@ -76,8 +76,11 @@ tui = [
 # the current source layout; the epic's agent rework (#100) is what will let
 # them separate.
 pr = ["tui", "dep:sendit"]
-# The code-agent integration (PR auto-fill). Currently gates no external
-# dependency; it will gate `agent-text` once the issue flow lands.
+# The code-agent integration (the PR auto-fill and the `wt issue` branch/brief
+# proposal). Currently gates no external dependency; it will gate `agent-text`
+# if and when the multi-provider agent migration lands. Note the issue flow is
+# deliberately *not* gated on it: `wt issue` must work with no agent at all
+# (issue #98), so it falls back rather than disappearing from the CLI.
 agent = ["cli"]
 
 [dependencies]
