@@ -1,7 +1,7 @@
 //! The worktree operation layer (issue #95).
 //!
-//! [`service`] is the public, stateless surface: a [`Workspace`] discovered
-//! from a directory can enumerate, create, and remove worktrees and read their
+//! [`Workspace`] is the public, stateless surface: discovered from a
+//! directory, it enumerates, creates, and removes worktrees and reads their
 //! `wt.*` metadata with **no prompting, no terminal, and no
 //! [`Cx`](crate::cx::Cx)** — outcomes and warnings are returned as data and the
 //! caller decides how (or whether) to present them. The `wt` CLI and TUI are
@@ -9,9 +9,27 @@
 //! directly and must resolve worktree paths through it rather than
 //! reimplementing the `.wt.toml` layout rules.
 //!
-//! [`rows`] is the crate-internal row assembly on top: enriched listing rows,
+//! `rows` is the crate-internal row assembly on top: enriched listing rows,
 //! worktree-less branch rows (issue #47), sorting, and the remove/prune guard
 //! evaluation shared by the CLI and TUI.
+//!
+//! Every type reachable through the public API is re-exported here. A doctest
+//! compiles as its own crate, so this one fails exactly when an embedder could
+//! not name what [`CreatedWorktree`] and [`RemovedWorktree`] hand back — which
+//! a crate-internal test cannot catch, since `service` is visible in-crate:
+//!
+//! ```
+//! use wt::worktree::{
+//!     CreatedWorktree, HookOutcome, RemovedWorktree, SubmoduleSeeding, SubmodulesOutcome,
+//! };
+//!
+//! fn inspect(created: &CreatedWorktree, removed: &RemovedWorktree) {
+//!     let _: &SubmoduleSeeding = &created.submodule_seeding;
+//!     let _: &SubmodulesOutcome = &created.submodules;
+//!     let _: &HookOutcome = &created.post_create;
+//!     let _: &HookOutcome = &removed.pre_remove;
+//! }
+//! ```
 
 pub(crate) mod materialize;
 pub(crate) mod rows;
@@ -31,7 +49,7 @@ pub(crate) use rows::{
 pub(crate) use rows::{enumerate_rows, sort_worktrees_base_first};
 pub use service::{
     CreateOptions, CreatedWorktree, HookOutcome, MetaUpdate, RemoveOptions, RemovedWorktree,
-    RepoLock, SubmodulesOutcome, Workspace,
+    RepoLock, SubmoduleSeeding, SubmodulesOutcome, Workspace,
 };
 #[cfg(feature = "cli")]
 pub(crate) use service::{
