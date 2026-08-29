@@ -4,7 +4,7 @@
 #[cfg(feature = "tui")]
 use ratatui::style::Color;
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::{AgentKind, AgentModel, Effort};
 use crate::cx::Env;
 #[cfg(feature = "tui")]
 use crate::keys::{KeyAction, KeyChord, Keymap};
@@ -147,6 +147,35 @@ impl CreateReflink {
     }
 }
 
+/// The generation agent profile (`[agent.generation]`): which agent `wt` drives
+/// for the short, structured generation steps it owns — the PR auto-fill and
+/// the `wt issue` branch/brief proposal.
+///
+/// `wt` owns *generation* only. Running a coding agent on the work itself is
+/// karet's job, which is why there is no work profile here and why
+/// `[agent.work]` is rejected with a pointer to karet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationAgentConfig {
+    /// Which agent CLI to drive.
+    pub provider: AgentKind,
+    /// The model to request.
+    pub model: AgentModel,
+    /// The reasoning effort to request.
+    pub effort: Effort,
+}
+
+impl Default for GenerationAgentConfig {
+    fn default() -> Self {
+        // Unchanged from the flat `[agent]` defaults these keys replace, so
+        // `wt pr open --ai` behaves identically before and after the move.
+        GenerationAgentConfig {
+            provider: AgentKind::Claude,
+            model: AgentModel::default(),
+            effort: Effort::default(),
+        }
+    }
+}
+
 /// The fully-resolved configuration after merging all layers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -177,12 +206,11 @@ pub struct Config {
     /// Whether to copy-on-write clone a new worktree's content from an existing
     /// worktree instead of checking it out.
     pub create_reflink: CreateReflink,
-    /// Default model for the AI PR auto-fill (`wt pr open --ai`); overridable
-    /// per-invocation by `--model` or the TUI's `Ctrl-M` key.
-    pub agent_model: AgentModel,
-    /// Default effort for the AI PR auto-fill; overridable by `--effort` or the
-    /// TUI's `Ctrl-E` key.
-    pub agent_effort: Effort,
+    /// The generation agent profile (`[agent.generation]`), used by the AI PR
+    /// auto-fill (`wt pr open --ai`) and by `wt issue`. Model and effort are
+    /// overridable per-invocation by `--model`/`--effort` or the TUI's
+    /// `Ctrl-M`/`Ctrl-E` keys.
+    pub agent_generation: GenerationAgentConfig,
     /// Show `?` in the dirty column for untracked files.
     pub list_show_untracked: bool,
     /// Ordered list of columns to display in `wt list`.
@@ -219,8 +247,7 @@ impl Default for Config {
             submodules_init: SubmoduleInit::default(),
             submodules_seed: SubmoduleSeed::default(),
             create_reflink: CreateReflink::default(),
-            agent_model: AgentModel::default(),
-            agent_effort: Effort::default(),
+            agent_generation: GenerationAgentConfig::default(),
             list_show_untracked: true,
             list_columns: Column::ALL.to_vec(),
             ui_nerd_fonts: false,
@@ -279,11 +306,14 @@ impl Config {
         if let Some(v) = layer.create_reflink {
             self.create_reflink = v;
         }
-        if let Some(v) = layer.agent_model {
-            self.agent_model = v;
+        if let Some(v) = layer.agent_generation_provider {
+            self.agent_generation.provider = v;
         }
-        if let Some(v) = layer.agent_effort {
-            self.agent_effort = v;
+        if let Some(v) = layer.agent_generation_model {
+            self.agent_generation.model = v;
+        }
+        if let Some(v) = layer.agent_generation_effort {
+            self.agent_generation.effort = v;
         }
         if let Some(v) = layer.list_show_untracked {
             self.list_show_untracked = v;
@@ -370,10 +400,12 @@ pub struct ConfigLayer {
     pub submodules_seed: Option<SubmoduleSeed>,
     /// `create.reflink`.
     pub create_reflink: Option<CreateReflink>,
-    /// `agent.model`.
-    pub agent_model: Option<AgentModel>,
-    /// `agent.effort`.
-    pub agent_effort: Option<Effort>,
+    /// `agent.generation.provider`.
+    pub agent_generation_provider: Option<AgentKind>,
+    /// `agent.generation.model`, or its deprecated `agent.model` alias.
+    pub agent_generation_model: Option<AgentModel>,
+    /// `agent.generation.effort`, or its deprecated `agent.effort` alias.
+    pub agent_generation_effort: Option<Effort>,
     /// `list.show_untracked`.
     pub list_show_untracked: Option<bool>,
     /// `list.columns`.
@@ -489,8 +521,9 @@ mod tests {
         assert!(!c.remove_untracked_blocks);
         assert_eq!(c.pr_default_remote, "origin");
         assert_eq!(c.submodules_init, SubmoduleInit::Prompt);
-        assert_eq!(c.agent_model, AgentModel::Sonnet);
-        assert_eq!(c.agent_effort, Effort::Medium);
+        assert_eq!(c.agent_generation.provider, AgentKind::Claude);
+        assert_eq!(c.agent_generation.model, AgentModel::Sonnet);
+        assert_eq!(c.agent_generation.effort, Effort::Medium);
         assert!(c.list_show_untracked);
         assert_eq!(c.list_columns, Column::ALL.to_vec());
         assert!(!c.ui_nerd_fonts);
@@ -542,8 +575,8 @@ mod tests {
             remove_delete_merged_branch: Some(false),
             remove_untracked_blocks: Some(true),
             submodules_init: Some(SubmoduleInit::Always),
-            agent_model: Some(AgentModel::Haiku),
-            agent_effort: Some(Effort::Low),
+            agent_generation_model: Some(AgentModel::Haiku),
+            agent_generation_effort: Some(Effort::Low),
             list_show_untracked: Some(false),
             ui_nerd_fonts: Some(true),
             ui_color: Some(ColorChoice::Never),
@@ -557,8 +590,8 @@ mod tests {
         assert!(!c.remove_delete_merged_branch);
         assert!(c.remove_untracked_blocks);
         assert_eq!(c.submodules_init, SubmoduleInit::Always);
-        assert_eq!(c.agent_model, AgentModel::Haiku);
-        assert_eq!(c.agent_effort, Effort::Low);
+        assert_eq!(c.agent_generation.model, AgentModel::Haiku);
+        assert_eq!(c.agent_generation.effort, Effort::Low);
         assert!(!c.list_show_untracked);
         assert!(c.ui_nerd_fonts);
         assert_eq!(c.ui_color, ColorChoice::Never);

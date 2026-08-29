@@ -756,6 +756,7 @@ pub(crate) fn do_draft_pr_ai(
         Mode::PrCompose(state) => crate::agent::AgentOptions {
             model: state.model,
             effort: state.effort,
+            timeout: None,
         },
         _ => crate::agent::AgentOptions::default(),
     };

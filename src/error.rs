@@ -73,6 +73,17 @@ pub enum Error {
     #[error("{0}")]
     AgentUnavailable(String),
 
+    /// A code-agent run exceeded its deadline and was killed. Generation is
+    /// always best-effort, so callers are expected to fall back rather than
+    /// surface this to the user as a failure.
+    #[error("{binary} did not respond within {seconds}s")]
+    AgentTimeout {
+        /// The agent binary that was killed.
+        binary: String,
+        /// The deadline it exceeded, in seconds.
+        seconds: u64,
+    },
+
     /// The repository's `wt.schema` was written by a newer `wt` (or embedder)
     /// than this one; reading it could silently misinterpret metadata, so the
     /// operation is refused (issue #99).

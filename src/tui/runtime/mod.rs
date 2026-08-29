@@ -1734,6 +1734,7 @@ mod tests {
             Some(crate::agent::AgentOptions {
                 model: crate::agent::AgentModel::Opus,
                 effort: crate::agent::Effort::High,
+                timeout: None,
             })
         );
     }

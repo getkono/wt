@@ -20,7 +20,7 @@ use crate::git::{
     CommitInfo, Upstream, abbrev_len, ahead_behind, branch_ref, commit_info, default_branch,
     enumerate, is_ancestor, local_branches, recent_commits, resolve_hex, status_of, upstream_of,
 };
-use crate::model::{Commit, MergeState, Pr, PrState, Worktree};
+use crate::model::{Commit, IssueLink, MergeState, Pr, PrState, Worktree};
 use crate::slug::slugify;
 use crate::time::iso8601;
 
@@ -67,6 +67,7 @@ pub(crate) fn enrich_worktree(repo: &Repo, git: &dyn GitCli, abbrev: usize, wt: 
         let meta = wtconfig::read_meta(repo.gix(), &branch);
         wt.base_ref = meta.base_ref.clone();
         wt.pr = build_pr(&meta);
+        wt.issue = build_issue(&meta);
         wt.pr_url = meta.pr_url.clone();
         // Upstream is read from config and is known even for a missing worktree;
         // ahead/behind needs the working directory, so it is computed only when
@@ -208,6 +209,18 @@ fn compute_merge_state(
 }
 
 /// Builds the PR row from cached `wt.*` metadata, if a PR number is recorded.
+/// Builds the [`IssueLink`] from `wt.<branch>.issue*`, or `None` when the branch
+/// has no recorded issue. The number is what makes the link real; title and URL
+/// are cached conveniences that default to empty.
+fn build_issue(meta: &WtMeta) -> Option<IssueLink> {
+    let number = meta.issue_number?;
+    Some(IssueLink {
+        number,
+        title: meta.issue_title.clone().unwrap_or_default(),
+        url: meta.issue_url.clone().unwrap_or_default(),
+    })
+}
+
 fn build_pr(meta: &WtMeta) -> Option<Pr> {
     let number = meta.pr_number?;
     let state = meta
@@ -281,6 +294,7 @@ fn enrich_branch_row(repo: &Repo, git: &dyn GitCli, abbrev: usize, row: &mut Wor
     let meta = wtconfig::read_meta(repo.gix(), &branch);
     row.base_ref = meta.base_ref.clone();
     row.pr = build_pr(&meta);
+    row.issue = build_issue(&meta);
     row.pr_url = meta.pr_url.clone();
     if let Some(up) = upstream_of(repo.gix(), &branch) {
         row.upstream = Some(up.display);

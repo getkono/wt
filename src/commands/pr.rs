@@ -326,6 +326,9 @@ fn pr_meta(view: &crate::gh::PrView, base: &str, created_here: bool) -> MetaUpda
         pr_title: Some(view.title.clone()),
         pr_url: Some(view.url.clone()),
         created_by_wt: created_here,
+        // A PR checkout records no issue link; `None` leaves any existing one
+        // (e.g. from `wt issue`) untouched.
+        ..MetaUpdate::default()
     }
 }
 

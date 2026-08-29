@@ -7,7 +7,7 @@
 use ratatui::style::Color;
 use toml::Value;
 
-use crate::agent::{AgentModel, Effort};
+use crate::agent::{AgentKind, AgentModel, Effort};
 use crate::config::schema::{ConfigLayer, CreateReflink, SubmoduleInit, SubmoduleSeed};
 use crate::error::{Error, Result};
 #[cfg(feature = "tui")]
@@ -168,27 +168,121 @@ fn parse_submodules(file: &str, value: &Value, layer: &mut ConfigLayer) -> Resul
     Ok(())
 }
 
-/// Parses the `[agent]` table, validating the model and effort identifiers.
+/// Parses the `[agent]` table.
+///
+/// `[agent.generation]` is the canonical home for the generation profile. The
+/// flat `agent.model` / `agent.effort` keys are kept as deprecated aliases for
+/// the same two settings, so existing configurations keep working; setting a
+/// key both ways in one file is rejected rather than silently resolved by
+/// table order.
+///
+/// `[agent.work]` is refused outright: `wt` does not run coding agents, so
+/// there is no work profile to configure here.
 fn parse_agent(file: &str, value: &Value, layer: &mut ConfigLayer) -> Result<()> {
+    let mut flat_model = false;
+    let mut flat_effort = false;
+    let mut generation_model = false;
+    let mut generation_effort = false;
+
     for (sub, val) in as_table(file, "agent", value)? {
         let key = format!("agent.{sub}");
         match sub.as_str() {
             "model" => {
-                let text = as_string(file, &key, val)?;
-                let model = AgentModel::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: opus, sonnet, haiku"))?;
-                layer.agent_model = Some(model);
+                layer.agent_generation_model = Some(parse_agent_model(file, &key, val)?);
+                flat_model = true;
+                tracing::warn!("{file}: `agent.model` is deprecated; use `agent.generation.model`");
             }
             "effort" => {
+                layer.agent_generation_effort = Some(parse_agent_effort(file, &key, val)?);
+                flat_effort = true;
+                tracing::warn!(
+                    "{file}: `agent.effort` is deprecated; use `agent.generation.effort`"
+                );
+            }
+            "generation" => {
+                parse_agent_generation(
+                    file,
+                    val,
+                    layer,
+                    &mut generation_model,
+                    &mut generation_effort,
+                )?;
+            }
+            "work" => {
+                return Err(cfg_err(
+                    file,
+                    &key,
+                    "`wt` does not run coding agents, so it has no work profile; \
+                     agent execution belongs to karet (https://github.com/getkono/karet). \
+                     `wt` owns only `[agent.generation]`",
+                ));
+            }
+            _ => return Err(cfg_err(file, &key, "unknown configuration key")),
+        }
+    }
+
+    // Order within a table is not something a user should have to reason about,
+    // so a key set both ways is an error rather than a last-one-wins race.
+    if flat_model && generation_model {
+        return Err(cfg_err(
+            file,
+            "agent.model",
+            "conflicts with `agent.generation.model` in the same file; set only one",
+        ));
+    }
+    if flat_effort && generation_effort {
+        return Err(cfg_err(
+            file,
+            "agent.effort",
+            "conflicts with `agent.generation.effort` in the same file; set only one",
+        ));
+    }
+    Ok(())
+}
+
+/// Parses the `[agent.generation]` sub-table.
+fn parse_agent_generation(
+    file: &str,
+    value: &Value,
+    layer: &mut ConfigLayer,
+    saw_model: &mut bool,
+    saw_effort: &mut bool,
+) -> Result<()> {
+    for (sub, val) in as_table(file, "agent.generation", value)? {
+        let key = format!("agent.generation.{sub}");
+        match sub.as_str() {
+            "provider" => {
                 let text = as_string(file, &key, val)?;
-                let effort = Effort::parse(&text)
-                    .ok_or_else(|| cfg_err(file, &key, "expected one of: low, medium, high"))?;
-                layer.agent_effort = Some(effort);
+                let provider = AgentKind::parse(&text)
+                    .ok_or_else(|| cfg_err(file, &key, "expected one of: claude"))?;
+                layer.agent_generation_provider = Some(provider);
+            }
+            "model" => {
+                layer.agent_generation_model = Some(parse_agent_model(file, &key, val)?);
+                *saw_model = true;
+            }
+            "effort" => {
+                layer.agent_generation_effort = Some(parse_agent_effort(file, &key, val)?);
+                *saw_effort = true;
             }
             _ => return Err(cfg_err(file, &key, "unknown configuration key")),
         }
     }
     Ok(())
+}
+
+/// Validates a model identifier, shared by the canonical key and its alias so
+/// the two cannot drift.
+fn parse_agent_model(file: &str, key: &str, value: &Value) -> Result<AgentModel> {
+    let text = as_string(file, key, value)?;
+    AgentModel::parse(&text)
+        .ok_or_else(|| cfg_err(file, key, "expected one of: opus, sonnet, haiku"))
+}
+
+/// Validates an effort identifier, shared by the canonical key and its alias.
+fn parse_agent_effort(file: &str, key: &str, value: &Value) -> Result<Effort> {
+    let text = as_string(file, key, value)?;
+    Effort::parse(&text).ok_or_else(|| cfg_err(file, key, "expected one of: low, medium, high"))
 }
 
 /// Parses the `[list]` table, validating column identifiers.
@@ -375,8 +469,8 @@ mod tests {
         assert_eq!(layer.remove_untracked_blocks, Some(true));
         assert_eq!(layer.pr_default_remote.as_deref(), Some("upstream"));
         assert_eq!(layer.submodules_init, Some(SubmoduleInit::Always));
-        assert_eq!(layer.agent_model, Some(AgentModel::Opus));
-        assert_eq!(layer.agent_effort, Some(Effort::High));
+        assert_eq!(layer.agent_generation_model, Some(AgentModel::Opus));
+        assert_eq!(layer.agent_generation_effort, Some(Effort::High));
         assert_eq!(layer.list_show_untracked, Some(false));
         assert_eq!(layer.list_columns, Some(vec![Column::Branch, Column::Pr]));
         assert_eq!(layer.ui_nerd_fonts, Some(true));
@@ -455,6 +549,60 @@ mod tests {
         assert!(reason.contains("low, medium, high"));
         let (key, _) = config_reason(parse("[agent]\nwiggle = true").unwrap_err());
         assert_eq!(key, "agent.wiggle");
+    }
+
+    #[test]
+    fn generation_profile_parses_every_key() {
+        let layer =
+            parse("[agent.generation]\nprovider = \"claude\"\nmodel = \"opus\"\neffort = \"high\"")
+                .unwrap();
+        assert_eq!(layer.agent_generation_provider, Some(AgentKind::Claude));
+        assert_eq!(layer.agent_generation_model, Some(AgentModel::Opus));
+        assert_eq!(layer.agent_generation_effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn flat_agent_keys_are_aliases_for_the_generation_profile() {
+        // The released flat keys keep working and land on exactly the same
+        // layer fields, so an existing config needs no migration.
+        let layer = parse("[agent]\nmodel = \"opus\"\neffort = \"high\"").unwrap();
+        assert_eq!(layer.agent_generation_model, Some(AgentModel::Opus));
+        assert_eq!(layer.agent_generation_effort, Some(Effort::High));
+    }
+
+    #[test]
+    fn a_key_set_both_ways_in_one_file_is_rejected() {
+        // Table iteration order is not something a user should have to reason
+        // about, so this is an error rather than a last-one-wins race.
+        let (key, reason) = config_reason(
+            parse("[agent]\nmodel = \"opus\"\n[agent.generation]\nmodel = \"haiku\"").unwrap_err(),
+        );
+        assert_eq!(key, "agent.model");
+        assert!(reason.contains("agent.generation.model"), "{reason}");
+        let (key, reason) = config_reason(
+            parse("[agent]\neffort = \"low\"\n[agent.generation]\neffort = \"high\"").unwrap_err(),
+        );
+        assert_eq!(key, "agent.effort");
+        assert!(reason.contains("agent.generation.effort"), "{reason}");
+    }
+
+    #[test]
+    fn agent_work_is_rejected_with_a_pointer_to_karet() {
+        // `wt` keeps the generation profile; running the agent is karet's job.
+        let (key, reason) =
+            config_reason(parse("[agent.work]\nprovider = \"claude\"").unwrap_err());
+        assert_eq!(key, "agent.work");
+        assert!(reason.contains("karet"), "{reason}");
+    }
+
+    #[test]
+    fn unknown_generation_keys_are_rejected_with_the_dotted_path() {
+        let (key, _) = config_reason(parse("[agent.generation]\nwiggle = true").unwrap_err());
+        assert_eq!(key, "agent.generation.wiggle");
+        let (key, reason) =
+            config_reason(parse("[agent.generation]\nprovider = \"codex\"").unwrap_err());
+        assert_eq!(key, "agent.generation.provider");
+        assert!(reason.contains("claude"), "{reason}");
     }
 
     #[test]

@@ -71,15 +71,15 @@ step that sets up everything; there's no separate completions install. (A static
 values-unaware script is still available via `wt completions <shell>` if you want
 to manage it yourself.)
 
-### 3. Authenticate `gh` (only for PR commands)
+### 3. Authenticate `gh` (for PR and issue commands)
 
 ```bash
 gh auth login
 ```
 
-Everything except `wt pr` works fully offline. If `gh` is missing or
-unauthenticated, only the PR commands fail (with an actionable message); the rest
-keep working.
+Everything except `wt pr` and `wt issue` works fully offline. If `gh` is missing
+or unauthenticated, only those commands fail (with an actionable message); the
+rest keep working.
 
 ### 4. Open it
 
@@ -89,6 +89,7 @@ sorting, and filtering are all discoverable from there. For example:
 
 ```bash
 wt new feature/login   # create the branch + worktree and switch into it
+wt issue 123           # branch + worktree for a GitHub issue, name proposed for you
 wt switch              # fuzzy-pick a worktree to jump to
 ```
 
@@ -109,6 +110,20 @@ These are the things worth knowing up front; the rest is discoverable from
   suggest existing local **and** remote branches to fork from or check out — type
   to filter, `↑/↓` to pick, `Enter` to accept, or just type a brand-new name. The
   PR compose form's model and effort fields list their choices the same way.
+- **Start from a GitHub issue.** `wt issue 123` fetches the issue's title, body,
+  labels, type and milestone, proposes a conventional `type/123-slug` branch and a
+  short implementation brief, lets you edit both, then creates the worktree and
+  records the link. `wt list` can show it with the opt-in `issue` column
+  (`wt config set list.columns status,dirty,branch,issue,path`), and running
+  `wt issue 123` again reuses the branch it already made.
+
+  Generation is best-effort and never blocks you: if the agent is missing, hangs,
+  or returns nonsense, `wt` falls back to a deterministic name built from the
+  issue's own labels and title, tells you it did, and carries on. Set which model
+  it uses under `[agent.generation]`, or per-run with `--model`/`--effort`.
+
+  `wt` stops at the prepared worktree — it does not run a coding agent for you.
+  Handing the work to an agent is [karet](https://github.com/getkono/karet)'s job.
 - **Where worktrees are created.** New worktrees follow a configurable path
   template. The default keeps them beside the repo, out of it, and prefixes each
   worktree directory with the repo name so it's obvious which repo you're in:
@@ -173,6 +188,20 @@ These are the things worth knowing up front; the rest is discoverable from
   the user config); precedence is flags > repo > global. `wt init` is an optional
   convenience that scaffolds a starter `.wt.toml` and, for a subdir store, offers
   to add it to `.gitignore`.
+- **Pick the generation model.** The short, structured generation steps `wt`
+  owns — the `wt pr open --ai` draft and the `wt issue` branch/brief proposal —
+  read one profile:
+
+  ```toml
+  [agent.generation]
+  provider = "claude"
+  model = "sonnet"   # opus | sonnet | haiku
+  effort = "medium"  # low | medium | high
+  ```
+
+  The older flat `agent.model` / `agent.effort` keys still work and mean the same
+  thing. `[agent.work]` is deliberately not a `wt` setting: running a coding agent
+  on the work belongs to [karet](https://github.com/getkono/karet).
 - **Theme the TUI.** Pick a built-in palette and tweak individual colors under
   `[ui.theme]`: `preset` selects the base (`one-dark` (default) or `solarized`),
   and the named slots (`accent`, `green`, `red`, `yellow`, `orange`, `cyan`,

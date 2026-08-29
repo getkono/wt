@@ -26,6 +26,9 @@ const KEYS: &[&str] = &[
     "submodules.init",
     "submodules.seed",
     "create.reflink",
+    "agent.generation.provider",
+    "agent.generation.model",
+    "agent.generation.effort",
     "agent.model",
     "agent.effort",
     "list.show_untracked",
@@ -204,6 +207,9 @@ fn key_type(key: &str) -> Option<KeyType> {
         | "submodules.init"
         | "submodules.seed"
         | "create.reflink"
+        | "agent.generation.provider"
+        | "agent.generation.model"
+        | "agent.generation.effort"
         | "agent.model"
         | "agent.effort"
         | "ui.color"
@@ -244,8 +250,14 @@ fn config_value(config: &Config, key: &str) -> Result<Option<String>> {
         "submodules.init" => Some(config.submodules_init.identifier().to_string()),
         "submodules.seed" => Some(config.submodules_seed.identifier().to_string()),
         "create.reflink" => Some(config.create_reflink.identifier().to_string()),
-        "agent.model" => Some(config.agent_model.id().to_string()),
-        "agent.effort" => Some(config.agent_effort.id().to_string()),
+        "agent.generation.provider" => Some(config.agent_generation.provider.as_str().to_string()),
+        // The flat keys remain readable aliases for the same two settings.
+        "agent.generation.model" | "agent.model" => {
+            Some(config.agent_generation.model.id().to_string())
+        }
+        "agent.generation.effort" | "agent.effort" => {
+            Some(config.agent_generation.effort.id().to_string())
+        }
         "list.show_untracked" => Some(config.list_show_untracked.to_string()),
         "list.columns" => Some(
             config

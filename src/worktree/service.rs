@@ -275,6 +275,14 @@ pub struct MetaUpdate {
     pub pr_title: Option<String>,
     /// The cached PR URL.
     pub pr_url: Option<String>,
+    /// The linked GitHub issue number (issue #100).
+    pub issue_number: Option<u64>,
+    /// The cached issue title.
+    pub issue_title: Option<String>,
+    /// The cached issue URL.
+    pub issue_url: Option<String>,
+    /// The generated implementation brief, persisted for embedders.
+    pub issue_brief: Option<String>,
     /// Marks the branch as created by `wt` (spec §10), which is what allows a
     /// later remove to delete it. There is no un-marking: `false` leaves the
     /// recorded flag as it is.
@@ -303,6 +311,18 @@ pub(crate) fn apply_meta(
     }
     if let Some(url) = &update.pr_url {
         wtconfig::write_pr_url(git, root, branch, url)?;
+    }
+    if let Some(number) = update.issue_number {
+        wtconfig::write_issue_number(git, root, branch, number)?;
+    }
+    if let Some(title) = &update.issue_title {
+        wtconfig::write_issue_title(git, root, branch, title)?;
+    }
+    if let Some(url) = &update.issue_url {
+        wtconfig::write_issue_url(git, root, branch, url)?;
+    }
+    if let Some(brief) = &update.issue_brief {
+        wtconfig::write_issue_brief(git, root, branch, brief)?;
     }
     if update.created_by_wt {
         wtconfig::mark_created_by_wt(git, root, branch)?;
@@ -485,6 +505,46 @@ pub(crate) fn resolve_base(repo: &Repo, config: &Config, explicit: Option<&str>)
     ("HEAD".to_string(), true)
 }
 
+/// The path `create_in` would materialize `branch` at, without creating
+/// anything.
+///
+/// Exists so a caller that previews the target before confirming (`wt issue`)
+/// derives it from the same slug and template logic `create_in` uses, rather
+/// than reimplementing it and drifting.
+#[cfg(feature = "cli")]
+pub(crate) fn preview_target(
+    ws: &WorkspaceParts<'_>,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let (slug, _) = target_slug(ws, branch, base)?;
+    render_target(ws.config, ws.root, branch, &slug, ws.env)
+}
+
+/// The directory slug for `branch`, derived exactly as [`create_in`] derives it.
+///
+/// The commit only matters for a branch name that slugifies to nothing, where it
+/// is the fallback — but that is precisely the case a preview would otherwise get
+/// wrong, so the rule is shared rather than restated: an existing branch keys off
+/// its own tip, a new one off the base it will fork from.
+fn target_slug(
+    ws: &WorkspaceParts<'_>,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<(String, String)> {
+    let commit = match resolve_hex(ws.repo.gix(), &branch_ref(branch)) {
+        Some(oid) => oid,
+        None => {
+            let base_ref = resolve_base(ws.repo, ws.config, base).0;
+            resolve_hex(ws.repo.gix(), &base_ref)
+                .ok_or_else(|| Error::operation(format!("base ref {base_ref:?} not found")))?
+        }
+    };
+    let short_hash = commit.get(..7).unwrap_or(&commit).to_string();
+    let slug = slugify_with_fallback(branch, &short_hash);
+    Ok((slug, short_hash))
+}
+
 /// Creates (or reuses) a worktree per `options`; see [`Workspace::create`].
 pub(crate) fn create_in(
     ws: &WorkspaceParts<'_>,
@@ -502,13 +562,10 @@ pub(crate) fn create_in(
     } else {
         Some(resolve_base(ws.repo, ws.config, options.base.as_deref()).0)
     };
-    let base_commit = match &base_ref {
-        Some(base) => resolve_hex(ws.repo.gix(), base)
-            .ok_or_else(|| Error::operation(format!("base ref {base:?} not found")))?,
-        None => resolve_hex(ws.repo.gix(), &branch_ref(&branch)).unwrap_or_default(),
-    };
-    let short_hash = base_commit.get(..7).unwrap_or(&base_commit).to_string();
-    let slug = slugify_with_fallback(&branch, &short_hash);
+    // Shared with `preview_target`, so a confirmation preview cannot name a
+    // different directory than the one that gets created. This also performs the
+    // base-ref existence check, erroring before anything is created.
+    let (slug, short_hash) = target_slug(ws, &branch, options.base.as_deref())?;
 
     // If the branch is already checked out, either reuse (same target) or
     // refuse. The reuse path is idempotent: no copy step, no hook.
@@ -1159,6 +1216,61 @@ mod tests {
             .create(&RealGit, &RealHookRunner, &create_opts("dup"))
             .unwrap_err();
         assert!(err.to_string().contains("already checked out"));
+    }
+
+    // `preview_target` exists for the CLI's confirmation preview, so its tests
+    // only compile where it does.
+    #[cfg(feature = "cli")]
+    #[test]
+    fn preview_target_names_the_directory_create_actually_makes() {
+        // The slug's commit is only consulted for a branch name that slugifies to
+        // nothing — and there a *new* branch keys off the base it forks from, not
+        // off itself. A preview deriving the hash from the (absent) branch would
+        // name a different directory than the one created, so `wt issue` would
+        // confirm one path and produce another.
+        // "_" is a legal git branch name whose slug is empty, so it is the case
+        // that actually consults the commit hash.
+        for branch in ["feat/7-add-login", "_"] {
+            let repo = TestRepo::init();
+            let ws = workspace(&repo);
+            let fresh = Repo::discover(repo.root()).unwrap();
+            let previewed = preview_target(&ws.parts(&fresh), branch, None).unwrap();
+            let created = ws
+                .create(&RealGit, &RealHookRunner, &create_opts(branch))
+                .unwrap();
+            assert_eq!(
+                previewed, created.path,
+                "preview and creation disagree for {branch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slugless_branch_is_named_after_the_base_it_forks_from() {
+        // Rule 5 of the slug contract: an empty slug falls back to the short hash
+        // of the *base ref*, not of the branch (which does not exist yet). Pinned
+        // separately from the preview test, which can only prove the two agree —
+        // not that the rule they share is the right one.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let base = Repo::discover(repo.root())
+            .ok()
+            .and_then(|r| resolve_hex(r.gix(), "main"))
+            .expect("main resolves");
+        let short = &base[..7];
+
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("_"))
+            .unwrap();
+        let name = created
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(
+            name.ends_with(short),
+            "{name} should end with the base short hash {short}"
+        );
     }
 
     #[test]

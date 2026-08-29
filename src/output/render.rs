@@ -71,6 +71,14 @@ pub fn pr_cell(worktree: &Worktree) -> String {
     }
 }
 
+/// The issue cell: `#<number>`, or empty when the branch has no linked issue.
+pub fn issue_cell(worktree: &Worktree) -> String {
+    match &worktree.issue {
+        Some(issue) => format!("#{}", issue.number),
+        None => String::new(),
+    }
+}
+
 /// The path cell: relative to the repo root, or absolute if outside it.
 pub fn path_cell(worktree: &Worktree, repo_root: &Path) -> String {
     match worktree.path.strip_prefix(repo_root) {
@@ -103,6 +111,7 @@ pub fn cell(worktree: &Worktree, column: Column, ctx: &RenderCtx) -> String {
         Column::AheadBehind => ahead_behind_cell(worktree),
         Column::Commit => commit_cell(worktree, ctx.now),
         Column::Pr => pr_cell(worktree),
+        Column::Issue => issue_cell(worktree),
     }
 }
 
@@ -142,6 +151,9 @@ pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> Stri
             pr.title
         );
     }
+    if let Some(issue) = &worktree.issue {
+        let _ = writeln!(out, "issue:    #{} \"{}\"", issue.number, issue.title);
+    }
     if !entries.is_empty() {
         let _ = writeln!(out, "dirty:");
         for entry in entries {
@@ -154,7 +166,7 @@ pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Commit, Pr, PrState};
+    use crate::model::{Commit, IssueLink, Pr, PrState};
     use std::path::PathBuf;
 
     fn base() -> Worktree {
@@ -220,6 +232,18 @@ mod tests {
         assert_eq!(path_cell(&w, root), ".worktrees/x");
         w.path = PathBuf::from("/elsewhere/y");
         assert_eq!(path_cell(&w, root), "/elsewhere/y");
+    }
+
+    #[test]
+    fn issue_cell_renders_the_linked_number() {
+        let mut w = base();
+        assert_eq!(issue_cell(&w), "");
+        w.issue = Some(IssueLink {
+            number: 7,
+            title: "Add login".into(),
+            url: "https://github.com/o/r/issues/7".into(),
+        });
+        assert_eq!(issue_cell(&w), "#7");
     }
 
     #[test]

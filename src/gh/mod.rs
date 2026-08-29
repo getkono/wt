@@ -9,10 +9,32 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::error::{Error, Result};
-pub use types::{Author, OpenPr, PrSummary, PrView, pr_state};
+pub use types::{
+    Author, IssueLabel, IssueMilestone, IssueSummary, IssueType, IssueView, OpenPr, PrSummary,
+    PrView, pr_state,
+};
 
 /// Performs GitHub pull-request operations via `gh`.
 pub trait GhClient {
+    /// Lists open issues for the repository at `dir`.
+    ///
+    /// Defaulted so third-party [`GhClient`] implementations stay
+    /// source-compatible; clients that support the issue workflow override it.
+    fn list_open_issues(&self, _dir: &Path) -> Result<Vec<IssueSummary>> {
+        Err(Error::GhUnavailable(
+            "GitHub issue operations are not supported by this client".into(),
+        ))
+    }
+
+    /// Views the issue identified by `target` (a number or URL).
+    ///
+    /// Defaulted for the same reason as [`GhClient::list_open_issues`].
+    fn view_issue(&self, _dir: &Path, _target: &str) -> Result<IssueView> {
+        Err(Error::GhUnavailable(
+            "GitHub issue operations are not supported by this client".into(),
+        ))
+    }
+
     /// Lists open PRs for the repository at `dir`.
     fn list_open_prs(&self, dir: &Path) -> Result<Vec<PrSummary>>;
 
@@ -51,6 +73,37 @@ pub trait GhClient {
 pub struct RealGh;
 
 impl GhClient for RealGh {
+    fn list_open_issues(&self, dir: &Path) -> Result<Vec<IssueSummary>> {
+        let output = run_gh(
+            dir,
+            &[
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "100",
+                "--json",
+                "number,title,state,labels,issueType,milestone,createdAt,url",
+            ],
+        )?;
+        serde_json::from_str(&output).map_err(Error::from)
+    }
+
+    fn view_issue(&self, dir: &Path, target: &str) -> Result<IssueView> {
+        let output = run_gh(
+            dir,
+            &[
+                "issue",
+                "view",
+                target,
+                "--json",
+                "number,title,body,state,labels,issueType,milestone,createdAt,updatedAt,url",
+            ],
+        )?;
+        serde_json::from_str(&output).map_err(Error::from)
+    }
+
     fn list_open_prs(&self, dir: &Path) -> Result<Vec<PrSummary>> {
         let output = run_gh(
             dir,

@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use crate::agent::{AgentClient, AgentKind, AgentOptions, AgentRun, AgentVersion, DetectedAgent};
 use crate::cx::{Cx, Env, Input, Stream};
 use crate::error::Error;
-use crate::gh::{GhClient, OpenPr, PrSummary, PrView, RealGh};
+use crate::gh::{GhClient, IssueSummary, IssueView, OpenPr, PrSummary, PrView, RealGh};
 use crate::git::cli::{GitCli, RealGit};
 
 /// A fake [`GhClient`] returning canned PR data or simulating an unavailable
@@ -33,6 +33,8 @@ pub(crate) struct FakeGh {
     edit_stdout: String,
     create_args: Arc<Mutex<Vec<Vec<String>>>>,
     edit_args: Arc<Mutex<Vec<Vec<String>>>>,
+    issue_list: Vec<IssueSummary>,
+    issue: Option<IssueView>,
 }
 
 #[allow(dead_code)]
@@ -65,6 +67,22 @@ impl FakeGh {
         }
     }
 
+    /// A fake that returns `issue` from `view_issue`.
+    pub(crate) fn with_issue(issue: IssueView) -> Self {
+        FakeGh {
+            issue: Some(issue),
+            available: true,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the issues returned by `list_open_issues`.
+    pub(crate) fn with_issue_list(mut self, list: Vec<IssueSummary>) -> Self {
+        self.issue_list = list;
+        self.available = true;
+        self
+    }
+
     /// A fake simulating a missing/unauthenticated `gh`.
     pub(crate) fn unavailable() -> Self {
         FakeGh::default()
@@ -94,6 +112,23 @@ impl FakeGh {
 }
 
 impl GhClient for FakeGh {
+    fn list_open_issues(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<IssueSummary>> {
+        if self.available {
+            Ok(self.issue_list.clone())
+        } else {
+            Err(Error::GhUnavailable("gh unavailable".into()))
+        }
+    }
+
+    fn view_issue(&self, _dir: &std::path::Path, _target: &str) -> crate::error::Result<IssueView> {
+        if !self.available {
+            return Err(Error::GhUnavailable("gh unavailable".into()));
+        }
+        self.issue
+            .clone()
+            .ok_or_else(|| Error::operation("no issue configured"))
+    }
+
     fn list_open_prs(&self, _dir: &std::path::Path) -> crate::error::Result<Vec<PrSummary>> {
         if self.available {
             Ok(self.list.clone())
@@ -158,6 +193,9 @@ pub(crate) enum AgentBehavior {
     Erroring(String),
     /// Agent absent: `detect` returns `Ok(None)` and `run` returns `AgentUnavailable`.
     Unavailable,
+    /// Agent present but unresponsive: `run` returns `AgentTimeout`, as the real
+    /// client does once a run exceeds its deadline.
+    TimingOut,
 }
 
 /// A fake [`AgentClient`] for tests: returns a canned draft, simulates an
@@ -190,6 +228,11 @@ impl FakeAgent {
     /// An absent agent (`detect` → `None`, `run` → `AgentUnavailable`).
     pub(crate) fn unavailable() -> Self {
         FakeAgent::new(AgentBehavior::Unavailable)
+    }
+
+    /// A present but unresponsive agent (`run` → `AgentTimeout`).
+    pub(crate) fn timing_out() -> Self {
+        FakeAgent::new(AgentBehavior::TimingOut)
     }
 
     /// The [`AgentOptions`] passed to the most recent `run`, if any.
@@ -235,6 +278,10 @@ impl AgentClient for FakeAgent {
                 raw: serde_json::Value::Null,
             }),
             AgentBehavior::Unavailable => Err(Error::AgentUnavailable("claude unavailable".into())),
+            AgentBehavior::TimingOut => Err(Error::AgentTimeout {
+                binary: kind.as_str().to_string(),
+                seconds: 120,
+            }),
         }
     }
 }

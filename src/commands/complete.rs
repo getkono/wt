@@ -63,6 +63,18 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
                 .map(|n| n.to_string())
                 .collect())
         }
+        "issue-numbers" => {
+            // Best-effort, exactly like `pr-numbers`: GitHub being unreachable
+            // must never make shell completion fail.
+            let dir = repo.current_workdir().unwrap_or_else(|| cx.cwd.clone());
+            Ok(cx
+                .gh
+                .list_open_issues(&dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.number.to_string())
+                .collect())
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -70,6 +82,7 @@ fn candidates(cx: &Cx, kind: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use crate::cli::CompleteArgs;
+    use crate::gh::IssueSummary;
     use crate::testutil::TestRepo;
 
     fn args(kind: &str, partial: Option<&str>) -> CompleteArgs {
@@ -100,6 +113,37 @@ mod tests {
         let out = t.out.contents();
         assert!(out.contains("main"));
         assert!(out.contains("topic"));
+    }
+
+    #[test]
+    fn completes_open_issue_numbers() {
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = std::sync::Arc::new(crate::testutil::FakeGh::default().with_issue_list(vec![
+            IssueSummary {
+                number: 7,
+                title: "Add login".into(),
+                state: "OPEN".into(),
+                labels: Vec::new(),
+                issue_type: None,
+                milestone: None,
+                created_at: String::new(),
+                url: String::new(),
+            },
+        ]));
+        super::run(&mut t.cx, &args("issue-numbers", None)).unwrap();
+        assert!(t.out.contents().contains('7'));
+    }
+
+    #[test]
+    fn issue_completion_is_silent_when_github_is_unreachable() {
+        // Completion runs on every keystroke; an unauthenticated `gh` must
+        // produce an empty list, never an error.
+        let repo = TestRepo::init();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = std::sync::Arc::new(crate::testutil::FakeGh::unavailable());
+        super::run(&mut t.cx, &args("issue-numbers", None)).unwrap();
+        assert!(t.out.contents().trim().is_empty());
     }
 
     #[test]

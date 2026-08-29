@@ -317,7 +317,7 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
                 "unknown --model {m:?}; expected one of: opus, sonnet, haiku"
             ))
         })?,
-        None => config.agent_model,
+        None => config.agent_generation.model,
     };
     let effort = match &args.effort {
         Some(e) => Effort::parse(e).ok_or_else(|| {
@@ -325,9 +325,15 @@ pub(crate) fn resolve_agent_options(args: &PrOpenArgs, config: &Config) -> Resul
                 "unknown --effort {e:?}; expected one of: low, medium, high"
             ))
         })?,
-        None => config.agent_effort,
+        None => config.agent_generation.effort,
     };
-    Ok(AgentOptions { model, effort })
+    Ok(AgentOptions {
+        model,
+        effort,
+        // The PR auto-fill has always waited indefinitely; `wt issue` is what
+        // introduces a deadline, and only for its own generation step.
+        timeout: None,
+    })
 }
 
 /// Runs the code agent (`claude`) to draft a PR `(title, body)` from `ctx` with
@@ -440,6 +446,9 @@ pub(crate) fn record_pr_metadata(
         // rather than recording a blank.
         pr_url: (!outcome.url.is_empty()).then(|| outcome.url.clone()),
         created_by_wt: false,
+        // Opening a PR records no issue link; `None` leaves any existing one
+        // (e.g. from `wt issue`) untouched.
+        ..MetaUpdate::default()
     };
     let _lock = lock_repo(root)?;
     apply_meta(git, root, branch, &update)
@@ -448,6 +457,7 @@ pub(crate) fn record_pr_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::GenerationAgentConfig;
     use crate::git::cli::RealGit;
     use crate::git::discover::Repo;
     use crate::testutil::{FakeAgent, FakeGh, TestRepo};
@@ -717,6 +727,7 @@ mod tests {
         let opts = AgentOptions {
             model: AgentModel::Opus,
             effort: Effort::High,
+            timeout: None,
         };
         draft_with_ai(&agent, &ctx_for("feat", "main", false), dir.path(), &opts).unwrap();
         assert_eq!(agent.last_opts(), Some(opts));
@@ -753,8 +764,11 @@ mod tests {
     #[test]
     fn resolve_agent_options_flags_override_config() {
         let config = Config {
-            agent_model: AgentModel::Haiku,
-            agent_effort: Effort::Low,
+            agent_generation: GenerationAgentConfig {
+                model: AgentModel::Haiku,
+                effort: Effort::Low,
+                ..GenerationAgentConfig::default()
+            },
             ..Config::default()
         };
         // No flags: config defaults win.
