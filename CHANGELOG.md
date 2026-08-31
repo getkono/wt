@@ -11,6 +11,48 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.6.0](https://github.com/getkono/wt/compare/v1.5.0...v1.6.0) - 2026-08-31
+
+### Added
+
+- *(cli)* complete issue numbers and route wt issue in the shell wrappers
+- *(cli)* add wt issue to create an issue-linked worktree
+- *(agent)* bound a generation run with a deadline
+- *(config)* add the [agent.generation] profile
+- *(model)* record a linked GitHub issue on worktree rows
+- *(gh)* read GitHub issues through the gh client
+- *(create)* opt-in copy-on-write materialization of new worktrees
+- *(submodules)* seed new worktrees from local object stores
+- locked wt.* metadata writes on the Workspace API
+- wt.schema version and repo advisory lock
+- gate CLI and TUI behind cargo features
+- stateless worktree service API
+
+### Fixed
+
+- *(worktree)* validate wt.schema under the repo lock
+- *(worktree)* export SubmoduleSeeding and seal RemovedWorktree
+- *(agent)* return promptly when a killed agent leaves a grandchild
+- *(create)* derive the preview and the real target from one rule
+- *(create)* leave the source's untracked files out of a reflink clone
+- *(remove)* keep git's untracked guard when forcing past submodules
+- *(submodules)* reject traversal in .gitmodules names and paths
+- *(create)* restore submodule origins after a reflink attach
+- *(create)* decide the reflink tree check against the real worktree
+- *(git)* detect submodules recursively and allow removing their worktrees
+- take the advisory repo lock on every mutating command path
+
+### Other
+
+- document using wt as a library
+- *(lib)* document the embedding surface in rustdoc
+- document wt issue and the agent.generation profile
+- merge origin/master into feat/fast-submodule-worktrees
+- explain submodule seeding and reflink materialization
+- *(copy)* stop the copy walk at nested repositories
+- extract branch naming into a pure wt::naming module
+- align gix to 0.85 to match karet
+
 ## [1.5.0](https://github.com/getkono/wt/compare/v1.4.0...v1.5.0) - 2026-07-10
 
 ### Added
