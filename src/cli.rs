@@ -354,15 +354,24 @@ pub(crate) struct DropArgs {
 /// Arguments for `wt prune`.
 #[derive(Debug, Args)]
 pub(crate) struct PruneArgs {
-    /// Include worktrees whose branch is merged into the default branch.
+    /// Include worktrees and branches merged into the default branch (local or
+    /// its `origin` tracking ref).
     #[arg(long)]
     pub(crate) merged: bool,
-    /// Include worktrees whose upstream is gone, and missing worktrees.
+    /// Include worktrees and branches whose upstream is gone, and missing worktrees.
     #[arg(long)]
     pub(crate) gone: bool,
-    /// Include both merged and gone candidates (same as `--merged --gone`).
+    /// Include branches (not worktrees) whose every commit is on a remote or the
+    /// default branch.
+    #[arg(long)]
+    pub(crate) pushed: bool,
+    /// Include everything deletable without losing a commit: merged and gone
+    /// worktrees, plus every merged, pushed, or gone branch whose commits survive.
     #[arg(short = 'a', long)]
     pub(crate) all: bool,
+    /// Trust the last fetch instead of running `git fetch --all --prune` first.
+    #[arg(long = "no-fetch")]
+    pub(crate) no_fetch: bool,
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
@@ -380,6 +389,17 @@ impl PruneArgs {
     /// Whether gone candidates are selected (`--gone` or `--all`).
     pub(crate) fn includes_gone(&self) -> bool {
         self.gone || self.all
+    }
+
+    /// Whether pushed branch candidates are selected (`--pushed` or `--all`).
+    pub(crate) fn includes_pushed(&self) -> bool {
+        self.pushed || self.all
+    }
+
+    /// Whether prune must fetch before selecting: a mode that reads remote state
+    /// is on (`--gone`, `--pushed`, or `--all`) and `--no-fetch` is not.
+    pub(crate) fn needs_fetch(&self) -> bool {
+        !self.no_fetch && (self.gone || self.pushed || self.all)
     }
 }
 
@@ -830,7 +850,8 @@ mod tests {
             match parse(&["prune", flag]).unwrap().command {
                 Some(Command::Prune(a)) => {
                     assert!(a.all);
-                    assert!(a.includes_merged() && a.includes_gone());
+                    assert!(a.includes_merged() && a.includes_gone() && a.includes_pushed());
+                    assert!(a.needs_fetch());
                 }
                 _ => panic!("expected prune for {flag}"),
             }
@@ -842,9 +863,27 @@ mod tests {
             Some(Command::Prune(a)) => {
                 assert!(!a.includes_merged());
                 assert!(a.includes_gone());
+                assert!(!a.includes_pushed());
             }
             _ => panic!("expected prune"),
         }
+    }
+
+    #[test]
+    fn prune_pushed_and_no_fetch_parse() {
+        let prune = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Prune(a)) => a,
+            _ => panic!("expected prune for {args:?}"),
+        };
+        let pushed = prune(&["prune", "--pushed"]);
+        assert!(pushed.includes_pushed());
+        assert!(!pushed.includes_merged() && !pushed.includes_gone());
+        // Remote-reading modes fetch unless told not to; `--merged` stays offline.
+        assert!(pushed.needs_fetch());
+        assert!(prune(&["prune", "--gone"]).needs_fetch());
+        assert!(!prune(&["prune", "--merged"]).needs_fetch());
+        assert!(!prune(&["prune", "--all", "--no-fetch"]).needs_fetch());
+        assert!(!prune(&["prune", "--pushed", "--no-fetch"]).needs_fetch());
     }
 
     #[test]

@@ -152,6 +152,15 @@ pub(crate) fn default_base_ref(repo: &gix::Repository) -> Option<String> {
     origin_head_tracking(repo)
 }
 
+/// The full remote-tracking ref of the default branch, e.g.
+/// `refs/remotes/origin/main`, from the `origin/HEAD` target. Lets a merge check
+/// see work merged on the remote even while the local default lags behind.
+/// `None` when `origin/HEAD` is unset.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn default_tracking_ref(repo: &gix::Repository) -> Option<String> {
+    origin_head_tracking(repo).map(|tracking| format!("refs/remotes/{tracking}"))
+}
+
 /// The current branch name, or `None` for a detached HEAD or unborn branch.
 pub(crate) fn current_branch(repo: &gix::Repository) -> Option<String> {
     let head = repo.head().ok()?;
@@ -330,6 +339,10 @@ mod tests {
         ]);
         let r = Repo::discover(repo.root()).unwrap();
         assert_eq!(default_base_ref(r.gix()).as_deref(), Some("origin/main"));
+        assert_eq!(
+            default_tracking_ref(r.gix()).as_deref(),
+            Some("refs/remotes/origin/main")
+        );
     }
 
     #[test]
@@ -339,6 +352,7 @@ mod tests {
         let repo = TestRepo::init();
         let r = Repo::discover(repo.root()).unwrap();
         assert_eq!(default_base_ref(r.gix()), None);
+        assert_eq!(default_tracking_ref(r.gix()), None);
     }
 
     #[test]
