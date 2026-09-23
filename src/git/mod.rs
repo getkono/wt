@@ -30,7 +30,9 @@ pub(crate) use refs::{
 // `default_base_ref` moved here from the TUI group when `wt issue` (a CLI
 // command) started resolving its base from `origin/HEAD`.
 #[cfg(feature = "cli")]
-pub(crate) use refs::{all_branches, current_branch, default_base_ref, remote_branches};
+pub(crate) use refs::{
+    all_branches, current_branch, default_base_ref, default_tracking_ref, remote_branches,
+};
 // Only the TUI reaches for this.
 #[cfg(feature = "tui")]
 pub(crate) use refs::origin_head_branch;

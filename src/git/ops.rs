@@ -130,6 +130,14 @@ pub(crate) fn fetch_refspec(
     git.run(dir, &["fetch", remote, refspec])
 }
 
+/// Fetches every remote and prunes remote-tracking refs whose branch was deleted
+/// (`git fetch --all --prune`), so both "gone" and "still on the remote" read
+/// the remote's current state.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn fetch_all_prune(git: &dyn GitCli, dir: &Path) -> Result<String> {
+    git.run(dir, &["fetch", "--all", "--prune"])
+}
+
 /// Fast-forwards the branch checked out at `dir` to `tracking_ref`
 /// (`git merge --ff-only`). Errors if the merge is not a fast-forward.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
@@ -303,6 +311,13 @@ mod tests {
         let git = RecordingGit::new();
         fetch_refspec(&git, &root(), "origin", "pull/7/head").unwrap();
         assert_eq!(git.last(), ["fetch", "origin", "pull/7/head"]);
+    }
+
+    #[test]
+    fn fetch_all_prune_fetches_every_remote_with_prune() {
+        let git = RecordingGit::new();
+        fetch_all_prune(&git, &root()).unwrap();
+        assert_eq!(git.last(), ["fetch", "--all", "--prune"]);
     }
 
     #[test]
