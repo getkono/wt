@@ -222,9 +222,10 @@ These are the things worth knowing up front; the rest is discoverable from
   guard.
 - **Bulk-clean stale branches.** `wt prune --merged` removes worktrees whose branch
   is merged into the default branch, and `wt prune --gone` removes worktrees whose
-  upstream was deleted (plus any missing worktrees). Both also delete matching
-  **local branches that no longer have a worktree** — so a repo left with a pile of
-  merged feature branches gets cleaned up too. Preview with `--dry-run`. A `--gone`
+  upstream was deleted (plus any missing worktrees); `wt prune --all` (`-a`) does
+  both at once. Every mode also deletes matching **local branches that no longer
+  have a worktree** — so a repo left with a pile of merged feature branches gets
+  cleaned up too. Preview with `--dry-run`. A `--gone`
   branch that isn't also merged may hold unmerged commits, so it is skipped unless
   you pass `--force`. The current and default branches are never touched.
 

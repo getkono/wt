@@ -30,8 +30,8 @@ enum Candidate {
 
 /// Selects and removes prune candidates after confirmation (spec §7/§12).
 pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
-    if !args.merged && !args.gone {
-        return Err(Error::usage("prune requires --merged and/or --gone"));
+    if !args.includes_merged() && !args.includes_gone() {
+        return Err(Error::usage("prune requires --merged, --gone, or --all"));
     }
     let git = cx.git.clone();
     let git = git.as_ref();
@@ -138,9 +138,10 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 }
 
 /// Selects local branches that have no worktree but qualify for pruning: merged
-/// into the default branch (`--merged`) or with a gone upstream (`--gone`). The
-/// default branch and the current branch are never selected, and branches that
-/// already have a worktree are left to the worktree path.
+/// into the default branch (`--merged`), with a gone upstream (`--gone`), or
+/// either (`--all`). The default branch and the current branch are never
+/// selected, and branches that already have a worktree are left to the worktree
+/// path.
 fn branch_candidates(
     repo: &Repo,
     args: &PruneArgs,
@@ -161,7 +162,7 @@ fn branch_candidates(
             .is_some_and(|d| is_ancestor(repo.gix(), &branch_ref(&branch), d));
         let gone = upstream_of(repo.gix(), &branch).is_some_and(|u| u.is_gone);
         tracing::trace!(branch = %branch, merged, gone, "prune: branch classified");
-        if (args.merged && merged) || (args.gone && gone) {
+        if (args.includes_merged() && merged) || (args.includes_gone() && gone) {
             out.push(Candidate::Branch {
                 name: branch,
                 merged,
@@ -277,7 +278,7 @@ fn is_candidate(
     args: &PruneArgs,
     default: &Option<String>,
 ) -> bool {
-    if args.merged
+    if args.includes_merged()
         && let Some(branch) = &worktree.branch
         && let Some(default) = default
         // The default branch is an ancestor of itself; never prune a worktree
@@ -287,7 +288,7 @@ fn is_candidate(
     {
         return true;
     }
-    if args.gone && (worktree.is_missing || upstream_is_gone(repo, worktree)) {
+    if args.includes_gone() && (worktree.is_missing || upstream_is_gone(repo, worktree)) {
         return true;
     }
     false
@@ -345,8 +346,17 @@ mod tests {
         PruneArgs {
             merged,
             gone,
+            all: false,
             dry_run,
             force,
+        }
+    }
+
+    /// `--all` alone (no `--merged`/`--gone`), as a dry run.
+    fn all_dry_run() -> PruneArgs {
+        PruneArgs {
+            all: true,
+            ..prune_args(false, false, true, false)
         }
     }
 
@@ -561,6 +571,49 @@ mod tests {
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
         super::run(&mut t.cx, &prune_args(false, true, false, true), false).unwrap();
         assert!(repo.git(&["branch", "--list", "wip"]).trim().is_empty());
+    }
+
+    #[test]
+    fn all_selects_merged_and_gone() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old"); // merged only
+        diverged_branch(&repo, "wip"); // gone only
+        give_gone_upstream(&repo, "wip");
+        let report = |args: &PruneArgs| {
+            let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+            super::run(&mut t.cx, args, false).unwrap();
+            t.out.contents()
+        };
+        let all = report(&all_dry_run());
+        assert!(all.contains("would remove old (branch)"), "{all}");
+        assert!(all.contains("would remove wip (branch)"), "{all}");
+        // Same selection as `--merged --gone`; each mode alone picks only one.
+        assert_eq!(all, report(&prune_args(true, true, true, false)));
+        assert!(!report(&prune_args(true, false, true, false)).contains("wip"));
+        assert!(!report(&prune_args(false, true, true, false)).contains("old"));
+        // Nothing was removed.
+        assert!(repo.git(&["branch", "--list", "old"]).contains("old"));
+        assert!(repo.git(&["branch", "--list", "wip"]).contains("wip"));
+    }
+
+    #[test]
+    fn all_selects_merged_and_missing_worktrees() {
+        // `--all` covers both worktree paths: a merged worktree, and a missing
+        // one whose branch is unmerged (so only the `--gone` path selects it).
+        let repo = TestRepo::init();
+        make_wt(&repo, "done");
+        make_unmerged_wt(&repo, "lost");
+        std::fs::remove_dir_all(wt_dir(&repo, "lost")).unwrap();
+        let report = |args: &PruneArgs| {
+            let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+            super::run(&mut t.cx, args, false).unwrap();
+            t.out.contents()
+        };
+        let all = report(&all_dry_run());
+        assert!(all.contains("would remove done\n"), "{all}");
+        assert!(all.contains("would remove lost\n"), "{all}");
+        assert!(!report(&prune_args(true, false, true, false)).contains("lost"));
+        assert!(!report(&prune_args(false, true, true, false)).contains("done"));
     }
 
     #[test]

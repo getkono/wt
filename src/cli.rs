@@ -360,12 +360,27 @@ pub(crate) struct PruneArgs {
     /// Include worktrees whose upstream is gone, and missing worktrees.
     #[arg(long)]
     pub(crate) gone: bool,
+    /// Include both merged and gone candidates (same as `--merged --gone`).
+    #[arg(short = 'a', long)]
+    pub(crate) all: bool,
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
     /// Include dirty worktrees and force-delete unmerged branches (implies `--yes`).
     #[arg(long)]
     pub(crate) force: bool,
+}
+
+impl PruneArgs {
+    /// Whether merged candidates are selected (`--merged` or `--all`).
+    pub(crate) fn includes_merged(&self) -> bool {
+        self.merged || self.all
+    }
+
+    /// Whether gone candidates are selected (`--gone` or `--all`).
+    pub(crate) fn includes_gone(&self) -> bool {
+        self.gone || self.all
+    }
 }
 
 /// Arguments for `wt pr`.
@@ -807,6 +822,29 @@ mod tests {
         ));
         // `drop` takes no positional argument.
         assert!(parse(&["drop", "somequery"]).is_err());
+    }
+
+    #[test]
+    fn prune_all_parses_short_and_long() {
+        for flag in ["-a", "--all"] {
+            match parse(&["prune", flag]).unwrap().command {
+                Some(Command::Prune(a)) => {
+                    assert!(a.all);
+                    assert!(a.includes_merged() && a.includes_gone());
+                }
+                _ => panic!("expected prune for {flag}"),
+            }
+        }
+        // `--all` alongside a mode flag is redundant, not an error.
+        assert!(parse(&["prune", "-a", "--merged"]).is_ok());
+        // A single mode flag selects only that mode.
+        match parse(&["prune", "--gone"]).unwrap().command {
+            Some(Command::Prune(a)) => {
+                assert!(!a.includes_merged());
+                assert!(a.includes_gone());
+            }
+            _ => panic!("expected prune"),
+        }
     }
 
     #[test]
