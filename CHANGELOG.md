@@ -11,6 +11,17 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.7.0](https://github.com/getkono/wt/compare/v1.6.0...v1.7.0) - 2026-09-23
+
+### Added
+
+- *(prune)* make --all delete every branch recoverable from a remote
+- *(prune)* add -a/--all to select merged and gone candidates
+
+### Other
+
+- *(readme)* describe prune --pushed, --all, and the default fetch
+
 ## [1.6.0](https://github.com/getkono/wt/compare/v1.5.0...v1.6.0) - 2026-08-31
 
 ### Added
