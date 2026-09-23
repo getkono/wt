@@ -220,14 +220,25 @@ These are the things worth knowing up front; the rest is discoverable from
   current directory (from any depth), keeps the branch, and `cd`s you back to the
   main worktree. It refuses the primary worktree and honors the same `--force`
   guard.
-- **Bulk-clean stale branches.** `wt prune --merged` removes worktrees whose branch
-  is merged into the default branch, and `wt prune --gone` removes worktrees whose
-  upstream was deleted (plus any missing worktrees); `wt prune --all` (`-a`) does
-  both at once. Every mode also deletes matching **local branches that no longer
-  have a worktree** — so a repo left with a pile of merged feature branches gets
-  cleaned up too. Preview with `--dry-run`. A `--gone`
-  branch that isn't also merged may hold unmerged commits, so it is skipped unless
-  you pass `--force`. The current and default branches are never touched.
+- **Bulk-clean stale branches.** `wt prune --all` (`-a`) deletes every local branch
+  you can drop without losing a commit, meaning each of its commits is also on a
+  remote or on the default branch. It also removes worktrees whose work is
+  finished. You can pick the modes one at a time:
+  - `--merged`: worktrees and branches merged into the default branch, either the
+    local copy or `origin`'s.
+  - `--gone`: worktrees and branches whose upstream was deleted, plus any missing
+    worktrees.
+  - `--pushed`: branches (never worktrees) whose every commit is already on a
+    remote, such as an open PR's branch.
+
+  Every mode deletes matching **local branches that have no worktree**, so a pile of
+  old feature branches gets cleaned up too. Under `--all`, the branch of a removed
+  worktree goes with it. A branch holding commits that exist nowhere else is
+  skipped unless you pass `--force`. This includes a `--gone` branch that was never
+  merged. The modes that read remote state (`--gone`, `--pushed`, `--all`) run
+  `git fetch --all --prune` first, so "still on the remote" means the remote now.
+  Pass `--no-fetch` to trust the last fetch. Preview with `--dry-run`. The current
+  and default branches are never touched.
 
 ## Using wt as a library
 
