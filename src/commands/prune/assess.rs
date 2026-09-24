@@ -18,11 +18,10 @@ use crate::git::merged::is_content_merged;
 use crate::git::porcelain::RawWorktree;
 use crate::git::worktrees::in_progress_op;
 use crate::git::{
-    branch_ref, default_branch, default_tracking_ref, is_ancestor, local_branches, resolve_hex,
-    upstream_of,
+    branch_ref, default_branch, default_tracking_ref, is_ancestor, is_clean_for_removal,
+    local_branches, resolve_hex, upstream_of,
 };
 use crate::model::Worktree;
-use crate::worktree::guard_status;
 
 /// The refs work counts as merged into: the local default branch and, when
 /// `origin/HEAD` is set, its remote-tracking ref — so work merged on the remote
@@ -186,8 +185,6 @@ pub(super) struct Assessor<'a> {
     pub(super) repo: &'a Repo,
     pub(super) args: &'a PruneArgs,
     pub(super) targets: &'a MergeTargets,
-    /// Whether untracked files make a worktree dirty (`remove.untracked_blocks`).
-    pub(super) untracked_blocks: bool,
 }
 
 impl Assessor<'_> {
@@ -307,7 +304,15 @@ impl Assessor<'_> {
         if !self.args.locked && raw.is_locked {
             return Some(Block::Locked(raw.lock_reason.clone()));
         }
-        if !self.args.force && guard_status(worktree, self.untracked_blocks).dirty {
+        // Untracked files always count, whatever `remove.untracked_blocks` or
+        // the repository's status config says: removal passes `--force`
+        // (submodules and locks need it), so git would otherwise delete them —
+        // and a worktree prune selects on its own is not one the user named.
+        // A missing worktree has nothing on disk to lose.
+        if !self.args.force
+            && !worktree.is_missing
+            && !is_clean_for_removal(self.git, &worktree.path)
+        {
             return Some(Block::Dirty);
         }
         None

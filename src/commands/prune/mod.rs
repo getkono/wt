@@ -19,7 +19,9 @@ use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::porcelain::RawWorktree;
 use crate::git::worktrees::{in_progress_branch, in_progress_op};
-use crate::git::{branch_ref, current_branch, enumerate, local_branches, ops, status_of};
+use crate::git::{
+    branch_ref, current_branch, enumerate, is_clean_for_removal, local_branches, ops,
+};
 use crate::model::Worktree;
 use crate::worktree::{build_worktrees, lock_repo};
 
@@ -54,7 +56,6 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         repo: &session.repo,
         args,
         targets: &targets,
-        untracked_blocks: session.config.remove_untracked_blocks,
     };
 
     let mut verdicts: Vec<Verdict> = worktrees
@@ -248,8 +249,9 @@ fn remove_worktree(
         return Ok(false);
     }
     let path = worktree.path.to_string_lossy();
-    // `--force` because the guards above are the safety decision: git's own
-    // check also refuses untracked and ignored files, which the guard allows.
+    // `--force` because the guards above are the safety decision (untracked
+    // files included): git's own check also refuses a worktree with
+    // submodules, and a lock needs it twice.
     // For a missing worktree this drops just its admin entry — never a blanket
     // `git worktree prune`, which would also drop missing worktrees prune chose
     // to keep.
@@ -317,10 +319,10 @@ fn changed_since_assessed(
 }
 
 /// Whether a present worktree is still clean by the same rule as the selection
-/// guard. A failed status read counts as dirty, so the guard fails safe.
+/// guard (untracked files included). A failed status read counts as dirty, so
+/// the guard fails safe.
 fn still_clean(assessor: &Assessor<'_>, worktree: &Worktree) -> bool {
-    status_of(assessor.git, &worktree.path)
-        .is_ok_and(|s| !s.dirty && !(assessor.untracked_blocks && s.has_untracked))
+    is_clean_for_removal(assessor.git, &worktree.path)
 }
 
 /// Deletes one bare-branch candidate, returning whether it was deleted. Its
@@ -963,7 +965,6 @@ mod tests {
             repo: &r,
             args,
             targets: &targets,
-            untracked_blocks: false,
         };
         f(&assessor);
     }
@@ -1424,6 +1425,74 @@ mod tests {
             let why = super::changed_since_assessed(assessor, &row, None).unwrap();
             assert!(why.contains("uncommitted changes"), "{why}");
         });
+    }
+
+    #[test]
+    fn an_untracked_file_added_after_the_prompt_keeps_the_worktree() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "late-new");
+        let path = wt_dir(&repo, "late-new");
+        let row = row_for(&repo, "late-new");
+        let args = all_run();
+        std::fs::write(path.join("new.rs"), "fn main() {}\n").unwrap();
+        with_assessor(&repo, &args, |assessor| {
+            let why = super::changed_since_assessed(assessor, &row, None).unwrap();
+            assert!(why.contains("uncommitted changes"), "{why}");
+        });
+    }
+
+    #[test]
+    fn untracked_files_keep_a_selected_worktree_whatever_the_config() {
+        // `remove.untracked_blocks` defaults to false, but removal passes
+        // `--force`: prune's own guard is the only thing between git and these
+        // files, for every way a worktree can qualify. The repository also
+        // hides untracked files from `git status`, which must not matter.
+        let repo = TestRepo::init();
+        repo.git(&["config", "status.showUntrackedFiles", "no"]);
+        let detached = detached_wt(&repo, "fresh", "main");
+        std::fs::write(detached.join("newfile.rs"), "wip\n").unwrap();
+        make_unmerged_wt(&repo, "squashed");
+        give_upstream(&repo, "squashed");
+        squash_into_main(&repo, "squashed");
+        std::fs::write(wt_dir(&repo, "squashed").join("notes.md"), "wip\n").unwrap();
+        make_wt(&repo, "held");
+        let held = wt_dir(&repo, "held");
+        std::fs::write(held.join("scratch.txt"), "wip\n").unwrap();
+        repo.git(&["worktree", "lock", held.to_str().unwrap()]);
+
+        let (out, err) = report_both(
+            &repo,
+            &PruneArgs {
+                locked: true,
+                ..all_dry_run()
+            },
+        );
+        for name in ["detached-fresh", "squashed", "held"] {
+            assert!(!out.contains(name), "{out}");
+            assert!(
+                err.contains(&format!("{name}: uncommitted changes")),
+                "{err}"
+            );
+        }
+        let unlocked = PruneArgs {
+            locked: true,
+            ..all_run()
+        };
+        run_yes(&repo, &unlocked);
+        assert!(detached.join("newfile.rs").exists());
+        assert!(wt_dir(&repo, "squashed").join("notes.md").exists());
+        assert!(held.join("scratch.txt").exists());
+
+        // `--force` is the explicit override.
+        let forced = PruneArgs {
+            all: true,
+            locked: true,
+            ..prune_args(false, false, false, true)
+        };
+        run_yes(&repo, &forced);
+        assert!(!worktree_listed(&repo, "detached-fresh"));
+        assert!(!worktree_listed(&repo, "squashed"));
+        assert!(!worktree_listed(&repo, "held"));
     }
 
     /// The worktree row whose path ends with `suffix`.

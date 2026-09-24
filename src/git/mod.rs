@@ -38,5 +38,8 @@ pub(crate) use refs::{
 // Only the TUI reaches for this.
 #[cfg(feature = "tui")]
 pub(crate) use refs::origin_head_branch;
+// Only prune reaches for this.
+#[cfg(feature = "cli")]
+pub(crate) use status::is_clean_for_removal;
 pub(crate) use status::status_of;
 pub(crate) use worktrees::enumerate;

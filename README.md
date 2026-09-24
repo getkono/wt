@@ -248,6 +248,8 @@ These are the things worth knowing up front; the rest is discoverable from
   - A worktree with uncommitted changes, or a branch or detached worktree whose
     work exists nowhere else, is skipped unless you pass `--force`. A missing
     detached worktree counts, because its registration holds its only HEAD.
+    Untracked files always count as uncommitted changes here, whatever
+    `remove.untracked_blocks` says. Ignored files (build output) do not.
   - A locked worktree is skipped unless you pass `--locked`. Agent harnesses often
     lock their worktrees.
   - These are never removed: the worktree you're in, a worktree in the middle of a
