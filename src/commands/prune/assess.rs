@@ -120,6 +120,10 @@ pub(super) enum Block {
     /// The worktree's git state could not be read, so it fails safe. Never
     /// overridden.
     Unreadable,
+    /// A bare branch while some worktree's rebase or bisect state cannot be
+    /// read, so it may be the branch that operation returns to. Never
+    /// overridden.
+    HolderUnreadable,
     /// Locked, with its reason if one was given. Overridden by `--locked`.
     Locked(Option<String>),
     /// Uncommitted changes. Overridden by `--force`.
@@ -136,6 +140,7 @@ impl Block {
             Block::Current => "it is the current worktree".into(),
             Block::InProgress(op) => format!("{op} in progress"),
             Block::Unreadable => "cannot read its git state".into(),
+            Block::HolderUnreadable => "a worktree's rebase or bisect state cannot be read".into(),
             Block::Locked(Some(reason)) => format!("locked ({reason}); use --locked"),
             Block::Locked(None) => "locked; use --locked".into(),
             Block::Dirty => "uncommitted changes; use --force".into(),

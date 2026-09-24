@@ -77,20 +77,35 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         })
         .collect();
     // A branch being rebased or bisected is in use too, although its worktree
-    // is detached meanwhile and so names no branch.
+    // is detached meanwhile and so names no branch. When a worktree's state
+    // cannot be read, the branch it holds is unknown, so every bare branch is
+    // kept rather than trusting git to refuse the one in use.
+    let mut holder_unreadable = false;
+    let held: Vec<String> = worktrees
+        .iter()
+        .filter(|w| !w.is_missing)
+        .filter_map(|w| {
+            in_progress_branch(git, &w.path).unwrap_or_else(|error| {
+                tracing::warn!(target_wt = %w.path.display(), %error, "prune: cannot read in-progress branch");
+                holder_unreadable = true;
+                None
+            })
+        })
+        .collect();
     let worktree_branches: HashSet<String> = worktrees
         .iter()
         .enumerate()
         .filter(|(i, _)| !(args.all && removing.contains(i)))
         .filter_map(|(_, w)| w.branch.clone())
-        .chain(
-            worktrees
-                .iter()
-                .filter(|w| !w.is_missing)
-                .filter_map(|w| in_progress_branch(git, &w.path).ok().flatten()),
-        )
+        .chain(held)
         .collect();
-    verdicts.extend(assessor.branches(current.as_deref(), &worktree_branches)?);
+    let mut branch_verdicts = assessor.branches(current.as_deref(), &worktree_branches)?;
+    if holder_unreadable {
+        for verdict in &mut branch_verdicts {
+            verdict.block = Some(Block::HolderUnreadable);
+        }
+    }
+    verdicts.extend(branch_verdicts);
     let (candidates, skipped): (Vec<Verdict>, Vec<Verdict>) =
         verdicts.into_iter().partition(|v| v.block.is_none());
 
@@ -1700,6 +1715,31 @@ mod tests {
                 Some(super::Block::Unreadable.message())
             );
         });
+    }
+
+    #[test]
+    fn an_unreadable_worktree_keeps_every_bare_branch() {
+        // The branch its rebase or bisect would return to is unknown, so no
+        // bare branch is deleted on the strength of git refusing the held one.
+        let repo = TestRepo::init();
+        make_wt(&repo, "blind");
+        repo.git(&["branch", "done"]);
+        let mut t = crate::testutil::test_cx_with_git(
+            &[],
+            repo.root().to_str().unwrap(),
+            std::sync::Arc::new(BlindAdminDir),
+        );
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, &all_run(), false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.contains(
+                "skipping done (branch): a worktree's rebase or bisect state cannot be read"
+            ),
+            "{err}"
+        );
+        assert!(has_branch(&repo, "done"));
+        assert!(worktree_listed(&repo, "blind"));
     }
 
     #[test]

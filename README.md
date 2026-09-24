@@ -257,7 +257,9 @@ These are the things worth knowing up front; the rest is discoverable from
     lock their worktrees.
   - These are never removed: the worktree you're in, a worktree in the middle of a
     rebase, merge, cherry-pick, revert, or bisect (and the branch it will return
-    to), and the current and default branches.
+    to), and the current and default branches. If a worktree's git directory
+    cannot be found, prune cannot tell which branch it holds, so no branch
+    without a worktree is deleted on that run.
 
   Prune removes only what it lists. It no longer runs a blanket
   `git worktree prune`, so a missing worktree that no mode selects stays
