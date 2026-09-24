@@ -265,6 +265,11 @@ These are the things worth knowing up front; the rest is discoverable from
   `git worktree prune`, so a missing worktree that no mode selects stays
   registered.
 
+  A detached worktree is judged by where its HEAD is now. If you committed in
+  one and then moved HEAD back (say, `git checkout --detach main`), it qualifies,
+  and removing it deletes its HEAD reflog: commits reachable only from that
+  reflog are lost. Branch or tag them first.
+
   `--json` prints one line per item that would be removed, each with a `reason`
   (`merged`, `merged by content`, `upstream gone`, `missing`, or `pushed`).
 

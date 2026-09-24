@@ -381,9 +381,10 @@ pub(crate) struct PruneArgs {
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
-    /// Include dirty worktrees and force-delete branches whose work exists nowhere
-    /// else (implies `--yes`). Never overrides a lock or an in-progress rebase,
-    /// merge, cherry-pick, revert, or bisect.
+    /// Include dirty worktrees, and remove branches and detached worktrees whose
+    /// work exists nowhere else, orphaning those commits (implies `--yes`).
+    /// Never overrides a lock or an in-progress rebase, merge, cherry-pick,
+    /// revert, or bisect.
     #[arg(long)]
     pub(crate) force: bool,
 }
