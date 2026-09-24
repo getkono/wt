@@ -957,10 +957,19 @@ mod tests {
 
     /// Runs `f` with an [`super::Assessor`] over `repo` for `args`.
     fn with_assessor(repo: &TestRepo, args: &PruneArgs, f: impl FnOnce(&super::Assessor<'_>)) {
+        with_assessor_git(repo, args, &RealGit, f);
+    }
+
+    fn with_assessor_git(
+        repo: &TestRepo,
+        args: &PruneArgs,
+        git: &dyn crate::git::cli::GitCli,
+        f: impl FnOnce(&super::Assessor<'_>),
+    ) {
         let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
         let targets = super::MergeTargets::resolve(&r);
         let assessor = super::Assessor {
-            git: &RealGit,
+            git,
             root: repo.root(),
             repo: &r,
             args,
@@ -1628,6 +1637,69 @@ mod tests {
         let err = run_yes(&repo, &all_run());
         assert!(!err.contains("skipping"), "{err}");
         assert!(!worktree_listed(&repo, "detached-spent"));
+    }
+
+    /// Real git, except that a worktree whose path ends in `blind` cannot
+    /// resolve its admin directory — its in-progress state is unreadable.
+    struct BlindAdminDir;
+    impl crate::git::cli::GitCli for BlindAdminDir {
+        fn run_raw(
+            &self,
+            repo: &std::path::Path,
+            args: &[&str],
+        ) -> crate::error::Result<crate::git::cli::GitOutput> {
+            if args == ["rev-parse", "--absolute-git-dir"]
+                && repo.to_string_lossy().ends_with("blind")
+            {
+                return Ok(crate::git::cli::GitOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "fatal: unreadable".into(),
+                });
+            }
+            RealGit.run_raw(repo, args)
+        }
+    }
+
+    #[test]
+    fn a_worktree_whose_state_turns_unreadable_after_the_prompt_is_kept() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "blind");
+        let row = row_for(&repo, "blind");
+        let args = all_run();
+        with_assessor(&repo, &args, |assessor| {
+            assert_eq!(super::changed_since_assessed(assessor, &row, None), None);
+        });
+        with_assessor_git(&repo, &args, &BlindAdminDir, |assessor| {
+            let why = super::changed_since_assessed(assessor, &row, None);
+            assert_eq!(why, Some(super::Block::Unreadable.message()));
+        });
+    }
+
+    #[test]
+    fn a_missing_worktree_whose_path_cannot_be_checked_is_kept() {
+        // `git worktree remove --force` would delete whatever is at the path,
+        // so a path whose existence cannot be read is not treated as gone.
+        let repo = TestRepo::init();
+        make_wt(&repo, "offline");
+        let mut row = row_for(&repo, "offline");
+        let scratch = TestRepo::init();
+        let parent = scratch.root().join("mount");
+        row.path = parent.join("offline");
+        row.is_missing = true;
+        let args = all_run();
+        with_assessor(&repo, &args, |assessor| {
+            assert_eq!(super::changed_since_assessed(assessor, &row, None), None);
+        });
+        // A file where a directory should be: the lookup fails with ENOTDIR,
+        // not NotFound (and unlike a permission error, even for root).
+        std::fs::write(&parent, "not a directory\n").unwrap();
+        with_assessor(&repo, &args, |assessor| {
+            assert_eq!(
+                super::changed_since_assessed(assessor, &row, None),
+                Some(super::Block::Unreadable.message())
+            );
+        });
     }
 
     #[test]
