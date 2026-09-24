@@ -265,6 +265,9 @@ These are the things worth knowing up front; the rest is discoverable from
   `git worktree prune`, so a missing worktree that no mode selects stays
   registered.
 
+  `--json` prints one line per item that would be removed, each with a `reason`
+  (`merged`, `merged by content`, `upstream gone`, `missing`, or `pushed`).
+
 ## Using wt as a library
 
 Everything the CLI and TUI do sits on a worktree engine that is usable on its

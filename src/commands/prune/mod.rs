@@ -410,10 +410,17 @@ fn verdict_text(worktrees: &[Worktree], verdict: &Verdict) -> String {
 }
 
 /// A machine-readable (`--json`) line for a prune candidate. A worktree emits its
-/// full row; a bare branch emits a small object tagged `"kind": "branch"`.
+/// full row plus a `reason`; a bare branch emits a small object tagged
+/// `"kind": "branch"`.
 fn verdict_json(worktrees: &[Worktree], verdict: &Verdict) -> Result<String> {
     match &verdict.subject {
-        Subject::Worktree { index, .. } => worktrees[*index].to_json_line(),
+        Subject::Worktree { index, .. } => {
+            let mut row = serde_json::to_value(&worktrees[*index])?;
+            if let Some(fields) = row.as_object_mut() {
+                fields.insert("reason".into(), verdict.reason.label().into());
+            }
+            Ok(row.to_string())
+        }
         Subject::Branch { name, merged, safe } => Ok(serde_json::json!({
             "branch": name,
             "kind": "branch",
@@ -714,6 +721,8 @@ mod tests {
         assert_eq!(out.lines().count(), 1);
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(v["branch"], serde_json::json!("merged-wt"));
+        assert_eq!(v["reason"], serde_json::json!("merged"));
+        assert_eq!(v["schema_version"], serde_json::json!(1));
         // --json implies dry-run: still present.
         assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
     }
