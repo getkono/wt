@@ -72,9 +72,9 @@ pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target:
 }
 
 /// `-c` overrides for the content check's `merge-tree`: every custom merge
-/// driver configured for `dir`, and the built-in `union` driver, made to fail,
-/// and `merge.default` pinned to `text`. `None` when the configuration cannot
-/// be read (which the caller treats as "not merged").
+/// driver configured for `dir` made to fail, the built-in `union` driver made
+/// a plain text merge, and `merge.default` pinned to `text`. `None` when the
+/// configuration cannot be read (which the caller treats as "not merged").
 ///
 /// A custom driver decides a file's merge however it likes — `merge=ours` keeps
 /// the target's side outright — so it can make work that never landed merge as
@@ -83,8 +83,11 @@ pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target:
 /// a conflict and can hide a deletion the same way, whether a `merge=union`
 /// attribute or `merge.default=union` selects it. It has no config key to find,
 /// but git looks up a configured `merge.union.driver` before its built-ins, so
-/// it is always overridden; `merge.default` is pinned as well. `text` must stay
-/// usable, and `binary` already conflicts.
+/// it is always overridden — with `git merge-file`, git's own text merge, so a
+/// conflict still conflicts while a `union` file (typically a changelog) whose
+/// edits both sides made cleanly still merges. It comes after any user
+/// `merge.union.driver` found above, so it wins. `merge.default` is pinned as
+/// well. `text` must stay usable, and `binary` already conflicts.
 fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
     let out = git
         .run_raw(
@@ -110,7 +113,7 @@ fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
         .filter(|key| !key.is_empty())
         .map(|key| (!key.contains('=')).then(|| format!("{key}=exit 1")))
         .collect::<Option<_>>()?;
-    overrides.push("merge.union.driver=exit 1".into());
+    overrides.push("merge.union.driver=git merge-file --marker-size=%L %A %O %B".into());
     overrides.push("merge.default=text".into());
     Some(overrides)
 }
@@ -339,6 +342,45 @@ mod tests {
         topic(&repo, "feat", &[("a.txt", "a\n")]);
         squash(&repo, "feat");
         assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_union_file_both_sides_edited_cleanly_is_merged() {
+        // The usual `union` changelog: the branch's entry was squashed in,
+        // then main added another elsewhere. A text merge is clean and a
+        // no-op, so the branch still counts as merged.
+        let repo = TestRepo::init();
+        repo.write(".gitattributes", "CHANGELOG.md merge=union\n");
+        repo.write("CHANGELOG.md", "# log\n\none\n\ntwo\n\nthree\n");
+        repo.commit_all("changelog");
+        topic(
+            &repo,
+            "feat",
+            &[("CHANGELOG.md", "# log\nfeat\n\none\n\ntwo\n\nthree\n")],
+        );
+        squash(&repo, "feat");
+        repo.write(
+            "CHANGELOG.md",
+            "# log\nfeat\n\none\n\ntwo\n\nthree\nlater\n",
+        );
+        repo.commit_all("main adds an entry");
+        assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_user_union_driver_is_still_overridden() {
+        // A configured `merge.union.driver` is found by the scan and set to
+        // fail, then replaced by the text merge; either way the deletion
+        // conflicts.
+        let repo = TestRepo::init();
+        repo.git(&["config", "merge.union.driver", "true"]);
+        repo.write(".gitattributes", "f.txt merge=union\n");
+        repo.write("f.txt", "a\nb\nc\n");
+        repo.commit_all("f");
+        topic(&repo, "del", &[("f.txt", "a\nc\n")]);
+        repo.write("f.txt", "a\nB\nc\n");
+        repo.commit_all("main edits b");
+        assert!(!merged(&repo, "del"));
     }
 
     #[test]
