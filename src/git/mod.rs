@@ -2,6 +2,7 @@
 //! network operations. Submodules:
 //!
 //! - [`cli`] — the [`GitCli`] subprocess trait + [`RealGit`].
+//! - `merged` — content-level merge detection (squash and rebase merges).
 //! - `ops` — verb-named wrappers over [`GitCli`] for shared mutations.
 //! - [`discover`] — repository discovery and identity via `gix`.
 //! - [`porcelain`] — pure parsers for `git` porcelain output.
@@ -12,6 +13,7 @@ pub mod aheadbehind;
 pub mod cli;
 pub mod commit;
 pub mod discover;
+pub(crate) mod merged;
 pub(crate) mod ops;
 pub mod porcelain;
 pub mod refs;

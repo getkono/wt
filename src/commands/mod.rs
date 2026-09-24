@@ -37,7 +37,7 @@ use crate::worktree::{CreatedWorktree, HookOutcome, Workspace, WorkspaceParts, b
 
 // Path/template helpers shared with the service layer, re-exported so command
 // modules keep their historical import paths.
-pub(crate) use crate::worktree::{resolve_target, rollback_worktree, run_best_effort, same_path};
+pub(crate) use crate::worktree::{resolve_target, rollback_worktree, same_path};
 
 /// A discovered repository plus its resolved configuration, set up once per
 /// repo-scoped command.

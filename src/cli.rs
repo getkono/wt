@@ -354,28 +354,36 @@ pub(crate) struct DropArgs {
 /// Arguments for `wt prune`.
 #[derive(Debug, Args)]
 pub(crate) struct PruneArgs {
-    /// Include worktrees and branches merged into the default branch (local or
-    /// its `origin` tracking ref).
+    /// Include worktrees (detached ones too) and branches merged into the default
+    /// branch (local or its `origin` tracking ref), by ancestry or by content — a
+    /// squash or rebase merge counts.
     #[arg(long)]
     pub(crate) merged: bool,
     /// Include worktrees and branches whose upstream is gone, and missing worktrees.
     #[arg(long)]
     pub(crate) gone: bool,
-    /// Include branches (not worktrees) whose every commit is on a remote or the
-    /// default branch.
+    /// Include branches without a worktree, and detached worktrees, whose every
+    /// commit is on a remote or the default branch.
     #[arg(long)]
     pub(crate) pushed: bool,
-    /// Include everything deletable without losing a commit: merged and gone
-    /// worktrees, plus every merged, pushed, or gone branch whose commits survive.
+    /// Include everything deletable without losing work: merged, gone, and pushed
+    /// candidates, where a branch counts as safe when its commits are on a remote
+    /// or its changes are already in the default branch.
     #[arg(short = 'a', long)]
     pub(crate) all: bool,
+    /// Also remove locked worktrees (`git worktree remove --force --force`).
+    /// Without it they are listed and skipped.
+    #[arg(long)]
+    pub(crate) locked: bool,
     /// Trust the last fetch instead of running `git fetch --all --prune` first.
     #[arg(long = "no-fetch")]
     pub(crate) no_fetch: bool,
     /// Report candidates without removing anything.
     #[arg(long = "dry-run")]
     pub(crate) dry_run: bool,
-    /// Include dirty worktrees and force-delete unmerged branches (implies `--yes`).
+    /// Include dirty worktrees and force-delete branches whose work exists nowhere
+    /// else (implies `--yes`). Never overrides a lock or an in-progress rebase,
+    /// merge, cherry-pick, revert, or bisect.
     #[arg(long)]
     pub(crate) force: bool,
 }
@@ -884,6 +892,10 @@ mod tests {
         assert!(!prune(&["prune", "--merged"]).needs_fetch());
         assert!(!prune(&["prune", "--all", "--no-fetch"]).needs_fetch());
         assert!(!prune(&["prune", "--pushed", "--no-fetch"]).needs_fetch());
+        // `--locked` is its own opt-in, separate from `--force`.
+        let locked = prune(&["prune", "-a", "--locked"]);
+        assert!(locked.locked && !locked.force);
+        assert!(!prune(&["prune", "-a"]).locked);
     }
 
     #[test]
