@@ -80,14 +80,14 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     // is detached meanwhile and so names no branch. When a worktree's state
     // cannot be read, the branch it holds is unknown, so every bare branch is
     // kept rather than trusting git to refuse the one in use.
-    let mut holder_unreadable = false;
+    let mut unreadable_holders: Vec<String> = Vec::new();
     let held: Vec<String> = worktrees
         .iter()
         .filter(|w| !w.is_missing)
         .filter_map(|w| {
             in_progress_branch(git, &w.path).unwrap_or_else(|error| {
                 tracing::warn!(target_wt = %w.path.display(), %error, "prune: cannot read in-progress branch");
-                holder_unreadable = true;
+                unreadable_holders.push(candidate_label(w));
                 None
             })
         })
@@ -100,9 +100,10 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         .chain(held)
         .collect();
     let mut branch_verdicts = assessor.branches(current.as_deref(), &worktree_branches)?;
-    if holder_unreadable {
+    if !unreadable_holders.is_empty() {
+        let holders = unreadable_holders.join(", ");
         for verdict in &mut branch_verdicts {
-            verdict.block = Some(Block::HolderUnreadable);
+            verdict.block = Some(Block::HolderUnreadable(holders.clone()));
         }
     }
     verdicts.extend(branch_verdicts);
@@ -1742,9 +1743,7 @@ mod tests {
         super::run(&mut t.cx, &all_run(), false).unwrap();
         let err = t.err.contents();
         assert!(
-            err.contains(
-                "skipping done (branch): a worktree's rebase or bisect state cannot be read"
-            ),
+            err.contains("skipping done (branch): cannot read the rebase or bisect state of blind"),
             "{err}"
         );
         assert!(has_branch(&repo, "done"));
