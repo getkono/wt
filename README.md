@@ -221,24 +221,56 @@ These are the things worth knowing up front; the rest is discoverable from
   main worktree. It refuses the primary worktree and honors the same `--force`
   guard.
 - **Bulk-clean stale branches.** `wt prune --all` (`-a`) deletes every local branch
-  you can drop without losing a commit, meaning each of its commits is also on a
-  remote or on the default branch. It also removes worktrees whose work is
-  finished. You can pick the modes one at a time:
+  you can drop without losing work. Each of its commits must be on a remote or on
+  the default branch, or its changes must already be in the default branch under
+  other commits (a squash or rebase merge). It also removes worktrees whose work is
+  finished, including detached-HEAD ones. You can pick the modes one at a time:
   - `--merged`: worktrees and branches merged into the default branch, either the
-    local copy or `origin`'s.
+    local copy or `origin`'s. A branch counts as merged when it is an ancestor of
+    the default branch, or when merging it would change nothing. That covers
+    squash merges, rebase merges, work split across several PRs, and branches made
+    only of merges. A branch whose own commits add up to no change is never
+    merged by content. Custom merge drivers from `.gitattributes` (such as
+    `merge=ours`) are disabled for this check, so a file one governs reads as not
+    merged. `merge=union` files and `merge.default` are merged as plain text.
+    The content check needs git ≥ 2.38. On older git only ancestry counts.
   - `--gone`: worktrees and branches whose upstream was deleted, plus any missing
     worktrees.
-  - `--pushed`: branches (never worktrees) whose every commit is already on a
-    remote, such as an open PR's branch.
+  - `--pushed`: branches without a worktree, and detached worktrees, whose every
+    commit is already on a remote, such as an open PR's branch. A worktree with a
+    branch checked out counts as active work and is left alone.
 
   Every mode deletes matching **local branches that have no worktree**, so a pile of
   old feature branches gets cleaned up too. Under `--all`, the branch of a removed
-  worktree goes with it. A branch holding commits that exist nowhere else is
-  skipped unless you pass `--force`. This includes a `--gone` branch that was never
-  merged. The modes that read remote state (`--gone`, `--pushed`, `--all`) run
-  `git fetch --all --prune` first, so "still on the remote" means the remote now.
-  Pass `--no-fetch` to trust the last fetch. Preview with `--dry-run`. The current
-  and default branches are never touched.
+  worktree goes with it. The modes that read remote state (`--gone`, `--pushed`,
+  `--all`) run `git fetch --all --prune` first, so "still on the remote" means the
+  remote now. Pass `--no-fetch` to trust the last fetch. Preview with `--dry-run`.
+
+  Anything that qualifies but is kept is listed as `skipping <name>: <why>`:
+  - A worktree with uncommitted changes, or a branch or detached worktree whose
+    work exists nowhere else, is skipped unless you pass `--force`. A missing
+    detached worktree counts, because its registration holds its only HEAD.
+    Untracked files always count as uncommitted changes here, whatever
+    `remove.untracked_blocks` says. Ignored files (build output) do not.
+  - A locked worktree is skipped unless you pass `--locked`. Agent harnesses often
+    lock their worktrees.
+  - These are never removed: the worktree you're in, a worktree in the middle of a
+    rebase, merge, cherry-pick, revert, or bisect (and the branch it will return
+    to), and the current and default branches. If a worktree's git directory
+    cannot be found, prune cannot tell which branch it holds, so no branch
+    without a worktree is deleted on that run.
+
+  Prune removes only what it lists. It no longer runs a blanket
+  `git worktree prune`, so a missing worktree that no mode selects stays
+  registered.
+
+  A detached worktree is judged by where its HEAD is now. If you committed in
+  one and then moved HEAD back (say, `git checkout --detach main`), it qualifies,
+  and removing it deletes its HEAD reflog: commits reachable only from that
+  reflog are lost. Branch or tag them first.
+
+  `--json` prints one line per item that would be removed, each with a `reason`
+  (`merged`, `merged by content`, `upstream gone`, `missing`, or `pushed`).
 
 ## Using wt as a library
 

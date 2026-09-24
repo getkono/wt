@@ -20,6 +20,8 @@ pub(crate) struct RawWorktree {
     pub(crate) is_detached: bool,
     /// Whether the worktree is locked.
     pub(crate) is_locked: bool,
+    /// The reason given when the worktree was locked, if any.
+    pub(crate) lock_reason: Option<String>,
     /// Whether Git considers the worktree prunable.
     pub(crate) is_prunable: bool,
     /// Whether this is the main (first) worktree.
@@ -38,6 +40,7 @@ impl RawWorktree {
             is_bare: false,
             is_detached: false,
             is_locked: false,
+            lock_reason: None,
             is_prunable: false,
             is_main: false,
             is_missing: false,
@@ -92,6 +95,7 @@ pub(crate) fn parse_worktree_list(porcelain: &str) -> Vec<RawWorktree> {
             "locked" => {
                 if let Some(wt) = current.as_mut() {
                     wt.is_locked = true;
+                    wt.lock_reason = rest.map(str::to_string).filter(|r| !r.is_empty());
                 }
             }
             "prunable" => {
@@ -263,7 +267,9 @@ mod tests {
         assert!(wts[1].is_detached);
         assert!(wts[1].branch.is_none());
         assert!(wts[2].is_locked);
+        assert_eq!(wts[2].lock_reason.as_deref(), Some("being used"));
         assert_eq!(wts[2].branch.as_deref(), Some("x"));
+        assert!(!wts[1].is_locked && wts[1].lock_reason.is_none());
         assert!(wts[3].is_prunable);
     }
 

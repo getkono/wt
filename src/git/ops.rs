@@ -63,9 +63,14 @@ pub(crate) fn worktree_remove(
     root: &Path,
     path: &str,
     force: bool,
+    unlock: bool,
 ) -> Result<String> {
     let mut argv = vec!["worktree", "remove"];
-    if force {
+    if force || unlock {
+        argv.push("--force");
+    }
+    // Git refuses a locked worktree unless `--force` is given twice.
+    if unlock {
         argv.push("--force");
     }
     argv.push(path);
@@ -260,10 +265,25 @@ mod tests {
     #[test]
     fn worktree_remove_adds_force_flag_only_when_asked() {
         let git = RecordingGit::new();
-        worktree_remove(&git, &root(), "/wt/x", false).unwrap();
+        worktree_remove(&git, &root(), "/wt/x", false, false).unwrap();
         assert_eq!(git.last(), ["worktree", "remove", "/wt/x"]);
-        worktree_remove(&git, &root(), "/wt/x", true).unwrap();
+        worktree_remove(&git, &root(), "/wt/x", true, false).unwrap();
         assert_eq!(git.last(), ["worktree", "remove", "--force", "/wt/x"]);
+    }
+
+    #[test]
+    fn worktree_remove_forces_twice_to_override_a_lock() {
+        let git = RecordingGit::new();
+        worktree_remove(&git, &root(), "/wt/x", false, true).unwrap();
+        assert_eq!(
+            git.last(),
+            ["worktree", "remove", "--force", "--force", "/wt/x"]
+        );
+        worktree_remove(&git, &root(), "/wt/x", true, true).unwrap();
+        assert_eq!(
+            git.last(),
+            ["worktree", "remove", "--force", "--force", "/wt/x"]
+        );
     }
 
     #[test]
