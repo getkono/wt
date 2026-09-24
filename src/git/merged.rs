@@ -72,15 +72,19 @@ pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target:
 }
 
 /// `-c` overrides for the content check's `merge-tree`: every custom merge
-/// driver configured for `dir` made to fail, and `merge.default` pinned to
-/// `text`. `None` when the configuration cannot be read (which the caller
-/// treats as "not merged").
+/// driver configured for `dir`, and the built-in `union` driver, made to fail,
+/// and `merge.default` pinned to `text`. `None` when the configuration cannot
+/// be read (which the caller treats as "not merged").
 ///
 /// A custom driver decides a file's merge however it likes — `merge=ours` keeps
 /// the target's side outright — so it can make work that never landed merge as
 /// a no-op. Failing it turns every file it governs into a conflict: "not
-/// merged", the safe direction. `merge.default=union` would keep both sides of
-/// a conflict and can hide a deletion the same way, so the default is pinned.
+/// merged", the safe direction. The built-in `union` driver keeps both sides of
+/// a conflict and can hide a deletion the same way, whether a `merge=union`
+/// attribute or `merge.default=union` selects it. It has no config key to find,
+/// but git looks up a configured `merge.union.driver` before its built-ins, so
+/// it is always overridden; `merge.default` is pinned as well. `text` must stay
+/// usable, and `binary` already conflicts.
 fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
     let out = git
         .run_raw(
@@ -106,6 +110,7 @@ fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
         .filter(|key| !key.is_empty())
         .map(|key| (!key.contains('=')).then(|| format!("{key}=exit 1")))
         .collect::<Option<_>>()?;
+    overrides.push("merge.union.driver=exit 1".into());
     overrides.push("merge.default=text".into());
     Some(overrides)
 }
@@ -309,6 +314,31 @@ mod tests {
         repo.write("f.txt", "a\nB\nc\n");
         repo.commit_all("main edits b");
         assert!(!merged(&repo, "del"));
+    }
+
+    #[test]
+    fn a_union_attribute_cannot_make_unlanded_work_merged() {
+        // The built-in `union` driver, picked by `.gitattributes` rather than
+        // config, resolves main's edit of `b` against the branch's deletion of
+        // it to main's own tree.
+        let repo = TestRepo::init();
+        repo.write(".gitattributes", "f.txt merge=union\n");
+        repo.write("f.txt", "a\nb\nc\n");
+        repo.commit_all("f");
+        topic(&repo, "del", &[("f.txt", "a\nc\n")]);
+        repo.write("f.txt", "a\nB\nc\n");
+        repo.commit_all("main edits b");
+        assert!(!merged(&repo, "del"));
+    }
+
+    #[test]
+    fn a_union_attribute_on_untouched_paths_leaves_real_merges_alone() {
+        let repo = TestRepo::init();
+        repo.write(".gitattributes", "CHANGELOG.md merge=union\n");
+        repo.commit_all("attributes");
+        topic(&repo, "feat", &[("a.txt", "a\n")]);
+        squash(&repo, "feat");
+        assert!(merged(&repo, "feat"));
     }
 
     #[test]
