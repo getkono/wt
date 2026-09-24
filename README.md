@@ -230,8 +230,10 @@ These are the things worth knowing up front; the rest is discoverable from
     the default branch, or when merging it would change nothing. That covers
     squash merges, rebase merges, work split across several PRs, and branches made
     only of merges. A branch whose own commits add up to no change is never
-    merged by content. The content check needs git ≥ 2.38. On older git only
-    ancestry counts.
+    merged by content. Custom merge drivers from `.gitattributes` (such as
+    `merge=ours`) are disabled for this check, so a file one governs reads as not
+    merged, and `merge.default` is treated as `text`. The content check needs git ≥ 2.38. On older git only ancestry
+    counts.
   - `--gone`: worktrees and branches whose upstream was deleted, plus any missing
     worktrees.
   - `--pushed`: branches without a worktree, and detached worktrees, whose every

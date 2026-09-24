@@ -42,10 +42,20 @@ pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target:
     if !changes_anything(git, dir, tip, target) {
         return false;
     }
-    match git.run_raw(
-        dir,
-        &["merge-tree", "--write-tree", "--no-messages", target, tip],
-    ) {
+    let Some(overrides) = driver_overrides(git, dir) else {
+        tracing::debug!(
+            tip,
+            target,
+            "merge drivers unreadable: content check skipped"
+        );
+        return false;
+    };
+    let mut argv: Vec<&str> = Vec::new();
+    for o in &overrides {
+        argv.extend(["-c", o.as_str()]);
+    }
+    argv.extend(["merge-tree", "--write-tree", "--no-messages", target, tip]);
+    match git.run_raw(dir, &argv) {
         Ok(out) if out.success => out.stdout.lines().next().map(str::trim) == Some(expected.trim()),
         Ok(out) => {
             // Exit 1 is a conflict; anything else (an old git, unrelated
@@ -59,6 +69,45 @@ pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target:
             false
         }
     }
+}
+
+/// `-c` overrides for the content check's `merge-tree`: every custom merge
+/// driver configured for `dir` made to fail, and `merge.default` pinned to
+/// `text`. `None` when the configuration cannot be read (which the caller
+/// treats as "not merged").
+///
+/// A custom driver decides a file's merge however it likes — `merge=ours` keeps
+/// the target's side outright — so it can make work that never landed merge as
+/// a no-op. Failing it turns every file it governs into a conflict: "not
+/// merged", the safe direction. `merge.default=union` would keep both sides of
+/// a conflict and can hide a deletion the same way, so the default is pinned.
+fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
+    let out = git
+        .run_raw(
+            dir,
+            &[
+                "config",
+                "-z",
+                "--name-only",
+                "--get-regexp",
+                r"^merge\..+\.driver$",
+            ],
+        )
+        .ok()?;
+    // Exit 1 with no output is "no such key"; anything else is a read failure.
+    if !out.success && !(out.stdout.is_empty() && out.stderr.trim().is_empty()) {
+        return None;
+    }
+    // A driver name git's `-c` would split wrongly cannot be overridden, so
+    // one fails the whole check.
+    let mut overrides: Vec<String> = out
+        .stdout
+        .split('\0')
+        .filter(|key| !key.is_empty())
+        .map(|key| (!key.contains('=')).then(|| format!("{key}=exit 1")))
+        .collect::<Option<_>>()?;
+    overrides.push("merge.default=text".into());
+    Some(overrides)
 }
 
 /// Whether `tip`'s tree differs from the tree of its merge base with `target`
@@ -215,6 +264,75 @@ mod tests {
         repo.write("other.txt", "o\n");
         repo.commit_all("main moves on");
         assert!(!merged(&repo, "empty"));
+    }
+
+    /// Configures an `ours` merge driver for `CHANGELOG.md`, the documented
+    /// "keep my side" recipe.
+    fn keep_ours_changelog(repo: &TestRepo) {
+        repo.git(&["config", "merge.ours.driver", "true"]);
+        repo.write(".gitattributes", "CHANGELOG.md merge=ours\n");
+        repo.write("CHANGELOG.md", "# Changelog\n");
+        repo.commit_all("changelog");
+    }
+
+    #[test]
+    fn a_custom_merge_driver_cannot_make_unlanded_work_merged() {
+        // The driver resolves the branch's CHANGELOG edit to main's side, so a
+        // plain merge-tree writes main's tree — though the notes are nowhere
+        // in main.
+        let repo = TestRepo::init();
+        keep_ours_changelog(&repo);
+        topic(&repo, "notes", &[("CHANGELOG.md", "# Changelog\nnotes\n")]);
+        repo.write("CHANGELOG.md", "# Changelog\nmain\n");
+        repo.commit_all("main edits the changelog");
+        assert!(!merged(&repo, "notes"));
+    }
+
+    #[test]
+    fn a_custom_driver_on_untouched_paths_leaves_real_merges_alone() {
+        let repo = TestRepo::init();
+        keep_ours_changelog(&repo);
+        topic(&repo, "feat", &[("a.txt", "a\n")]);
+        squash(&repo, "feat");
+        assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_union_default_cannot_make_unlanded_work_merged() {
+        // `union` keeps both sides of a conflict: main's edit of `b` plus
+        // nothing from the branch's deletion of it, which is main's own tree.
+        let repo = TestRepo::init();
+        repo.git(&["config", "merge.default", "union"]);
+        repo.write("f.txt", "a\nb\nc\n");
+        repo.commit_all("f");
+        topic(&repo, "del", &[("f.txt", "a\nc\n")]);
+        repo.write("f.txt", "a\nB\nc\n");
+        repo.commit_all("main edits b");
+        assert!(!merged(&repo, "del"));
+    }
+
+    #[test]
+    fn unreadable_driver_config_is_not_merged() {
+        // A config git refuses to parse fails the check rather than skipping
+        // the driver overrides.
+        let repo = TestRepo::init();
+        topic(&repo, "feat", &[("a.txt", "a\n")]);
+        squash(&repo, "feat");
+        assert!(merged(&repo, "feat"));
+        let config = repo.root().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[broken\n");
+        std::fs::write(&config, text).unwrap();
+        assert!(!merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_driver_name_that_cannot_be_overridden_fails_safe() {
+        let repo = TestRepo::init();
+        repo.git(&["config", "merge.a=b.driver", "true"]);
+        topic(&repo, "feat", &[("a.txt", "a\n")]);
+        squash(&repo, "feat");
+        assert!(!merged(&repo, "feat"));
     }
 
     #[test]
