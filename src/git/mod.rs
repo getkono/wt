@@ -2,6 +2,7 @@
 //! network operations. Submodules:
 //!
 //! - [`cli`] — the [`GitCli`] subprocess trait + [`RealGit`].
+//! - `merged` — content-level merge detection (squash and rebase merges).
 //! - `ops` — verb-named wrappers over [`GitCli`] for shared mutations.
 //! - [`discover`] — repository discovery and identity via `gix`.
 //! - [`porcelain`] — pure parsers for `git` porcelain output.
@@ -12,6 +13,7 @@ pub mod aheadbehind;
 pub mod cli;
 pub mod commit;
 pub mod discover;
+pub(crate) mod merged;
 pub(crate) mod ops;
 pub mod porcelain;
 pub mod refs;
@@ -36,5 +38,8 @@ pub(crate) use refs::{
 // Only the TUI reaches for this.
 #[cfg(feature = "tui")]
 pub(crate) use refs::origin_head_branch;
+// Only prune reaches for this.
+#[cfg(feature = "cli")]
+pub(crate) use status::is_clean_for_removal;
 pub(crate) use status::status_of;
 pub(crate) use worktrees::enumerate;

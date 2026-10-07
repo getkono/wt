@@ -70,6 +70,26 @@ pub(crate) fn status_of(git: &dyn GitCli, worktree_dir: &Path) -> Result<StatusS
     Ok(parse_status_porcelain(&output))
 }
 
+/// Whether the worktree at `worktree_dir` has no tracked changes and no
+/// untracked files, read with the flags pinned so the repository's own config
+/// (`status.showUntrackedFiles`, `diff.ignoreSubmodules`, a submodule's
+/// `ignore`) cannot hide either. For guards that decide whether a forced
+/// removal may delete the directory; a failed read counts as not clean.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn is_clean_for_removal(git: &dyn GitCli, worktree_dir: &Path) -> bool {
+    git.run(
+        worktree_dir,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ],
+    )
+    .is_ok_and(|out| out.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +172,22 @@ mod tests {
         let s = status_of(&RealGit, repo.root()).unwrap();
         assert!(s.dirty);
         assert!(s.has_untracked);
+    }
+
+    #[test]
+    fn clean_for_removal_ignores_config_that_hides_untracked_files() {
+        let repo = TestRepo::init();
+        assert!(is_clean_for_removal(&RealGit, repo.root()));
+        repo.git(&["config", "status.showUntrackedFiles", "no"]);
+        repo.write("scratch.txt", "x\n");
+        assert!(!is_clean_for_removal(&RealGit, repo.root()));
+        repo.write(".gitignore", "scratch.txt\n");
+        repo.commit_all("ignore scratch");
+        // Ignored files are not the guard's concern.
+        assert!(is_clean_for_removal(&RealGit, repo.root()));
+        assert!(!is_clean_for_removal(
+            &RealGit,
+            &repo.root().join("no-such-dir")
+        ));
     }
 }

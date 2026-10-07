@@ -958,6 +958,7 @@ pub(crate) fn remove_in(
         ws.root,
         &path,
         options.force_remove || needs_submodule_force,
+        false,
     )?;
 
     let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);

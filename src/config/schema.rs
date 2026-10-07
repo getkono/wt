@@ -194,7 +194,8 @@ pub struct Config {
     pub editor: Option<String>,
     /// Delete a wt-created branch on `remove` if fully merged.
     pub remove_delete_merged_branch: bool,
-    /// Whether untracked files count as dirty for remove/prune guards.
+    /// Whether untracked files count as dirty for the remove guard. Prune always
+    /// counts them.
     pub remove_untracked_blocks: bool,
     /// Remote used for PR fetches.
     pub pr_default_remote: String,
