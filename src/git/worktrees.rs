@@ -64,15 +64,25 @@ pub(crate) fn in_progress_op(git: &dyn GitCli, worktree: &Path) -> Result<Option
 /// The local branch an in-progress rebase or bisect in the worktree at
 /// `worktree` will return to, if any. Mid-operation the worktree is detached,
 /// so `git worktree list` no longer names that branch — yet it is still in use.
+/// An absent state file means no such operation; any other read failure (a
+/// permission error, a file that is not UTF-8) is an error, so a caller can
+/// fail safe rather than take the branch for unused.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn in_progress_branch(git: &dyn GitCli, worktree: &Path) -> Result<Option<String>> {
     let git_dir = admin_dir(git, worktree)?;
-    Ok(IN_PROGRESS_BRANCH_FILES.iter().find_map(|file| {
-        let name = std::fs::read_to_string(git_dir.join(file)).ok()?;
-        let name = name.trim();
+    for file in IN_PROGRESS_BRANCH_FILES {
+        let contents = match std::fs::read_to_string(git_dir.join(file)) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let name = contents.trim();
         let name = name.strip_prefix("refs/heads/").unwrap_or(name);
-        (!name.is_empty()).then(|| name.to_string())
-    }))
+        if !name.is_empty() {
+            return Ok(Some(name.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -169,6 +179,25 @@ mod tests {
             Some("main")
         );
         assert!(in_progress_branch(&RealGit, Path::new("/nonexistent/wt")).is_err());
+    }
+
+    #[test]
+    fn in_progress_branch_errors_when_a_state_file_cannot_be_read() {
+        let repo = TestRepo::init();
+        let admin = RealGit
+            .run(repo.root(), &["rev-parse", "--absolute-git-dir"])
+            .unwrap();
+        let rebase = Path::new(admin.trim()).join("rebase-merge");
+        std::fs::create_dir(&rebase).unwrap();
+        // No `head-name` yet: nothing is held.
+        assert_eq!(in_progress_branch(&RealGit, repo.root()).unwrap(), None);
+        // A directory where the file should be cannot be read as one.
+        std::fs::create_dir(rebase.join("head-name")).unwrap();
+        assert!(in_progress_branch(&RealGit, repo.root()).is_err());
+        std::fs::remove_dir(rebase.join("head-name")).unwrap();
+        // Nor can a name that is not UTF-8.
+        std::fs::write(rebase.join("head-name"), b"refs/heads/\xff\xfe").unwrap();
+        assert!(in_progress_branch(&RealGit, repo.root()).is_err());
     }
 
     #[test]
