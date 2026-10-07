@@ -11,6 +11,33 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.8.0](https://github.com/getkono/wt/compare/v1.7.0...v1.8.0) - 2026-10-07
+
+### Added
+
+- *(prune)* give --json worktree rows a reason
+- *(prune)* judge detached, locked, and content-merged work
+
+### Fixed
+
+- *(prune)* report a branch kept because it is being rebased or bisected
+- *(prune)* keep a missing worktree that is mid-operation, and its branch
+- *(prune)* fail safe when a rebase or bisect state file is unreadable
+- *(prune)* name the unreadable worktree that keeps bare branches
+- *(merged)* merge union files as plain text in the content check
+- *(prune)* keep bare branches when a worktree's state is unreadable
+- *(merged)* override the built-in union driver in the content check
+- *(merged)* neutralise custom merge drivers
+- *(prune)* treat untracked files as dirty
+
+### Other
+
+- *(prune)* cover --merged deleting a squash-merged worktree's branch
+- *(prune)* inline the still_clean wrapper
+- *(prune)* name what --force orphans and what a reflog loses
+- *(prune)* cover the unreadable re-checks under the repo lock
+- *(readme)* describe content-aware prune, detached and locked worktrees
+
 ## [1.7.0](https://github.com/getkono/wt/compare/v1.6.0...v1.7.0) - 2026-09-23
 
 ### Added
