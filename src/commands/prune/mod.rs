@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::porcelain::RawWorktree;
-use crate::git::worktrees::{in_progress_branch, in_progress_op};
+use crate::git::worktrees::{HeldBranch, in_progress_branch, in_progress_op};
 use crate::git::{
     branch_ref, current_branch, enumerate, is_clean_for_removal, local_branches, ops,
 };
@@ -76,35 +76,14 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
             Subject::Branch { .. } => None,
         })
         .collect();
-    // A branch being rebased or bisected is in use too, although its worktree
-    // is detached meanwhile and so names no branch. When a worktree's state
-    // cannot be read, the branch it holds is unknown, so every bare branch is
-    // kept rather than trusting git to refuse the one in use.
-    let mut unreadable_holders: Vec<String> = Vec::new();
-    let held: Vec<String> = worktrees
-        .iter()
-        .filter_map(|w| {
-            in_progress_branch(git, &root, &w.path, w.is_missing).unwrap_or_else(|error| {
-                tracing::warn!(target_wt = %w.path.display(), %error, "prune: cannot read in-progress branch");
-                unreadable_holders.push(candidate_label(w));
-                None
-            })
-        })
-        .collect();
     let worktree_branches: HashSet<String> = worktrees
         .iter()
         .enumerate()
         .filter(|(i, _)| !(args.all && removing.contains(i)))
         .filter_map(|(_, w)| w.branch.clone())
-        .chain(held)
         .collect();
     let mut branch_verdicts = assessor.branches(current.as_deref(), &worktree_branches)?;
-    if !unreadable_holders.is_empty() {
-        let holders = unreadable_holders.join(", ");
-        for verdict in &mut branch_verdicts {
-            verdict.block = Some(Block::HolderUnreadable(holders.clone()));
-        }
-    }
+    keep_held_branches(git, &root, &worktrees, &mut branch_verdicts);
     verdicts.extend(branch_verdicts);
     let (candidates, skipped): (Vec<Verdict>, Vec<Verdict>) =
         verdicts.into_iter().partition(|v| v.block.is_none());
@@ -216,6 +195,45 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     tracing::debug!(removed, "prune: done");
     cx.err.line(&format!("pruned {removed} item(s)"))?;
     Ok(0)
+}
+
+/// Blocks every bare-branch verdict a worktree still needs. A branch being
+/// rebased or bisected is in use, although its worktree is detached meanwhile
+/// and so names no branch: it is kept, and said so. When a worktree's state
+/// cannot be read, the branch it holds is unknown, so every bare branch is
+/// kept rather than trusting git to refuse the one in use.
+fn keep_held_branches(
+    git: &dyn GitCli,
+    root: &Path,
+    worktrees: &[Worktree],
+    verdicts: &mut [Verdict],
+) {
+    let mut unreadable_holders: Vec<String> = Vec::new();
+    let mut held: Vec<(HeldBranch, String)> = Vec::new();
+    for w in worktrees {
+        match in_progress_branch(git, root, &w.path, w.is_missing) {
+            Ok(Some(branch)) => held.push((branch, candidate_label(w))),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target_wt = %w.path.display(), %error, "prune: cannot read in-progress branch");
+                unreadable_holders.push(candidate_label(w));
+            }
+        }
+    }
+    let holders = unreadable_holders.join(", ");
+    for verdict in verdicts {
+        let Subject::Branch { name, .. } = &verdict.subject else {
+            continue;
+        };
+        if let Some((branch, worktree)) = held.iter().find(|(b, _)| b.name == *name) {
+            verdict.block = Some(Block::Held {
+                activity: branch.activity,
+                worktree: worktree.clone(),
+            });
+        } else if !unreadable_holders.is_empty() {
+            verdict.block = Some(Block::HolderUnreadable(holders.clone()));
+        }
+    }
 }
 
 /// Runs `git fetch --all --prune` when the repository has any remote, so the
@@ -1773,26 +1791,64 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_being_rebased_is_not_a_bare_candidate() {
+    fn a_branch_being_rebased_is_kept_and_says_so() {
         // Mid-rebase its worktree is detached and names no branch, but the
         // branch is still in use: deleting it would strand the rebase.
         let repo = TestRepo::init();
-        make_unmerged_wt(&repo, "feat");
+        rebase_stopped_wt(&repo, "feat");
         give_upstream(&repo, "feat"); // pushed, so `--pushed` would pick it bare
-        repo.write("change.txt", "main\n");
-        repo.commit_all("main conflicts");
-        let dir = wt_dir(&repo, "feat").to_string_lossy().into_owned();
-        let out = crate::git::cli::GitCli::run_raw(
-            &RealGit,
-            std::path::Path::new(&dir),
-            &["rebase", "main"],
-        )
-        .unwrap();
-        assert!(!out.success, "the rebase should stop on the conflict");
-        let (all, _) = report_both(&repo, &all_dry_run());
+        let holder = wt_dir(&repo, "feat");
+        let skip = format!(
+            "skipping feat (branch): being rebased in {}",
+            holder.display()
+        );
+        let (all, err) = report_both(&repo, &all_dry_run());
         assert!(!all.contains("feat (branch)"), "{all}");
-        run_yes(&repo, &all_run());
+        assert!(err.lines().any(|l| l == skip), "{err}");
+        // Never in `--json`, which lists only candidates.
+        assert!(json_branch(&repo, &all_dry_run(), "feat").is_none());
+        let forced = PruneArgs {
+            all: true,
+            ..prune_args(false, false, false, true)
+        };
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &forced, false).unwrap();
+        assert!(t.err.contents().lines().any(|l| l == skip));
         assert!(has_branch(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_branch_being_bisected_is_kept_and_says_so() {
+        let repo = TestRepo::init();
+        make_wt(&repo, "hunt"); // merged, so `--merged` would pick it bare
+        let holder = wt_dir(&repo, "hunt");
+        for n in 1..=3 {
+            repo.write("a.txt", &format!("{n}\n"));
+            repo.commit_all(&format!("c{n}"));
+        }
+        // Wide enough that the bisect checks out a midpoint, detaching HEAD.
+        let dir = holder.to_string_lossy().into_owned();
+        repo.git(&["-C", &dir, "bisect", "start", "main", "main~3"]);
+        let skip = format!(
+            "skipping hunt (branch): being bisected in {}",
+            holder.display()
+        );
+        let merged_dry_run = prune_args(true, false, true, false);
+        let (out, err) = report_both(&repo, &merged_dry_run);
+        assert!(!out.contains("hunt (branch)"), "{out}");
+        assert!(err.lines().any(|l| l == skip), "{err}");
+        let err = run_yes(&repo, &prune_args(true, false, false, true));
+        assert!(err.lines().any(|l| l == skip), "{err}");
+        assert!(has_branch(&repo, "hunt"));
+    }
+
+    #[test]
+    fn a_held_branch_no_mode_selects_is_not_mentioned() {
+        // Unmerged and unpushed: `--merged` would not pick it bare anyway.
+        let repo = TestRepo::init();
+        rebase_stopped_wt(&repo, "feat");
+        let (_, err) = report_both(&repo, &prune_args(true, false, true, false));
+        assert!(!err.contains("feat (branch)"), "{err}");
     }
 
     /// Creates a wt worktree on `branch` and leaves it stopped mid-rebase onto

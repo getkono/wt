@@ -124,6 +124,12 @@ pub(super) enum Block {
     /// be read, so it may be the branch one of them returns to. Never
     /// overridden.
     HolderUnreadable(String),
+    /// A bare branch an in-progress rebase or bisect will return to, with what
+    /// is happening to it and the worktree doing it. Never overridden.
+    Held {
+        activity: &'static str,
+        worktree: String,
+    },
     /// Locked, with its reason if one was given. Overridden by `--locked`.
     Locked(Option<String>),
     /// Uncommitted changes. Overridden by `--force`.
@@ -143,6 +149,7 @@ impl Block {
             Block::HolderUnreadable(worktrees) => {
                 format!("cannot read the rebase or bisect state of {worktrees}")
             }
+            Block::Held { activity, worktree } => format!("{activity} in {worktree}"),
             Block::Locked(Some(reason)) => format!("locked ({reason}); use --locked"),
             Block::Locked(None) => "locked; use --locked".into(),
             Block::Dirty => "uncommitted changes; use --force".into(),

@@ -36,12 +36,22 @@ const IN_PROGRESS_MARKERS: [(&str, &str); 7] = [
 ];
 
 /// Files naming the branch an in-progress operation will return to: the branch
-/// being rebased (`refs/heads/<name>`), or the one a bisect started from.
-const IN_PROGRESS_BRANCH_FILES: [&str; 3] = [
-    "rebase-merge/head-name",
-    "rebase-apply/head-name",
-    "BISECT_START",
+/// being rebased (`refs/heads/<name>`), or the one a bisect started from —
+/// each paired with what is happening to that branch.
+const IN_PROGRESS_BRANCH_FILES: [(&str, &str); 3] = [
+    ("rebase-merge/head-name", "being rebased"),
+    ("rebase-apply/head-name", "being rebased"),
+    ("BISECT_START", "being bisected"),
 ];
+
+/// A local branch an in-progress rebase or bisect will return to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldBranch {
+    /// The branch's short name.
+    pub(crate) name: String,
+    /// What is happening to it: `being rebased` or `being bisected`.
+    pub(crate) activity: &'static str,
+}
 
 /// The absolute admin directory (`$GIT_DIR`) of the worktree at `worktree`.
 /// A `missing` worktree's directory is gone, so git cannot be asked from inside
@@ -128,9 +138,9 @@ pub(crate) fn in_progress_branch(
     repo_dir: &Path,
     worktree: &Path,
     missing: bool,
-) -> Result<Option<String>> {
+) -> Result<Option<HeldBranch>> {
     let git_dir = admin_dir(git, repo_dir, worktree, missing)?;
-    for file in IN_PROGRESS_BRANCH_FILES {
+    for (file, activity) in IN_PROGRESS_BRANCH_FILES {
         let contents = match std::fs::read_to_string(git_dir.join(file)) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -139,7 +149,10 @@ pub(crate) fn in_progress_branch(
         let name = contents.trim();
         let name = name.strip_prefix("refs/heads/").unwrap_or(name);
         if !name.is_empty() {
-            return Ok(Some(name.to_string()));
+            return Ok(Some(HeldBranch {
+                name: name.to_string(),
+                activity,
+            }));
         }
     }
     Ok(None)
@@ -229,8 +242,8 @@ mod tests {
         assert_eq!(
             in_progress_branch(&RealGit, repo.root(), repo.root(), false)
                 .unwrap()
-                .as_deref(),
-            Some("topic")
+                .map(|held| (held.name, held.activity)),
+            Some(("topic".to_string(), "being rebased"))
         );
     }
 
@@ -247,8 +260,8 @@ mod tests {
         assert_eq!(
             in_progress_branch(&RealGit, repo.root(), repo.root(), false)
                 .unwrap()
-                .as_deref(),
-            Some("main")
+                .map(|held| (held.name, held.activity)),
+            Some(("main".to_string(), "being bisected"))
         );
         assert!(
             in_progress_branch(
@@ -309,6 +322,7 @@ mod tests {
         assert_eq!(
             in_progress_branch(&RealGit, repo.root(), &linked, true)
                 .unwrap()
+                .map(|held| held.name)
                 .as_deref(),
             Some("gone")
         );
