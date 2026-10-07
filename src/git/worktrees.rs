@@ -1,9 +1,9 @@
 //! Worktree enumeration via `git worktree list --porcelain` (spec §4 sanctioned
 //! subprocess read) plus missing-directory detection.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::porcelain::{RawWorktree, parse_worktree_list};
 
@@ -44,17 +44,71 @@ const IN_PROGRESS_BRANCH_FILES: [&str; 3] = [
 ];
 
 /// The absolute admin directory (`$GIT_DIR`) of the worktree at `worktree`.
-fn admin_dir(git: &dyn GitCli, worktree: &Path) -> Result<PathBuf> {
+/// A `missing` worktree's directory is gone, so git cannot be asked from inside
+/// it; its admin directory is found from the repository at `repo_dir` instead
+/// (see [`missing_admin_dir`]).
+fn admin_dir(git: &dyn GitCli, repo_dir: &Path, worktree: &Path, missing: bool) -> Result<PathBuf> {
+    if missing {
+        return missing_admin_dir(git, repo_dir, worktree);
+    }
     let git_dir = git.run(worktree, &["rev-parse", "--absolute-git-dir"])?;
     Ok(PathBuf::from(git_dir.trim()))
 }
 
+/// The admin directory of a linked worktree whose directory is gone: the entry
+/// under `<common-dir>/worktrees/` whose `gitdir` file points at
+/// `<worktree>/.git`. Errors when no entry can be matched or one cannot be
+/// read, so a caller can fail safe.
+fn missing_admin_dir(git: &dyn GitCli, repo_dir: &Path, worktree: &Path) -> Result<PathBuf> {
+    let common = git.run(repo_dir, &["rev-parse", "--git-common-dir"])?;
+    let entries = repo_dir.join(common.trim()).join("worktrees");
+    let target = worktree.join(".git");
+    for entry in std::fs::read_dir(&entries)? {
+        let admin = entry?.path();
+        let recorded = match std::fs::read_to_string(admin.join("gitdir")) {
+            Ok(recorded) => recorded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // `worktree.useRelativePaths` records the path relative to the entry.
+        if normalize(&admin.join(recorded.trim())) == target {
+            return Ok(admin);
+        }
+    }
+    Err(Error::operation(format!(
+        "no worktree admin directory records {}",
+        worktree.display()
+    )))
+}
+
+/// `path` with `.` and `..` components resolved lexically (the path may not
+/// exist, so it cannot be canonicalized).
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The operation in progress in the worktree at `worktree` (a rebase, merge,
-/// cherry-pick, revert, or bisect), or `None` when it is idle. Errors when the
-/// worktree's admin directory cannot be resolved, so a caller can fail safe.
+/// cherry-pick, revert, or bisect), or `None` when it is idle. A `missing`
+/// worktree's state is read through the repository at `repo_dir`. Errors when
+/// the worktree's admin directory cannot be resolved, so a caller can fail safe.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-pub(crate) fn in_progress_op(git: &dyn GitCli, worktree: &Path) -> Result<Option<&'static str>> {
-    let git_dir = admin_dir(git, worktree)?;
+pub(crate) fn in_progress_op(
+    git: &dyn GitCli,
+    repo_dir: &Path,
+    worktree: &Path,
+    missing: bool,
+) -> Result<Option<&'static str>> {
+    let git_dir = admin_dir(git, repo_dir, worktree, missing)?;
     Ok(IN_PROGRESS_MARKERS
         .iter()
         .find(|(marker, _)| git_dir.join(marker).exists())
@@ -66,10 +120,16 @@ pub(crate) fn in_progress_op(git: &dyn GitCli, worktree: &Path) -> Result<Option
 /// so `git worktree list` no longer names that branch — yet it is still in use.
 /// An absent state file means no such operation; any other read failure (a
 /// permission error, a file that is not UTF-8) is an error, so a caller can
-/// fail safe rather than take the branch for unused.
+/// fail safe rather than take the branch for unused. A `missing` worktree's
+/// state is read through the repository at `repo_dir`.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-pub(crate) fn in_progress_branch(git: &dyn GitCli, worktree: &Path) -> Result<Option<String>> {
-    let git_dir = admin_dir(git, worktree)?;
+pub(crate) fn in_progress_branch(
+    git: &dyn GitCli,
+    repo_dir: &Path,
+    worktree: &Path,
+    missing: bool,
+) -> Result<Option<String>> {
+    let git_dir = admin_dir(git, repo_dir, worktree, missing)?;
     for file in IN_PROGRESS_BRANCH_FILES {
         let contents = match std::fs::read_to_string(git_dir.join(file)) {
             Ok(contents) => contents,
@@ -124,7 +184,10 @@ mod tests {
         let repo = TestRepo::init();
         repo.add_worktree("busy", "../wt-busy");
         let linked = repo.root().parent().unwrap().join("wt-busy");
-        assert_eq!(in_progress_op(&RealGit, &linked).unwrap(), None);
+        assert_eq!(
+            in_progress_op(&RealGit, repo.root(), &linked, false).unwrap(),
+            None
+        );
         let admin = RealGit
             .run(&linked, &["rev-parse", "--absolute-git-dir"])
             .unwrap();
@@ -132,11 +195,17 @@ mod tests {
         for (marker, op) in IN_PROGRESS_MARKERS {
             let path = admin.join(marker);
             std::fs::write(&path, "").unwrap();
-            assert_eq!(in_progress_op(&RealGit, &linked).unwrap(), Some(op));
+            assert_eq!(
+                in_progress_op(&RealGit, repo.root(), &linked, false).unwrap(),
+                Some(op)
+            );
             std::fs::remove_file(&path).unwrap();
         }
         // The primary worktree's own state is separate.
-        assert_eq!(in_progress_op(&RealGit, repo.root()).unwrap(), None);
+        assert_eq!(
+            in_progress_op(&RealGit, repo.root(), repo.root(), false).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -153,12 +222,12 @@ mod tests {
         let out = RealGit.run_raw(repo.root(), &["rebase", "main"]).unwrap();
         assert!(!out.success);
         assert_eq!(
-            in_progress_op(&RealGit, repo.root()).unwrap(),
+            in_progress_op(&RealGit, repo.root(), repo.root(), false).unwrap(),
             Some("rebase")
         );
         // The rebased branch is still in use although HEAD is detached.
         assert_eq!(
-            in_progress_branch(&RealGit, repo.root())
+            in_progress_branch(&RealGit, repo.root(), repo.root(), false)
                 .unwrap()
                 .as_deref(),
             Some("topic")
@@ -170,15 +239,26 @@ mod tests {
         let repo = TestRepo::init();
         repo.write("a.txt", "1\n");
         repo.commit_all("c1");
-        assert_eq!(in_progress_branch(&RealGit, repo.root()).unwrap(), None);
+        assert_eq!(
+            in_progress_branch(&RealGit, repo.root(), repo.root(), false).unwrap(),
+            None
+        );
         repo.git(&["bisect", "start", "HEAD", "HEAD~1"]);
         assert_eq!(
-            in_progress_branch(&RealGit, repo.root())
+            in_progress_branch(&RealGit, repo.root(), repo.root(), false)
                 .unwrap()
                 .as_deref(),
             Some("main")
         );
-        assert!(in_progress_branch(&RealGit, Path::new("/nonexistent/wt")).is_err());
+        assert!(
+            in_progress_branch(
+                &RealGit,
+                Path::new("/nonexistent/wt"),
+                Path::new("/nonexistent/wt"),
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -190,20 +270,65 @@ mod tests {
         let rebase = Path::new(admin.trim()).join("rebase-merge");
         std::fs::create_dir(&rebase).unwrap();
         // No `head-name` yet: nothing is held.
-        assert_eq!(in_progress_branch(&RealGit, repo.root()).unwrap(), None);
+        assert_eq!(
+            in_progress_branch(&RealGit, repo.root(), repo.root(), false).unwrap(),
+            None
+        );
         // A directory where the file should be cannot be read as one.
         std::fs::create_dir(rebase.join("head-name")).unwrap();
-        assert!(in_progress_branch(&RealGit, repo.root()).is_err());
+        assert!(in_progress_branch(&RealGit, repo.root(), repo.root(), false).is_err());
         std::fs::remove_dir(rebase.join("head-name")).unwrap();
         // Nor can a name that is not UTF-8.
         std::fs::write(rebase.join("head-name"), b"refs/heads/\xff\xfe").unwrap();
-        assert!(in_progress_branch(&RealGit, repo.root()).is_err());
+        assert!(in_progress_branch(&RealGit, repo.root(), repo.root(), false).is_err());
+    }
+
+    #[test]
+    fn a_missing_worktree_state_is_read_through_the_repository() {
+        let repo = TestRepo::init();
+        repo.add_worktree("gone", "../wt-gone");
+        repo.add_worktree("other", "../wt-other");
+        let linked = repo.root().parent().unwrap().join("wt-gone");
+        let admin = RealGit
+            .run(&linked, &["rev-parse", "--absolute-git-dir"])
+            .unwrap();
+        let admin = PathBuf::from(admin.trim());
+        std::fs::remove_dir_all(&linked).unwrap();
+        // Git cannot be asked from inside a directory that is gone.
+        assert!(in_progress_op(&RealGit, repo.root(), &linked, false).is_err());
+        assert_eq!(
+            in_progress_op(&RealGit, repo.root(), &linked, true).unwrap(),
+            None
+        );
+        std::fs::create_dir(admin.join("rebase-merge")).unwrap();
+        std::fs::write(admin.join("rebase-merge/head-name"), "refs/heads/gone\n").unwrap();
+        assert_eq!(
+            in_progress_op(&RealGit, repo.root(), &linked, true).unwrap(),
+            Some("rebase")
+        );
+        assert_eq!(
+            in_progress_branch(&RealGit, repo.root(), &linked, true)
+                .unwrap()
+                .as_deref(),
+            Some("gone")
+        );
+        // A path no admin entry records cannot be resolved.
+        let stranger = repo.root().parent().unwrap().join("wt-stranger");
+        assert!(in_progress_op(&RealGit, repo.root(), &stranger, true).is_err());
+    }
+
+    #[test]
+    fn normalize_resolves_dot_components_lexically() {
+        assert_eq!(
+            normalize(Path::new("/r/.git/worktrees/x/../../../wt/./.git")),
+            PathBuf::from("/r/wt/.git")
+        );
     }
 
     #[test]
     fn in_progress_op_errors_outside_a_repository() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(in_progress_op(&RealGit, dir.path()).is_err());
+        assert!(in_progress_op(&RealGit, dir.path(), dir.path(), false).is_err());
     }
 
     #[test]

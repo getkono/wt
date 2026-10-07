@@ -83,9 +83,8 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let mut unreadable_holders: Vec<String> = Vec::new();
     let held: Vec<String> = worktrees
         .iter()
-        .filter(|w| !w.is_missing)
         .filter_map(|w| {
-            in_progress_branch(git, &w.path).unwrap_or_else(|error| {
+            in_progress_branch(git, &root, &w.path, w.is_missing).unwrap_or_else(|error| {
                 tracing::warn!(target_wt = %w.path.display(), %error, "prune: cannot read in-progress branch");
                 unreadable_holders.push(candidate_label(w));
                 None
@@ -284,10 +283,10 @@ fn remove_worktree(
     Ok(true)
 }
 
-/// Why a present worktree may no longer be removed although it was a candidate
-/// at selection, or `None` when it is unchanged: an operation now in progress,
-/// a detached HEAD that moved off the assessed commit, or (without `--force`)
-/// new uncommitted changes. A missing worktree cannot change.
+/// Why a worktree may no longer be removed although it was a candidate at
+/// selection, or `None` when it is unchanged: an operation now in progress, a
+/// detached HEAD that moved off the assessed commit, or (without `--force`) new
+/// uncommitted changes. A missing worktree must still be missing and idle.
 fn changed_since_assessed(
     assessor: &Assessor<'_>,
     worktree: &Worktree,
@@ -297,16 +296,24 @@ fn changed_since_assessed(
         // `git worktree remove --force` deletes whatever is at the path, so a
         // directory that came back (a remounted drive) — or one that cannot be
         // checked — must not be treated as gone.
-        return match std::fs::symlink_metadata(&worktree.path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Ok(_) => Some("reappeared since it was assessed; run prune again".into()),
-            Err(_) => Some(Block::Unreadable.message()),
-        };
+        match std::fs::symlink_metadata(&worktree.path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => return Some("reappeared since it was assessed; run prune again".into()),
+            Err(_) => return Some(Block::Unreadable.message()),
+        }
     }
-    match in_progress_op(assessor.git, &worktree.path) {
+    match in_progress_op(
+        assessor.git,
+        assessor.root,
+        &worktree.path,
+        worktree.is_missing,
+    ) {
         Ok(None) => {}
         Ok(Some(op)) => return Some(Block::InProgress(op).message()),
         Err(_) => return Some(Block::Unreadable.message()),
+    }
+    if worktree.is_missing {
+        return None;
     }
     let moved = "HEAD moved since it was assessed; run prune again";
     if let Some(head) = head {
@@ -1701,11 +1708,19 @@ mod tests {
         // `git worktree remove --force` would delete whatever is at the path,
         // so a path whose existence cannot be read is not treated as gone.
         let repo = TestRepo::init();
-        make_wt(&repo, "offline");
+        let scratch = tempfile::tempdir().unwrap();
+        let path = scratch.path().join("mount").join("offline");
+        repo.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "offline",
+            path.to_str().unwrap(),
+        ]);
         let mut row = row_for(&repo, "offline");
-        let scratch = TestRepo::init();
-        let parent = scratch.root().join("mount");
-        row.path = parent.join("offline");
+        let parent = row.path.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&parent).unwrap();
         row.is_missing = true;
         let args = all_run();
         with_assessor(&repo, &args, |assessor| {
@@ -1778,6 +1793,47 @@ mod tests {
         assert!(!all.contains("feat (branch)"), "{all}");
         run_yes(&repo, &all_run());
         assert!(has_branch(&repo, "feat"));
+    }
+
+    /// Creates a wt worktree on `branch` and leaves it stopped mid-rebase onto
+    /// a conflicting `main` (detached, as a real rebase leaves it).
+    fn rebase_stopped_wt(repo: &TestRepo, branch: &str) {
+        make_unmerged_wt(repo, branch);
+        repo.write("change.txt", "main\n");
+        repo.commit_all("main conflicts");
+        let out =
+            crate::git::cli::GitCli::run_raw(&RealGit, &wt_dir(repo, branch), &["rebase", "main"])
+                .unwrap();
+        assert!(!out.success, "the rebase should stop on the conflict");
+    }
+
+    #[test]
+    fn a_missing_worktree_mid_rebase_is_kept_with_its_branch() {
+        // Its directory is gone, but its admin entry still holds the rebase —
+        // and the branch it will return to.
+        let repo = TestRepo::init();
+        rebase_stopped_wt(&repo, "stalled");
+        std::fs::remove_dir_all(wt_dir(&repo, "stalled")).unwrap();
+        make_wt(&repo, "lost");
+        std::fs::remove_dir_all(wt_dir(&repo, "lost")).unwrap();
+        let forced = PruneArgs {
+            all: true,
+            ..prune_args(false, false, false, true)
+        };
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        super::run(&mut t.cx, &forced, false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.lines().any(|l| l.starts_with("skipping")
+                && l.contains("stalled")
+                && l.ends_with(": rebase in progress")),
+            "{err}"
+        );
+        assert!(worktree_listed(&repo, "stalled"));
+        assert!(has_branch(&repo, "stalled"));
+        // A plain missing worktree is still removed, branch and all.
+        assert!(!worktree_listed(&repo, "lost"), "{err}");
+        assert!(!has_branch(&repo, "lost"));
     }
 
     #[test]

@@ -298,14 +298,14 @@ impl Assessor<'_> {
             tracing::warn!(target_wt = %worktree.path.display(), "prune: no worktree record");
             return Some(Block::Unreadable);
         };
-        if !worktree.is_missing {
-            match in_progress_op(self.git, &worktree.path) {
-                Ok(Some(op)) => return Some(Block::InProgress(op)),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(target_wt = %worktree.path.display(), %error, "prune: cannot read worktree state");
-                    return Some(Block::Unreadable);
-                }
+        // A missing worktree can be mid-operation too (its admin entry still
+        // holds the state), and is kept like a present one.
+        match in_progress_op(self.git, self.root, &worktree.path, worktree.is_missing) {
+            Ok(Some(op)) => return Some(Block::InProgress(op)),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(target_wt = %worktree.path.display(), %error, "prune: cannot read worktree state");
+                return Some(Block::Unreadable);
             }
         }
         if !self.args.locked && raw.is_locked {
