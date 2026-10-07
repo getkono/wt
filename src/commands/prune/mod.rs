@@ -328,17 +328,12 @@ fn changed_since_assessed(
             return Some(moved.into());
         }
     }
-    if !assessor.args.force && !still_clean(assessor, worktree) {
+    // The same rule as the selection guard (untracked files included); a failed
+    // status read counts as dirty, so the guard fails safe.
+    if !assessor.args.force && !is_clean_for_removal(assessor.git, &worktree.path) {
         return Some(Block::Dirty.message());
     }
     None
-}
-
-/// Whether a present worktree is still clean by the same rule as the selection
-/// guard (untracked files included). A failed status read counts as dirty, so
-/// the guard fails safe.
-fn still_clean(assessor: &Assessor<'_>, worktree: &Worktree) -> bool {
-    is_clean_for_removal(assessor.git, &worktree.path)
 }
 
 /// Deletes one bare-branch candidate, returning whether it was deleted. Its
