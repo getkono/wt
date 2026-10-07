@@ -1303,6 +1303,21 @@ mod tests {
     }
 
     #[test]
+    fn merged_alone_removes_a_squash_merged_worktree_and_its_branch() {
+        // Not `--all`: the branch is never a bare candidate here, so only the
+        // worktree removal's own cleanup can delete it — which must count a
+        // squash merge as merged, like the selection did.
+        let repo = TestRepo::init();
+        make_unmerged_wt(&repo, "squashed");
+        squash_into_main(&repo, "squashed");
+        let err = run_yes(&repo, &prune_args(true, false, false, false));
+        assert!(err.contains("squashed: merged by content"), "{err}");
+        assert!(err.contains("pruned 1 item(s)"), "{err}");
+        assert!(!worktree_listed(&repo, "squashed"));
+        assert!(!has_branch(&repo, "squashed"));
+    }
+
+    #[test]
     fn a_merge_only_branch_without_upstream_is_merged_by_content() {
         // An integration branch never pushed, holding only merges of work that
         // later reached main through squashes: its SHAs exist nowhere else, its
