@@ -17,6 +17,7 @@ use crate::cx::Cx;
 use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
+use crate::git::merged::ContentCheck;
 use crate::git::porcelain::RawWorktree;
 use crate::git::worktrees::{HeldBranch, in_progress_branch_in, in_progress_op};
 use crate::git::{
@@ -174,6 +175,9 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     // the whole loop is one mutation region under the advisory repo lock (issue
     // #99). `prune` runs no hooks, so nothing inside can re-enter `wt`.
     let lock = lock_repo(&root)?;
+    // The merge state is re-read under the lock: a target may have moved
+    // while the prompt waited, so nothing selection cached is reused.
+    let content = ContentCheck::new(git, &root);
     let mut removed = 0_usize;
     // Branches whose worktree was not removed (it turned dirty, or git refused)
     // stay checked out, so their `--all` branch candidate is skipped too.
@@ -190,6 +194,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
                 let pruned = remove_worktree(
                     cx,
                     &assessor,
+                    &content,
                     &session,
                     worktree,
                     head.as_deref(),
@@ -201,7 +206,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
                 pruned
             }
             Subject::Branch { name, .. } if kept.contains(name.as_str()) => false,
-            Subject::Branch { name, .. } => remove_branch(cx, &assessor, name)?,
+            Subject::Branch { name, .. } => remove_branch(cx, &assessor, &content, name)?,
         };
         if pruned {
             removed += 1;
@@ -285,6 +290,7 @@ fn raw_for<'a>(raws: &'a [RawWorktree], worktree: &Worktree) -> Option<&'a RawWo
 fn remove_worktree(
     cx: &mut Cx,
     assessor: &Assessor<'_>,
+    content: &ContentCheck<'_>,
     session: &Session,
     worktree: &Worktree,
     head: Option<&str>,
@@ -308,7 +314,7 @@ fn remove_worktree(
         tracing::warn!(target_wt = %label, "prune: worktree remove failed");
         return Ok(false);
     }
-    delete_merged_branch(assessor, worktree, &session.config);
+    delete_merged_branch(assessor, content, worktree, &session.config);
     if let Some(branch) = &worktree.branch {
         let _ = wtconfig::clear_meta(git, root, branch);
     }
@@ -384,13 +390,18 @@ fn changed_since_assessed(
 /// skipped. A branch already gone (deleted with its worktree) is skipped
 /// quietly, and a delete failure is reported and skipped rather than aborting
 /// the whole prune.
-fn remove_branch(cx: &mut Cx, assessor: &Assessor<'_>, name: &str) -> Result<bool> {
+fn remove_branch(
+    cx: &mut Cx,
+    assessor: &Assessor<'_>,
+    content: &ContentCheck<'_>,
+    name: &str,
+) -> Result<bool> {
     let (git, root) = (assessor.git, assessor.root);
     if !branch_exists(git, root, name) {
         tracing::debug!(branch = %name, "prune: branch already deleted");
         return Ok(false);
     }
-    if !assessor.args.force && !assessor.branch_is_safe(name) {
+    if !assessor.args.force && !assessor.branch_is_safe(name, content) {
         cx.err.line(&format!(
             "skipping {name} (branch): {}",
             Block::Unsafe.message()
@@ -474,6 +485,7 @@ fn verdict_json(worktrees: &[Worktree], verdict: &Verdict) -> Result<String> {
 /// under `--all`, or simply kept.
 fn delete_merged_branch(
     assessor: &Assessor<'_>,
+    content: &ContentCheck<'_>,
     worktree: &Worktree,
     config: &crate::config::Config,
 ) {
@@ -489,7 +501,7 @@ fn delete_merged_branch(
     }
     if !assessor
         .targets
-        .is_merged(&assessor.content, assessor.repo, &branch_ref(branch))
+        .is_merged(content, assessor.repo, &branch_ref(branch))
     {
         return;
     }
@@ -1009,7 +1021,8 @@ mod tests {
         let args = all_dry_run();
         with_assessor(&repo, &args, |assessor| {
             assert!(!assessor.recoverable("refs/heads/no-such-branch"));
-            assert!(!assessor.branch_is_safe("no-such-branch"));
+            let content = crate::git::merged::ContentCheck::new(&RealGit, repo.root());
+            assert!(!assessor.branch_is_safe("no-such-branch", &content));
         });
     }
 
@@ -1322,6 +1335,46 @@ mod tests {
         assert!(err.contains("pruned 1 item(s)"), "{err}");
         assert!(!worktree_listed(&repo, "squashed"));
         assert!(!has_branch(&repo, "squashed"));
+    }
+
+    /// Answers the prompt `y`, after running `git <args>` in `dir` — standing
+    /// in for something done while the prompt waited.
+    struct ActsThenConfirms {
+        dir: std::path::PathBuf,
+        args: Vec<&'static str>,
+    }
+    impl crate::cx::Input for ActsThenConfirms {
+        fn read_line(&mut self) -> crate::error::Result<String> {
+            crate::git::cli::GitCli::run(&RealGit, &self.dir, &self.args)?;
+            Ok("y\n".into())
+        }
+    }
+
+    #[test]
+    fn a_squash_merge_reverted_while_the_prompt_waits_keeps_the_branch() {
+        // Selected as merged by content; main then backs the squash out, so
+        // the branch's work exists nowhere else. The re-check under the lock
+        // must see the new main, not the tree selection read.
+        let repo = TestRepo::init();
+        diverged_branch(&repo, "feat");
+        squash_into_main(&repo, "feat");
+        let merged = report(&repo, &prune_args(true, false, true, false));
+        assert!(
+            merged.contains("feat (branch): merged by content"),
+            "{merged}"
+        );
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.input = Box::new(ActsThenConfirms {
+            dir: repo.root().to_path_buf(),
+            args: vec!["revert", "--no-edit", "HEAD"],
+        });
+        super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.contains("skipping feat (branch): has work on no remote"),
+            "{err}"
+        );
+        assert!(has_branch(&repo, "feat"));
     }
 
     #[test]
