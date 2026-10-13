@@ -1637,6 +1637,70 @@ mod tests {
         }
     }
 
+    /// Real git that records each call's subcommand.
+    #[derive(Default)]
+    struct Counting(std::sync::Mutex<Vec<String>>);
+    impl crate::git::cli::GitCli for Counting {
+        fn run_raw(
+            &self,
+            repo: &std::path::Path,
+            args: &[&str],
+        ) -> crate::error::Result<crate::git::cli::GitOutput> {
+            let verb = args
+                .iter()
+                .find(|a| !a.starts_with('-') && !a.contains('='))
+                .unwrap_or(&"");
+            self.0.lock().unwrap().push(verb.to_string());
+            RealGit.run_raw(repo, args)
+        }
+    }
+
+    /// The subcommands `args` spawns, per subcommand, when prune runs over a
+    /// repository with `branches` merged bare branches (and a merged worktree).
+    fn spawns(branches: usize, args: &PruneArgs) -> std::collections::BTreeMap<String, usize> {
+        let repo = TestRepo::init();
+        make_wt(&repo, "done");
+        for i in 0..branches {
+            bare_branch(&repo, &format!("old{i}"));
+        }
+        let git = std::sync::Arc::new(Counting::default());
+        let mut t =
+            crate::testutil::test_cx_with_git(&[], repo.root().to_str().unwrap(), git.clone());
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, args, false).unwrap();
+        let err = t.err.contents();
+        if !args.dry_run {
+            assert!(
+                err.contains(&format!("pruned {} item(s)", branches + 1)),
+                "{err}"
+            );
+        }
+        let mut counts = std::collections::BTreeMap::new();
+        for verb in git.0.lock().unwrap().iter() {
+            *counts.entry(verb.clone()).or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Issue #116: what prune spawns does not grow with the number of
+    /// branches, selecting or deleting.
+    #[test]
+    fn git_spawns_do_not_grow_with_the_branch_count() {
+        let few = spawns(2, &all_dry_run());
+        assert_eq!(few, spawns(12, &all_dry_run()));
+        assert_eq!(few.get("rev-list"), Some(&1), "{few:?}");
+        // Nothing reads a worktree's status that selection does not need.
+        assert_eq!(few.get("status"), Some(&1), "{few:?}");
+
+        let few = spawns(2, &all_run());
+        assert_eq!(few, spawns(12, &all_run()));
+        // One batch delete for every bare branch; the worktree's own branch
+        // goes with it.
+        assert_eq!(few.get("branch"), Some(&2), "{few:?}");
+        // Only the worktree `wt` created has metadata to clear.
+        assert_eq!(few.get("config").copied().unwrap_or(0), 2, "{few:?}");
+    }
+
     /// Real git, except as `refuse` says: given an argv, `Some(stderr)` fails
     /// that call.
     struct Refuses(fn(&[&str]) -> Option<&'static str>);
