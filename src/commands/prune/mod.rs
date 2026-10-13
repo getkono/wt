@@ -1151,12 +1151,11 @@ mod tests {
     const RE_READ: usize = 1;
     const READ_BACK: usize = 2;
 
-    /// `git` in `dir`, trimmed stdout.
+    /// `git` in `dir` with the fixtures' sandboxed environment (a pinned
+    /// identity, no global config), trimmed stdout. For actions that cannot
+    /// borrow the [`TestRepo`].
     fn repo_git(dir: &std::path::Path, args: &[&str]) -> String {
-        crate::git::cli::GitCli::run(&RealGit, dir, args)
-            .unwrap()
-            .trim()
-            .to_string()
+        crate::testutil::run_git(dir, args).trim().to_string()
     }
 
     /// Runs a real `--all -y` prune whose git calls `on_read(n)` before the
