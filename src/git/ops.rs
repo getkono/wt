@@ -96,6 +96,21 @@ pub(crate) fn delete_branch(
     git.run_raw(root, &["branch", flag, branch])
 }
 
+/// Force-deletes every local branch in `branches` in one process
+/// (`git branch -D <branch>...`). Git carries on past a branch it cannot
+/// delete and then exits non-zero, so the raw [`GitOutput`] says only that
+/// something failed: the caller reads which branches remain to know what.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn delete_branches(
+    git: &dyn GitCli,
+    root: &Path,
+    branches: &[&str],
+) -> Result<GitOutput> {
+    let mut argv = vec!["branch", "-D"];
+    argv.extend_from_slice(branches);
+    git.run_raw(root, &argv)
+}
+
 /// Points `branch` at `to` without checking it out (`git branch -f`).
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn set_branch_ref(
@@ -300,6 +315,14 @@ mod tests {
         assert_eq!(git.last(), ["branch", "-d", "topic"]);
         delete_branch(&git, &root(), "topic", true).unwrap();
         assert_eq!(git.last(), ["branch", "-D", "topic"]);
+    }
+
+    #[test]
+    fn delete_branches_force_deletes_every_branch_in_one_call() {
+        let git = RecordingGit::new();
+        delete_branches(&git, &root(), &["a", "feat/b"]).unwrap();
+        assert_eq!(git.calls.borrow().len(), 1);
+        assert_eq!(git.last(), ["branch", "-D", "a", "feat/b"]);
     }
 
     #[test]

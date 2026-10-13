@@ -7,11 +7,11 @@
 
 mod assess;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::cli::PruneArgs;
-use crate::commands::{Session, candidate_label, confirm, open_session};
+use crate::commands::{candidate_label, confirm, open_session};
 use crate::config::wtconfig;
 use crate::cx::Cx;
 use crate::error::{Error, Result};
@@ -177,14 +177,23 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let lock = lock_repo(&root)?;
     // The merge state is re-read under the lock: a target may have moved
     // while the prompt waited, so nothing selection cached is reused.
-    let content = ContentCheck::new(git, &root);
+    let removal = Removal {
+        assessor: &assessor,
+        content: ContentCheck::new(git, &root),
+        config: &session.config,
+        meta: wtconfig::meta_branches(git, &root)
+            .inspect_err(|error| tracing::debug!(%error, "prune: cannot list wt metadata"))
+            .ok(),
+    };
     let mut removed = 0_usize;
     // Branches whose worktree was not removed (it turned dirty, or git refused)
     // stay checked out, so their `--all` branch candidate is skipped too.
-    // Worktree candidates come first.
+    // Worktree candidates come first, one at a time; the bare branches left
+    // then go in one batch.
     let mut kept: HashSet<&str> = HashSet::new();
+    let mut branches: Vec<&str> = Vec::new();
     for verdict in &candidates {
-        let pruned = match &verdict.subject {
+        match &verdict.subject {
             Subject::Worktree {
                 index,
                 locked,
@@ -193,25 +202,22 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
                 let worktree = &worktrees[*index];
                 let pruned = remove_worktree(
                     cx,
-                    &assessor,
-                    &content,
-                    &session,
+                    &removal,
                     worktree,
                     head.as_deref(),
                     *locked && args.locked,
                 )?;
-                if !pruned && let Some(branch) = &worktree.branch {
+                if pruned {
+                    removed += 1;
+                } else if let Some(branch) = &worktree.branch {
                     kept.insert(branch);
                 }
-                pruned
             }
-            Subject::Branch { name, .. } if kept.contains(name.as_str()) => false,
-            Subject::Branch { name, .. } => remove_branch(cx, &assessor, &content, name)?,
-        };
-        if pruned {
-            removed += 1;
+            Subject::Branch { name, .. } if kept.contains(name.as_str()) => {}
+            Subject::Branch { name, .. } => branches.push(name),
         }
     }
+    removed += remove_branches(cx, &removal, &branches)?;
 
     drop(lock);
     tracing::debug!(removed, "prune: done");
@@ -278,6 +284,30 @@ fn raw_for<'a>(raws: &'a [RawWorktree], worktree: &Worktree) -> Option<&'a RawWo
     raws.iter().find(|raw| raw.path == worktree.path)
 }
 
+/// What every removal under the repo lock shares. Nothing in it was read
+/// before the confirmation prompt except the selection itself.
+struct Removal<'r, 'a> {
+    assessor: &'r Assessor<'a>,
+    /// The merge state, re-read under the lock: a target may have moved while
+    /// the prompt waited, so nothing selection cached is reused.
+    content: ContentCheck<'a>,
+    config: &'r crate::config::Config,
+    /// The branches with `wt.*` metadata to clear, or `None` when that could
+    /// not be read and every removal clears its section regardless.
+    meta: Option<HashSet<String>>,
+}
+
+impl Removal<'_, '_> {
+    /// Drops `branch`'s `wt.*` metadata, best-effort, spawning nothing when it
+    /// has none.
+    fn clear_meta(&self, branch: &str) {
+        if self.meta.as_ref().is_none_or(|meta| meta.contains(branch)) {
+            let assessor = self.assessor;
+            let _ = wtconfig::clear_meta(assessor.git, assessor.root, branch);
+        }
+    }
+}
+
 /// Removes one worktree candidate, returning whether it was removed. `head` is
 /// a detached worktree's HEAD as assessed; `unlock` overrides a lock
 /// (`--locked` on a locked worktree). This is the per-worktree body of the prune
@@ -289,13 +319,12 @@ fn raw_for<'a>(raws: &'a [RawWorktree], worktree: &Worktree) -> Option<&'a RawWo
 /// reported and leaves the worktree — and so its branch — in place.
 fn remove_worktree(
     cx: &mut Cx,
-    assessor: &Assessor<'_>,
-    content: &ContentCheck<'_>,
-    session: &Session,
+    removal: &Removal<'_, '_>,
     worktree: &Worktree,
     head: Option<&str>,
     unlock: bool,
 ) -> Result<bool> {
+    let assessor = removal.assessor;
     let (git, root) = (assessor.git, assessor.root);
     let label = candidate_label(worktree);
     if let Some(why) = changed_since_assessed(assessor, worktree, head) {
@@ -314,9 +343,9 @@ fn remove_worktree(
         tracing::warn!(target_wt = %label, "prune: worktree remove failed");
         return Ok(false);
     }
-    delete_merged_branch(assessor, content, worktree, &session.config);
+    delete_merged_branch(removal, worktree);
     if let Some(branch) = &worktree.branch {
-        let _ = wtconfig::clear_meta(git, root, branch);
+        removal.clear_meta(branch);
     }
     tracing::debug!(target_wt = %label, "prune: removed worktree");
     Ok(true)
@@ -382,39 +411,111 @@ fn changed_since_assessed(
     None
 }
 
-/// Deletes one bare-branch candidate, returning whether it was deleted. Its
-/// safety — every commit on a remote or the default branch, or every change in
-/// the default branch — is re-checked under the lock (it may have moved since
-/// selection), and the branch is then deleted with `git branch -D`, since `-d`
-/// only knows about HEAD and the upstream. Without `--force` an unsafe branch is
-/// skipped. A branch already gone (deleted with its worktree) is skipped
-/// quietly, and a delete failure is reported and skipped rather than aborting
-/// the whole prune.
-fn remove_branch(
-    cx: &mut Cx,
-    assessor: &Assessor<'_>,
-    content: &ContentCheck<'_>,
-    name: &str,
-) -> Result<bool> {
+/// Branch names per `git branch -D` call, so the argv stays bounded however
+/// many branches go.
+const BRANCHES_PER_DELETE: usize = 256;
+
+/// Deletes the bare-branch candidates `names`, in order, returning how many
+/// were deleted. Each one's safety — every commit on a remote or the default
+/// branch, or every change in the default branch — is re-checked under the
+/// lock against its tip now (it may have moved since selection), for all of
+/// them in one check. Without `--force` an unsafe branch is skipped. The rest
+/// go with `git branch -D` (since `-d` only knows about HEAD and the
+/// upstream), many per call. A branch already gone (deleted with its worktree)
+/// is skipped quietly, and a delete failure is reported per branch and skipped
+/// rather than aborting the whole prune.
+fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Result<usize> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let assessor = removal.assessor;
     let (git, root) = (assessor.git, assessor.root);
-    if !branch_exists(git, root, name) {
-        tracing::debug!(branch = %name, "prune: branch already deleted");
-        return Ok(false);
-    }
-    if !assessor.args.force && !assessor.branch_is_safe(name, content) {
-        cx.err.line(&format!(
-            "skipping {name} (branch): {}",
-            Block::Unsafe.message()
-        ))?;
-        tracing::debug!(branch = %name, "prune: skip unsafe branch");
-        return Ok(false);
-    }
-    match ops::delete_branch(git, root, name, true) {
-        Ok(out) if out.success => {
-            let _ = wtconfig::clear_meta(git, root, name);
-            tracing::debug!(branch = %name, "prune: deleted branch");
-            Ok(true)
+    let tips = match branch_tips(git, root) {
+        Ok(tips) => tips,
+        Err(error) => {
+            // Which branch is where is unknown, so none is deleted.
+            tracing::warn!(%error, "prune: cannot read branch tips");
+            for name in names {
+                cx.err.line(&format!(
+                    "skipping {name} (branch): {}",
+                    Block::Unreadable.message()
+                ))?;
+            }
+            return Ok(0);
         }
+    };
+    let present: Vec<(&str, &str)> = names
+        .iter()
+        .filter_map(|name| match tips.get(*name) {
+            Some(id) => Some((*name, id.as_str())),
+            None => {
+                tracing::debug!(branch = %name, "prune: branch already deleted");
+                None
+            }
+        })
+        .collect();
+    let force = assessor.args.force;
+    let recoverable = if force {
+        HashSet::new()
+    } else {
+        let ids: Vec<String> = present.iter().map(|(_, id)| id.to_string()).collect();
+        assessor.recoverable_now(&ids)
+    };
+    let mut doomed: Vec<&str> = Vec::new();
+    for (name, id) in present {
+        if !force
+            && !recoverable.contains(id)
+            && !assessor
+                .targets
+                .is_merged(&removal.content, assessor.repo, id)
+        {
+            cx.err.line(&format!(
+                "skipping {name} (branch): {}",
+                Block::Unsafe.message()
+            ))?;
+            tracing::debug!(branch = %name, "prune: skip unsafe branch");
+            continue;
+        }
+        doomed.push(name);
+    }
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    for chunk in doomed.chunks(BRANCHES_PER_DELETE) {
+        // Whether each went is read back below; git's own messages are
+        // translated, so they are not parsed.
+        match ops::delete_branches(git, root, chunk) {
+            Ok(out) if !out.success => {
+                tracing::debug!(stderr = %out.stderr.trim(), "prune: batch delete left some branches");
+            }
+            Err(error) => tracing::debug!(%error, "prune: batch delete could not run"),
+            Ok(_) => {}
+        }
+    }
+    let left = branch_tips(git, root)
+        .inspect_err(|error| tracing::debug!(%error, "prune: cannot re-read branch tips"))
+        .ok();
+    let mut deleted = 0_usize;
+    for name in doomed {
+        let gone = match &left {
+            Some(left) => !left.contains_key(name),
+            None => !branch_exists(git, root, name),
+        };
+        // One the batch left is tried alone, which also yields its own error.
+        if gone || delete_branch(cx, git, root, name)? {
+            removal.clear_meta(name);
+            tracing::debug!(branch = %name, "prune: deleted branch");
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+/// Force-deletes the single branch `name`, reporting a failure; returns whether
+/// it was deleted.
+fn delete_branch(cx: &mut Cx, git: &dyn GitCli, root: &Path, name: &str) -> Result<bool> {
+    match ops::delete_branch(git, root, name, true) {
+        Ok(out) if out.success => Ok(true),
         Ok(out) => {
             cx.err
                 .line(&format!("could not delete {name}: {}", out.stderr.trim()))?;
@@ -427,6 +528,28 @@ fn remove_branch(
             Ok(false)
         }
     }
+}
+
+/// Every local branch's tip, read now: short name to commit id.
+fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>> {
+    let out = git.run(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads/",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (id, name) = line.split_once(' ')?;
+            Some((
+                name.strip_prefix("refs/heads/")?.to_string(),
+                id.to_string(),
+            ))
+        })
+        .collect())
 }
 
 /// Whether the local branch `name` still exists.
@@ -483,16 +606,12 @@ fn verdict_json(worktrees: &[Worktree], verdict: &Verdict) -> Result<String> {
 /// allows it, and it is merged into the default branch by ancestry or content.
 /// Best-effort: a branch left behind is reported as a later branch candidate
 /// under `--all`, or simply kept.
-fn delete_merged_branch(
-    assessor: &Assessor<'_>,
-    content: &ContentCheck<'_>,
-    worktree: &Worktree,
-    config: &crate::config::Config,
-) {
+fn delete_merged_branch(removal: &Removal<'_, '_>, worktree: &Worktree) {
+    let assessor = removal.assessor;
     let Some(branch) = &worktree.branch else {
         return;
     };
-    if !config.remove_delete_merged_branch || assessor.targets.is_default(branch) {
+    if !removal.config.remove_delete_merged_branch || assessor.targets.is_default(branch) {
         return;
     }
     let meta = wtconfig::read_meta(assessor.repo.gix(), branch);
@@ -501,7 +620,7 @@ fn delete_merged_branch(
     }
     if !assessor
         .targets
-        .is_merged(content, assessor.repo, &branch_ref(branch))
+        .is_merged(&removal.content, assessor.repo, &branch_ref(branch))
     {
         return;
     }
@@ -1016,13 +1135,15 @@ mod tests {
     #[test]
     fn a_failed_recoverability_check_counts_as_unsafe() {
         let repo = TestRepo::init();
-        // `rev-list` fails on a branch that does not exist; that must never read
-        // as "safe to delete".
+        // A tip that does not resolve, or a `rev-list` that fails (here on a
+        // commit the repository lacks), must never read as "safe to delete".
         let args = all_dry_run();
         with_assessor(&repo, &args, |assessor| {
             assert!(!assessor.recoverable("refs/heads/no-such-branch"));
-            let content = crate::git::merged::ContentCheck::new(&RealGit, repo.root());
-            assert!(!assessor.branch_is_safe("no-such-branch", &content));
+            let main = repo.git(&["rev-parse", "main"]).trim().to_string();
+            let unknown = "0123456789abcdef0123456789abcdef01234567".to_string();
+            // One bad commit fails the whole batch, the good one included.
+            assert!(assessor.recoverable_now(&[main, unknown]).is_empty());
         });
     }
 
@@ -1514,6 +1635,93 @@ mod tests {
             }
             RealGit.run_raw(repo, args)
         }
+    }
+
+    /// Real git, except as `refuse` says: given an argv, `Some(stderr)` fails
+    /// that call.
+    struct Refuses(fn(&[&str]) -> Option<&'static str>);
+    impl crate::git::cli::GitCli for Refuses {
+        fn run_raw(
+            &self,
+            repo: &std::path::Path,
+            args: &[&str],
+        ) -> crate::error::Result<crate::git::cli::GitOutput> {
+            if let Some(stderr) = (self.0)(args) {
+                return Ok(crate::git::cli::GitOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: stderr.into(),
+                });
+            }
+            RealGit.run_raw(repo, args)
+        }
+    }
+
+    /// Runs a real `--all -y` prune with `git`, returning stderr.
+    fn run_yes_with(repo: &TestRepo, git: Refuses) -> String {
+        let mut t = crate::testutil::test_cx_with_git(
+            &[],
+            repo.root().to_str().unwrap(),
+            std::sync::Arc::new(git),
+        );
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, &all_run(), false).unwrap();
+        t.err.contents()
+    }
+
+    #[test]
+    fn a_branch_the_batch_delete_leaves_is_retried_alone() {
+        // The batched `branch -D` fails outright; each branch then goes on
+        // its own, and counts.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "one");
+        bare_branch(&repo, "two");
+        let err = run_yes_with(
+            &repo,
+            Refuses(|args| {
+                (args.first() == Some(&"branch") && args.len() > 3).then_some("fatal: batch")
+            }),
+        );
+        assert!(err.contains("pruned 2 item(s)"), "{err}");
+        assert!(!err.contains("could not delete"), "{err}");
+        assert!(!has_branch(&repo, "one"));
+        assert!(!has_branch(&repo, "two"));
+    }
+
+    #[test]
+    fn a_branch_git_will_not_delete_is_reported_on_its_own() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "stuck");
+        bare_branch(&repo, "fine");
+        let err = run_yes_with(
+            &repo,
+            Refuses(|args| {
+                (args.first() == Some(&"branch") && args.contains(&"stuck")).then_some("fatal: no")
+            }),
+        );
+        assert!(err.contains("could not delete stuck: fatal: no"), "{err}");
+        assert!(!err.contains("could not delete fine"), "{err}");
+        assert!(err.contains("pruned 1 item(s)"), "{err}");
+        assert!(has_branch(&repo, "stuck"));
+        assert!(!has_branch(&repo, "fine"));
+    }
+
+    #[test]
+    fn unreadable_branch_tips_under_the_lock_delete_no_branch() {
+        // Selection reads refs through gix; only the removal's `for-each-ref`
+        // fails, so which branch is where is unknown and none is deleted.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let err = run_yes_with(
+            &repo,
+            Refuses(|args| (args.first() == Some(&"for-each-ref")).then_some("fatal: refs")),
+        );
+        assert!(
+            err.contains("skipping old (branch): cannot read its git state"),
+            "{err}"
+        );
+        assert!(err.contains("pruned 0 item(s)"), "{err}");
+        assert!(has_branch(&repo, "old"));
     }
 
     #[test]

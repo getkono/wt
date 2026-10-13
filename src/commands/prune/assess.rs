@@ -478,19 +478,6 @@ impl<'a> Assessor<'a> {
         })
     }
 
-    /// Whether deleting local branch `name` loses no work — re-checked under the
-    /// repo lock, since the branch may have moved since selection, so it reads
-    /// fresh rather than from the selection caches: `content` is a check made
-    /// under the lock.
-    pub(super) fn branch_is_safe(&self, name: &str, content: &ContentCheck<'_>) -> bool {
-        let tip = branch_ref(name);
-        let recoverable = resolve_hex(self.repo.gix(), &tip).is_some_and(|id| {
-            self.recoverable_now(std::slice::from_ref(&id))
-                .contains(&id)
-        });
-        recoverable || self.targets.is_merged(content, self.repo, &tip)
-    }
-
     /// Whether `branch`'s upstream is configured but its tracking ref is gone.
     fn upstream_gone(&self, branch: Option<&str>) -> bool {
         branch
