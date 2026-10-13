@@ -13,38 +13,12 @@ use std::path::Path;
 
 use crate::git::cli::GitCli;
 
-/// Whether every change `tip` introduces is already in `target`, run in `dir`:
-/// merging `tip` into `target` would leave `target`'s tree unchanged
-/// (`git merge-tree --write-tree`, git ≥ 2.38). Meant for a `tip` that is *not*
-/// an ancestor of `target` — ancestry is the cheaper, stronger test and callers
-/// try it first.
-///
-/// This is a tree test, not a patch test, on purpose: a patch-equivalence check
-/// (`git cherry`) still matches a change the target later reverted, which would
-/// make reverted work look safe to delete. The cost is that a change the target
-/// has since edited on the same lines conflicts and reads as "not merged" — the
-/// safe direction to be wrong in.
-///
-/// A branch whose final tree equals its merge base's — nothing but empty
-/// commits, or work it added and then backed out itself — also merges as a
-/// no-op, yet its commits may hold work found nowhere else. It reads as "not
-/// merged", so only a branch that actually changes something can be judged
-/// merged by content.
-///
-/// `merge-tree` writes the merged tree to the object store; it creates no ref,
-/// so the object is garbage-collected like any other unreachable one. A conflict,
-/// unrelated histories, or a `git` without `merge-tree --write-tree` returns
-/// `false`.
-#[cfg_attr(not(feature = "cli"), allow(dead_code))]
-pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> bool {
-    ContentCheck::new(git, dir).is_merged(tip, target)
-}
-
-/// [`is_content_merged`] for many tips and targets in one run: what does not
-/// depend on the tip — the merge-driver overrides and each target's tree — is
-/// read once and reused, so each further check costs a `merge-base`, one
-/// `rev-parse`, and the `merge-tree` itself. Only for the span of one command:
-/// config or a target that changes meanwhile is not seen.
+/// The content check, run with one `git` in one directory for any number of
+/// tips and targets: what does not depend on the tip — the merge-driver
+/// overrides and each target's tree — is read once and reused, so each check
+/// costs a `merge-base`, one `rev-parse`, and the `merge-tree` itself. Lives
+/// for the span of one command: config or a target that changes meanwhile is
+/// not seen.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) struct ContentCheck<'a> {
     git: &'a dyn GitCli,
@@ -65,8 +39,28 @@ impl<'a> ContentCheck<'a> {
         }
     }
 
-    /// Whether every change `tip` introduces is already in `target` (see
-    /// [`is_content_merged`]).
+    /// Whether every change `tip` introduces is already in `target`: merging
+    /// `tip` into `target` would leave `target`'s tree unchanged
+    /// (`git merge-tree --write-tree`, git ≥ 2.38). Meant for a `tip` that is
+    /// *not* an ancestor of `target` — ancestry is the cheaper, stronger test
+    /// and callers try it first.
+    ///
+    /// This is a tree test, not a patch test, on purpose: a patch-equivalence
+    /// check (`git cherry`) still matches a change the target later reverted,
+    /// which would make reverted work look safe to delete. The cost is that a
+    /// change the target has since edited on the same lines conflicts and reads
+    /// as "not merged" — the safe direction to be wrong in.
+    ///
+    /// A branch whose final tree equals its merge base's — nothing but empty
+    /// commits, or work it added and then backed out itself — also merges as a
+    /// no-op, yet its commits may hold work found nowhere else. It reads as "not
+    /// merged", so only a branch that actually changes something can be judged
+    /// merged by content.
+    ///
+    /// `merge-tree` writes the merged tree to the object store; it creates no
+    /// ref, so the object is garbage-collected like any other unreachable one.
+    /// A conflict, unrelated histories, or a `git` without
+    /// `merge-tree --write-tree` returns `false`.
     pub(crate) fn is_merged(&self, tip: &str, target: &str) -> bool {
         let (git, dir) = (self.git, self.dir);
         let Some(expected) = self.target_tree(target) else {
@@ -213,6 +207,11 @@ mod tests {
     use super::*;
     use crate::git::cli::RealGit;
     use crate::testutil::TestRepo;
+
+    /// One check on its own, nothing reused.
+    fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> bool {
+        ContentCheck::new(git, dir).is_merged(tip, target)
+    }
 
     fn merged(repo: &TestRepo, tip: &str) -> bool {
         is_content_merged(&RealGit, repo.root(), tip, "refs/heads/main")

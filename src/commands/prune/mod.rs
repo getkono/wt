@@ -18,12 +18,12 @@ use crate::error::{Error, Result};
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::porcelain::RawWorktree;
-use crate::git::worktrees::{HeldBranch, in_progress_branch, in_progress_op};
+use crate::git::worktrees::{HeldBranch, in_progress_branch_in, in_progress_op};
 use crate::git::{
-    branch_ref, current_branch, enumerate, is_clean_for_removal, local_branches, ops,
+    abbrev_len, branch_ref, current_branch, enumerate, is_clean_for_removal, local_branches, ops,
 };
 use crate::model::Worktree;
-use crate::worktree::{build_worktrees, lock_repo};
+use crate::worktree::{enrich_worktree, enumerate_worktrees, lock_repo};
 
 use assess::{Assessor, Block, MergeTargets, Subject, Verdict};
 
@@ -44,19 +44,27 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     if args.needs_fetch() {
         fetch_remotes(git, &session.repo, &root)?;
     }
-    let worktrees = build_worktrees(&session.repo, git)?;
+    // Bare rows: selection reads nothing the listing enrichment adds (status,
+    // ahead/behind, commits), so only `--json` enriches, and only candidates.
+    let mut worktrees = enumerate_worktrees(&session.repo, git)?;
     // The porcelain records carry what the rows do not: the lock, and a detached
     // worktree's HEAD commit.
     let raws = enumerate(git, &root)?;
     let targets = MergeTargets::resolve(&session.repo);
     let current = current_branch(session.repo.gix());
-    let assessor = Assessor {
-        git,
-        root: &root,
-        repo: &session.repo,
-        args,
-        targets: &targets,
-    };
+    let assessor = Assessor::new(git, &root, &session.repo, args, &targets);
+    // Every branch tip and detached HEAD in one recoverability check, rather
+    // than one `git` per subject.
+    let branch_refs: Vec<String> = local_branches(session.repo.gix())?
+        .iter()
+        .map(|name| branch_ref(name))
+        .collect();
+    assessor.prefetch_recoverable(
+        branch_refs
+            .iter()
+            .map(String::as_str)
+            .chain(raws.iter().filter_map(|raw| raw.head.as_deref())),
+    );
 
     let mut verdicts: Vec<Verdict> = worktrees
         .iter()
@@ -83,7 +91,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
         .filter_map(|(_, w)| w.branch.clone())
         .collect();
     let mut branch_verdicts = assessor.branches(current.as_deref(), &worktree_branches)?;
-    keep_held_branches(git, &root, &worktrees, &mut branch_verdicts);
+    keep_held_branches(&assessor, &worktrees, &mut branch_verdicts);
     verdicts.extend(branch_verdicts);
     let (candidates, skipped): (Vec<Verdict>, Vec<Verdict>) =
         verdicts.into_iter().partition(|v| v.block.is_none());
@@ -115,6 +123,15 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 
     // `--dry-run` (and the `--json` form) only report the candidate set.
     if args.dry_run || json {
+        if json {
+            // A worktree candidate's JSON line is its full listing row.
+            let abbrev = abbrev_len(session.repo.gix());
+            for verdict in &candidates {
+                if let Subject::Worktree { index, .. } = verdict.subject {
+                    enrich_worktree(&session.repo, git, abbrev, &mut worktrees[index]);
+                }
+            }
+        }
         // Report the empty case explicitly on stderr so a dry-run that finds
         // nothing is never silently blank.
         if candidates.is_empty() && !json {
@@ -202,16 +219,14 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
 /// and so names no branch: it is kept, and said so. When a worktree's state
 /// cannot be read, the branch it holds is unknown, so every bare branch is
 /// kept rather than trusting git to refuse the one in use.
-fn keep_held_branches(
-    git: &dyn GitCli,
-    root: &Path,
-    worktrees: &[Worktree],
-    verdicts: &mut [Verdict],
-) {
+fn keep_held_branches(assessor: &Assessor<'_>, worktrees: &[Worktree], verdicts: &mut [Verdict]) {
     let mut unreadable_holders: Vec<String> = Vec::new();
     let mut held: Vec<(HeldBranch, String)> = Vec::new();
     for w in worktrees {
-        match in_progress_branch(git, root, &w.path, w.is_missing) {
+        match assessor
+            .admin_dir(w)
+            .and_then(|dir| in_progress_branch_in(&dir))
+        {
             Ok(Some(branch)) => held.push((branch, candidate_label(w))),
             Ok(None) => {}
             Err(error) => {
@@ -472,12 +487,10 @@ fn delete_merged_branch(
     if !meta.created_by_wt {
         return;
     }
-    if !assessor.targets.is_merged(
-        assessor.git,
-        assessor.root,
-        assessor.repo,
-        &branch_ref(branch),
-    ) {
+    if !assessor
+        .targets
+        .is_merged(&assessor.content, assessor.repo, &branch_ref(branch))
+    {
         return;
     }
     match ops::delete_branch(assessor.git, assessor.root, branch, true) {
@@ -1013,13 +1026,7 @@ mod tests {
     ) {
         let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
         let targets = super::MergeTargets::resolve(&r);
-        let assessor = super::Assessor {
-            git,
-            root: repo.root(),
-            repo: &r,
-            args,
-            targets: &targets,
-        };
+        let assessor = super::Assessor::new(git, repo.root(), &r, args, &targets);
         f(&assessor);
     }
 
