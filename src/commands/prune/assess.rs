@@ -142,6 +142,10 @@ pub(super) enum Block {
     /// A branch holding work found on no remote and not in the default branch.
     /// Overridden by `--force`.
     Unsafe,
+    /// A bare branch that moved after its safety was re-checked under the
+    /// lock, so the check vouches for a commit it no longer names. Only arises
+    /// when there was a check, so without `--force`.
+    Moved,
 }
 
 impl Block {
@@ -161,6 +165,7 @@ impl Block {
             Block::Unsafe => {
                 "has work on no remote and not in the default branch; use --force".into()
             }
+            Block::Moved => "moved since it was checked; run prune again".into(),
         }
     }
 }
@@ -240,12 +245,11 @@ impl<'a> Assessor<'a> {
     /// Answers the recoverability of every tip in `tips` (refs or commit ids)
     /// in one batched check, so the per-subject [`Self::recoverable`] calls
     /// that follow spawn nothing. A tip that does not resolve is left out (it
-    /// reads as unrecoverable), and a failed check marks the whole batch
-    /// unrecoverable.
+    /// reads as unrecoverable).
     pub(super) fn prefetch_recoverable<'t>(&self, tips: impl IntoIterator<Item = &'t str>) {
         let ids: Vec<String> = tips
             .into_iter()
-            .filter_map(|tip| resolve_hex(self.repo.gix(), tip))
+            .filter_map(|tip| self.commit_of(tip))
             .filter(|id| !self.recoverable.borrow().contains_key(id))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -258,9 +262,11 @@ impl<'a> Assessor<'a> {
         }
     }
 
-    /// The subset of `ids` that is recoverable, read now, keeping the local
-    /// default branch. A failed check yields none, so a git error can never
-    /// be the reason work is deleted.
+    /// The subset of `ids` (commit ids) that is recoverable, read now, keeping
+    /// the local default branch. When the batch fails, each id is checked on
+    /// its own, so one bad commit costs only its own answer; an id whose check
+    /// fails is unrecoverable, so a git error can never be the reason work is
+    /// deleted.
     pub(super) fn recoverable_now(&self, ids: &[String]) -> HashSet<String> {
         if ids.is_empty() {
             return HashSet::new();
@@ -268,9 +274,22 @@ impl<'a> Assessor<'a> {
         let keep: Vec<&str> = self.targets.local_default_ref().into_iter().collect();
         let tips: Vec<&str> = ids.iter().map(String::as_str).collect();
         recoverable_tips(self.git, self.root, &tips, &keep).unwrap_or_else(|e| {
-            tracing::warn!(tips = tips.len(), error = %e, "prune: recoverability check failed");
-            HashSet::new()
+            tracing::warn!(tips = tips.len(), error = %e, "prune: batched recoverability check failed; checking each");
+            tips.iter()
+                .filter(|tip| {
+                    recoverable_tips(self.git, self.root, &[tip], &keep)
+                        .inspect_err(|e| tracing::warn!(tip, error = %e, "prune: recoverability check failed"))
+                        .is_ok_and(|recoverable| recoverable.contains(**tip))
+                })
+                .map(|tip| tip.to_string())
+                .collect()
         })
+    }
+
+    /// The commit `tip` (a ref or commit id) peels to: a branch may point at
+    /// an annotated tag, whose own id no reachability check ever prints.
+    fn commit_of(&self, tip: &str) -> Option<String> {
+        resolve_hex(self.repo.gix(), &format!("{tip}^{{commit}}"))
     }
 
     /// The admin directory of `worktree`, resolved once per run.
@@ -490,7 +509,7 @@ impl<'a> Assessor<'a> {
     /// tip that does not resolve, or a failed check, reads as unrecoverable so
     /// a git error can never be the reason work is deleted.
     pub(super) fn recoverable(&self, tip: &str) -> bool {
-        let Some(id) = resolve_hex(self.repo.gix(), tip) else {
+        let Some(id) = self.commit_of(tip) else {
             tracing::warn!(tip, "prune: recoverability check on an unknown tip");
             return false;
         };

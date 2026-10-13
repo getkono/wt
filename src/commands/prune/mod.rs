@@ -461,26 +461,42 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
         let ids: Vec<String> = present.iter().map(|(_, id)| id.to_string()).collect();
         assessor.recoverable_now(&ids)
     };
-    let mut doomed: Vec<&str> = Vec::new();
-    for (name, id) in present {
-        if !force
-            && !recoverable.contains(id)
-            && !assessor
-                .targets
-                .is_merged(&removal.content, assessor.repo, id)
-        {
-            cx.err.line(&format!(
-                "skipping {name} (branch): {}",
-                Block::Unsafe.message()
-            ))?;
-            tracing::debug!(branch = %name, "prune: skip unsafe branch");
-            continue;
+    let mut outcomes: Vec<(&str, Option<Block>)> = present
+        .iter()
+        .map(|&(name, id)| {
+            let safe = force
+                || recoverable.contains(id)
+                || assessor
+                    .targets
+                    .is_merged(&removal.content, assessor.repo, id);
+            (name, (!safe).then_some(Block::Unsafe))
+        })
+        .collect();
+    // The checks above take a while, and the lock keeps out only `wt`: a branch
+    // that moved meanwhile was checked at a commit it no longer names, so it is
+    // kept. What is left between this read and the delete is one spawn. Under
+    // `--force` nothing was checked, so nothing is re-read.
+    if !force && outcomes.iter().any(|(_, block)| block.is_none()) {
+        let checked: HashMap<&str, &str> = present.iter().copied().collect();
+        let now = branch_tips(git, root);
+        for (name, block) in &mut outcomes {
+            if block.is_some() {
+                continue;
+            }
+            match &now {
+                Ok(now) if now.get(*name).map(String::as_str) != checked.get(name).copied() => {
+                    *block = Some(Block::Moved);
+                }
+                Ok(_) => {}
+                Err(_) => *block = Some(Block::Unreadable),
+            }
         }
-        doomed.push(name);
     }
-    if doomed.is_empty() {
-        return Ok(0);
-    }
+    let doomed: Vec<&str> = outcomes
+        .iter()
+        .filter(|(_, block)| block.is_none())
+        .map(|(name, _)| *name)
+        .collect();
     for chunk in doomed.chunks(BRANCHES_PER_DELETE) {
         // Whether each went is read back below; git's own messages are
         // translated, so they are not parsed.
@@ -492,14 +508,25 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
             Ok(_) => {}
         }
     }
-    let left = branch_tips(git, root)
-        .inspect_err(|error| tracing::debug!(%error, "prune: cannot re-read branch tips"))
-        .ok();
+    let left = if doomed.is_empty() {
+        None
+    } else {
+        branch_tips(git, root)
+            .inspect_err(|error| tracing::debug!(%error, "prune: cannot re-read branch tips"))
+            .ok()
+    };
+    // Every branch is reported in candidate order, as it was checked.
     let mut deleted = 0_usize;
-    for name in doomed {
+    for (name, block) in outcomes {
+        if let Some(block) = block {
+            cx.err
+                .line(&format!("skipping {name} (branch): {}", block.message()))?;
+            tracing::debug!(branch = %name, ?block, "prune: skip branch");
+            continue;
+        }
         let gone = match &left {
             Some(left) => !left.contains_key(name),
-            None => !branch_exists(git, root, name),
+            None => branch_is_gone(git, root, name),
         };
         // One the batch left is tried alone, which also yields its own error.
         if gone || delete_branch(cx, git, root, name)? {
@@ -532,18 +559,23 @@ fn delete_branch(cx: &mut Cx, git: &dyn GitCli, root: &Path, name: &str) -> Resu
 
 /// Every local branch's tip, read now: short name to commit id.
 fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>> {
+    // `%(*objectname)` is the commit a branch pointing at an annotated tag
+    // peels to (empty otherwise): reachability is a question about commits,
+    // and a tag object's own id is never among them.
     let out = git.run(
         root,
         &[
             "for-each-ref",
-            "--format=%(objectname) %(refname)",
+            "--format=%(objectname) %(*objectname) %(refname)",
             "refs/heads/",
         ],
     )?;
     Ok(out
         .lines()
         .filter_map(|line| {
-            let (id, name) = line.split_once(' ')?;
+            let mut fields = line.splitn(3, ' ');
+            let (id, peeled, name) = (fields.next()?, fields.next()?, fields.next()?);
+            let id = if peeled.is_empty() { id } else { peeled };
             Some((
                 name.strip_prefix("refs/heads/")?.to_string(),
                 id.to_string(),
@@ -552,13 +584,16 @@ fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>>
         .collect())
 }
 
-/// Whether the local branch `name` still exists.
-fn branch_exists(git: &dyn GitCli, root: &Path, name: &str) -> bool {
+/// Whether the local branch `name` is known to be gone: `rev-parse --quiet`
+/// failed without a word, which is how it reports a missing ref. Any other
+/// failure — git not running at all included — cannot tell, and reads as the
+/// branch still being there.
+fn branch_is_gone(git: &dyn GitCli, root: &Path, name: &str) -> bool {
     git.run_raw(
         root,
         &["rev-parse", "--verify", "--quiet", &branch_ref(name)],
     )
-    .is_ok_and(|out| out.success)
+    .is_ok_and(|out| !out.success && out.stderr.trim().is_empty())
 }
 
 /// A human label for a verdict's subject (worktree or bare branch).
@@ -888,8 +923,139 @@ mod tests {
         assert_eq!(v["branch"], serde_json::json!("merged-wt"));
         assert_eq!(v["reason"], serde_json::json!("merged"));
         assert_eq!(v["schema_version"], serde_json::json!(1));
+        // The row is the full listing row: the fields only enrichment fills.
+        assert_eq!(v["dirty"], serde_json::json!(false));
+        assert_eq!(v["has_untracked"], serde_json::json!(false));
+        assert!(v["commit"]["hash"].is_string(), "{v}");
         // --json implies dry-run: still present.
         assert!(repo.git(&["worktree", "list"]).contains("merged-wt"));
+    }
+
+    #[test]
+    fn a_remote_default_at_the_local_commit_is_one_target() {
+        let repo = TestRepo::init();
+        repo.git(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"]);
+        repo.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
+        assert_eq!(super::MergeTargets::resolve(&r).refs, ["refs/heads/main"]);
+        // Once they differ, both count.
+        repo.write("new.txt", "x\n");
+        repo.commit_all("local only");
+        let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
+        assert_eq!(
+            super::MergeTargets::resolve(&r).refs,
+            ["refs/heads/main", "refs/remotes/origin/main"]
+        );
+    }
+
+    #[test]
+    fn a_branch_pointing_at_a_tag_of_unpushed_work_is_unsafe() {
+        // The tag object's own id is never printed by `rev-list`; only the
+        // commit it peels to is, so that is what must be checked.
+        let repo = TestRepo::init();
+        diverged_branch(&repo, "work");
+        repo.git(&["tag", "-a", "-m", "note", "v-work", "work"]);
+        let tag = repo.git(&["rev-parse", "v-work"]).trim().to_string();
+        // Porcelain refuses a tag on a branch; the ref file does not.
+        std::fs::write(
+            repo.root().join(".git/refs/heads/tagged"),
+            format!("{tag}\n"),
+        )
+        .unwrap();
+        repo.git(&["branch", "-D", "work"]);
+        repo.git(&["tag", "-d", "v-work"]);
+        let pushed = PruneArgs {
+            pushed: true,
+            ..prune_args(false, false, false, false)
+        };
+        let err = run_yes(&repo, &pushed);
+        assert!(!err.contains("tagged"), "{err}");
+        assert!(has_branch(&repo, "tagged"));
+    }
+
+    #[test]
+    fn branch_skips_and_failures_are_reported_in_candidate_order() {
+        // Three merged branches; while the prompt waits, the middle one is
+        // moved onto work found nowhere else, so its re-check fails, and git
+        // refuses to delete the other two.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "a-stuck");
+        bare_branch(&repo, "b-unsafe");
+        bare_branch(&repo, "c-stuck");
+        diverged_branch(&repo, "wip"); // selected by no mode
+        let mut t = crate::testutil::test_cx_with_git(
+            &[],
+            repo.root().to_str().unwrap(),
+            std::sync::Arc::new(Refuses(|args| {
+                (args.first() == Some(&"branch") && args.iter().any(|a| a.ends_with("-stuck")))
+                    .then_some("fatal: no")
+            })),
+        );
+        t.cx.input = Box::new(ActsThenConfirms {
+            dir: repo.root().to_path_buf(),
+            args: vec!["branch", "-f", "b-unsafe", "wip"],
+        });
+        super::run(&mut t.cx, &all_run(), false).unwrap();
+        let err = t.err.contents();
+        let at = |needle: &str| {
+            err.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {err}"))
+        };
+        assert!(at("could not delete a-stuck") < at("skipping b-unsafe (branch)"));
+        assert!(at("skipping b-unsafe (branch)") < at("could not delete c-stuck"));
+    }
+
+    #[test]
+    fn a_branch_that_moves_before_its_delete_is_kept() {
+        // Stands in for a commit made by a git outside `wt` between the
+        // safety check and the delete: the branch moves on the re-read.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let moved = std::sync::Arc::new(MovesOnSecondRead {
+            reads,
+            repo: repo.root().to_path_buf(),
+        });
+        let mut t = crate::testutil::test_cx_with_git(&[], repo.root().to_str().unwrap(), moved);
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, &all_run(), false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.contains("skipping old (branch): moved since it was checked"),
+            "{err}"
+        );
+        assert!(has_branch(&repo, "old"));
+    }
+
+    /// Real git, which commits onto `old` just before the second
+    /// `for-each-ref` (the re-read right before the delete).
+    struct MovesOnSecondRead {
+        reads: std::sync::atomic::AtomicUsize,
+        repo: std::path::PathBuf,
+    }
+    impl crate::git::cli::GitCli for MovesOnSecondRead {
+        fn run_raw(
+            &self,
+            repo: &std::path::Path,
+            args: &[&str],
+        ) -> crate::error::Result<crate::git::cli::GitOutput> {
+            use std::sync::atomic::Ordering;
+            if args.first() == Some(&"for-each-ref")
+                && self.reads.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                let tree = RealGit.run(&self.repo, &["rev-parse", "old^{tree}"])?;
+                let commit = RealGit.run(
+                    &self.repo,
+                    &["commit-tree", tree.trim(), "-p", "old", "-m", "late"],
+                )?;
+                RealGit.run(&self.repo, &["update-ref", "refs/heads/old", commit.trim()])?;
+            }
+            RealGit.run_raw(repo, args)
+        }
     }
 
     #[test]
@@ -1142,8 +1308,12 @@ mod tests {
             assert!(!assessor.recoverable("refs/heads/no-such-branch"));
             let main = repo.git(&["rev-parse", "main"]).trim().to_string();
             let unknown = "0123456789abcdef0123456789abcdef01234567".to_string();
-            // One bad commit fails the whole batch, the good one included.
-            assert!(assessor.recoverable_now(&[main, unknown]).is_empty());
+            // One bad commit fails the batch; each is then checked alone, so
+            // only the bad one loses its answer (`main` keeps itself).
+            assert_eq!(
+                assessor.recoverable_now(&[main.clone(), unknown]),
+                std::collections::HashSet::from([main])
+            );
         });
     }
 
