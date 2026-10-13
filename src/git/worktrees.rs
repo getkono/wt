@@ -57,7 +57,12 @@ pub(crate) struct HeldBranch {
 /// A `missing` worktree's directory is gone, so git cannot be asked from inside
 /// it; its admin directory is found from the repository at `repo_dir` instead
 /// (see [`missing_admin_dir`]).
-fn admin_dir(git: &dyn GitCli, repo_dir: &Path, worktree: &Path, missing: bool) -> Result<PathBuf> {
+pub(crate) fn admin_dir(
+    git: &dyn GitCli,
+    repo_dir: &Path,
+    worktree: &Path,
+    missing: bool,
+) -> Result<PathBuf> {
     if missing {
         return missing_admin_dir(git, repo_dir, worktree);
     }
@@ -119,27 +124,28 @@ pub(crate) fn in_progress_op(
     missing: bool,
 ) -> Result<Option<&'static str>> {
     let git_dir = admin_dir(git, repo_dir, worktree, missing)?;
-    Ok(IN_PROGRESS_MARKERS
-        .iter()
-        .find(|(marker, _)| git_dir.join(marker).exists())
-        .map(|(_, op)| *op))
+    Ok(in_progress_op_in(&git_dir))
 }
 
-/// The local branch an in-progress rebase or bisect in the worktree at
-/// `worktree` will return to, if any. Mid-operation the worktree is detached,
-/// so `git worktree list` no longer names that branch — yet it is still in use.
-/// An absent state file means no such operation; any other read failure (a
-/// permission error, a file that is not UTF-8) is an error, so a caller can
-/// fail safe rather than take the branch for unused. A `missing` worktree's
-/// state is read through the repository at `repo_dir`.
+/// [`in_progress_op`] for a worktree whose admin directory `git_dir` is
+/// already known (see [`admin_dir`]).
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-pub(crate) fn in_progress_branch(
-    git: &dyn GitCli,
-    repo_dir: &Path,
-    worktree: &Path,
-    missing: bool,
-) -> Result<Option<HeldBranch>> {
-    let git_dir = admin_dir(git, repo_dir, worktree, missing)?;
+pub(crate) fn in_progress_op_in(git_dir: &Path) -> Option<&'static str> {
+    IN_PROGRESS_MARKERS
+        .iter()
+        .find(|(marker, _)| git_dir.join(marker).exists())
+        .map(|(_, op)| *op)
+}
+
+/// The local branch an in-progress rebase or bisect in the worktree whose admin
+/// directory is `git_dir` (see [`admin_dir`]) will return to, if any.
+/// Mid-operation the worktree is detached, so `git worktree list` no longer
+/// names that branch — yet it is still in use. An absent state file means no
+/// such operation; any other read failure (a permission error, a file that is
+/// not UTF-8) is an error, so a caller can fail safe rather than take the
+/// branch for unused.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn in_progress_branch_in(git_dir: &Path) -> Result<Option<HeldBranch>> {
     for (file, activity) in IN_PROGRESS_BRANCH_FILES {
         let contents = match std::fs::read_to_string(git_dir.join(file)) {
             Ok(contents) => contents,
@@ -163,6 +169,17 @@ mod tests {
     use super::*;
     use crate::git::cli::RealGit;
     use crate::testutil::TestRepo;
+
+    /// [`in_progress_branch_in`] for the worktree at `worktree`, resolving its
+    /// admin directory the way prune does (a `missing` one through `repo_dir`).
+    fn in_progress_branch(
+        git: &dyn GitCli,
+        repo_dir: &Path,
+        worktree: &Path,
+        missing: bool,
+    ) -> Result<Option<HeldBranch>> {
+        in_progress_branch_in(&admin_dir(git, repo_dir, worktree, missing)?)
+    }
 
     #[test]
     fn enumerates_main_and_linked() {

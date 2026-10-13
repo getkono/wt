@@ -6,17 +6,18 @@
 //! commit reachable from a remote-tracking ref or the default branch, or a change
 //! already in the default branch under another SHA (a squash or rebase merge).
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::cli::PruneArgs;
 use crate::error::Result;
-use crate::git::aheadbehind::is_recoverable;
+use crate::git::aheadbehind::recoverable_tips;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
-use crate::git::merged::is_content_merged;
+use crate::git::merged::ContentCheck;
 use crate::git::porcelain::RawWorktree;
-use crate::git::worktrees::in_progress_op;
+use crate::git::worktrees::{admin_dir, in_progress_op_in};
 use crate::git::{
     branch_ref, default_branch, default_tracking_ref, is_ancestor, is_clean_for_removal,
     local_branches, resolve_hex, upstream_of,
@@ -34,14 +35,18 @@ pub(super) struct MergeTargets {
 }
 
 impl MergeTargets {
+    /// A target at the same commit as an earlier one is dropped: every check
+    /// against it would repeat the earlier one's answer. The local default
+    /// comes first, so it is the one kept.
     pub(super) fn resolve(repo: &Repo) -> Self {
         let default = default_branch(repo.gix());
+        let mut seen: HashSet<String> = HashSet::new();
         let refs = default
             .as_deref()
             .map(branch_ref)
             .into_iter()
             .chain(default_tracking_ref(repo.gix()))
-            .filter(|r| resolve_hex(repo.gix(), r).is_some())
+            .filter(|r| resolve_hex(repo.gix(), r).is_some_and(|id| seen.insert(id)))
             .collect();
         MergeTargets { default, refs }
     }
@@ -60,16 +65,16 @@ impl MergeTargets {
     }
 
     /// Whether every change on `tip` is already in some target under other SHAs
-    /// (see [`is_content_merged`]).
-    fn has_content_merge(&self, git: &dyn GitCli, root: &Path, tip: &str) -> bool {
+    /// (see [`ContentCheck`]).
+    fn has_content_merge(&self, content: &ContentCheck<'_>, tip: &str) -> bool {
         self.refs
             .iter()
-            .any(|target| is_content_merged(git, root, tip, target))
+            .any(|target| content.is_merged(tip, target))
     }
 
     /// Whether `tip` is merged into some target, by ancestry or by content.
-    pub(super) fn is_merged(&self, git: &dyn GitCli, root: &Path, repo: &Repo, tip: &str) -> bool {
-        self.has_ancestor_merge(repo, tip) || self.has_content_merge(git, root, tip)
+    pub(super) fn is_merged(&self, content: &ContentCheck<'_>, repo: &Repo, tip: &str) -> bool {
+        self.has_ancestor_merge(repo, tip) || self.has_content_merge(content, tip)
     }
 
     /// The local default branch ref, if it resolves — the one non-remote ref
@@ -137,6 +142,10 @@ pub(super) enum Block {
     /// A branch holding work found on no remote and not in the default branch.
     /// Overridden by `--force`.
     Unsafe,
+    /// A bare branch that moved after its safety was re-checked under the
+    /// lock, so the check vouches for a commit it no longer names. Only arises
+    /// when there was a check, so without `--force`.
+    Moved,
 }
 
 impl Block {
@@ -156,6 +165,7 @@ impl Block {
             Block::Unsafe => {
                 "has work on no remote and not in the default branch; use --force".into()
             }
+            Block::Moved => "moved since it was checked; run prune again".into(),
         }
     }
 }
@@ -193,15 +203,107 @@ pub(super) struct Verdict {
 }
 
 /// Classifies worktrees and branches for one prune run.
+///
+/// What every subject's checks share is read once: the content check's
+/// merge-driver config and target trees, each commit's recoverability (see
+/// [`Assessor::prefetch_recoverable`]), and each worktree's admin directory.
+/// The caches hold for selection only; the re-checks under the repo lock read
+/// fresh.
 pub(super) struct Assessor<'a> {
     pub(super) git: &'a dyn GitCli,
     pub(super) root: &'a Path,
     pub(super) repo: &'a Repo,
     pub(super) args: &'a PruneArgs,
     pub(super) targets: &'a MergeTargets,
+    pub(super) content: ContentCheck<'a>,
+    /// Recoverability by commit id.
+    recoverable: RefCell<HashMap<String, bool>>,
+    /// Admin directory by worktree path.
+    admin_dirs: RefCell<HashMap<PathBuf, PathBuf>>,
 }
 
-impl Assessor<'_> {
+impl<'a> Assessor<'a> {
+    pub(super) fn new(
+        git: &'a dyn GitCli,
+        root: &'a Path,
+        repo: &'a Repo,
+        args: &'a PruneArgs,
+        targets: &'a MergeTargets,
+    ) -> Self {
+        Assessor {
+            git,
+            root,
+            repo,
+            args,
+            targets,
+            content: ContentCheck::new(git, root),
+            recoverable: RefCell::new(HashMap::new()),
+            admin_dirs: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Answers the recoverability of every tip in `tips` (refs or commit ids)
+    /// in one batched check, so the per-subject [`Self::recoverable`] calls
+    /// that follow spawn nothing. A tip that does not resolve is left out (it
+    /// reads as unrecoverable).
+    pub(super) fn prefetch_recoverable<'t>(&self, tips: impl IntoIterator<Item = &'t str>) {
+        let ids: Vec<String> = tips
+            .into_iter()
+            .filter_map(|tip| self.commit_of(tip))
+            .filter(|id| !self.recoverable.borrow().contains_key(id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let answers = self.recoverable_now(&ids);
+        let mut cache = self.recoverable.borrow_mut();
+        for id in ids {
+            let recoverable = answers.contains(&id);
+            cache.insert(id, recoverable);
+        }
+    }
+
+    /// The subset of `ids` (commit ids) that is recoverable, read now, keeping
+    /// the local default branch. When the batch fails, each id is checked on
+    /// its own, so one bad commit costs only its own answer; an id whose check
+    /// fails is unrecoverable, so a git error can never be the reason work is
+    /// deleted.
+    pub(super) fn recoverable_now(&self, ids: &[String]) -> HashSet<String> {
+        if ids.is_empty() {
+            return HashSet::new();
+        }
+        let keep: Vec<&str> = self.targets.local_default_ref().into_iter().collect();
+        let tips: Vec<&str> = ids.iter().map(String::as_str).collect();
+        recoverable_tips(self.git, self.root, &tips, &keep).unwrap_or_else(|e| {
+            tracing::warn!(tips = tips.len(), error = %e, "prune: batched recoverability check failed; checking each");
+            tips.iter()
+                .filter(|tip| {
+                    recoverable_tips(self.git, self.root, &[tip], &keep)
+                        .inspect_err(|e| tracing::warn!(tip, error = %e, "prune: recoverability check failed"))
+                        .is_ok_and(|recoverable| recoverable.contains(**tip))
+                })
+                .map(|tip| tip.to_string())
+                .collect()
+        })
+    }
+
+    /// The commit `tip` (a ref or commit id) peels to: a branch may point at
+    /// an annotated tag, whose own id no reachability check ever prints.
+    fn commit_of(&self, tip: &str) -> Option<String> {
+        resolve_hex(self.repo.gix(), &format!("{tip}^{{commit}}"))
+    }
+
+    /// The admin directory of `worktree`, resolved once per run.
+    pub(super) fn admin_dir(&self, worktree: &Worktree) -> Result<PathBuf> {
+        if let Some(dir) = self.admin_dirs.borrow().get(&worktree.path) {
+            return Ok(dir.clone());
+        }
+        let dir = admin_dir(self.git, self.root, &worktree.path, worktree.is_missing)?;
+        self.admin_dirs
+            .borrow_mut()
+            .insert(worktree.path.clone(), dir.clone());
+        Ok(dir)
+    }
+
     /// The verdict for one worktree, or `None` when no selected mode picks it.
     /// The primary worktree is never a candidate. `raw` is the worktree's
     /// porcelain record, which carries the lock and a detached HEAD's commit.
@@ -246,7 +348,7 @@ impl Assessor<'_> {
             return None;
         }
         let safe = tip.is_some_and(|tip| {
-            self.recoverable(tip) || self.targets.is_merged(self.git, self.root, self.repo, tip)
+            self.recoverable(tip) || self.targets.is_merged(&self.content, self.repo, tip)
         });
         (!safe).then_some(Block::Unsafe)
     }
@@ -278,7 +380,7 @@ impl Assessor<'_> {
         }
         if args.includes_merged()
             && let Some(tip) = mergeable
-            && self.targets.has_content_merge(self.git, self.root, tip)
+            && self.targets.has_content_merge(&self.content, tip)
         {
             return Some(Reason::MergedByContent);
         }
@@ -307,7 +409,7 @@ impl Assessor<'_> {
         };
         // A missing worktree can be mid-operation too (its admin entry still
         // holds the state), and is kept like a present one.
-        match in_progress_op(self.git, self.root, &worktree.path, worktree.is_missing) {
+        match self.admin_dir(worktree).map(|dir| in_progress_op_in(&dir)) {
             Ok(Some(op)) => return Some(Block::InProgress(op)),
             Ok(None) => {}
             Err(error) => {
@@ -364,7 +466,7 @@ impl Assessor<'_> {
         let gone = self.upstream_gone(Some(&name));
         let content = !ancestor
             && args.includes_merged()
-            && self.targets.has_content_merge(self.git, self.root, &tip);
+            && self.targets.has_content_merge(&self.content, &tip);
         let by_mode = if args.includes_merged() && ancestor {
             Some(Reason::Merged)
         } else if content {
@@ -384,8 +486,7 @@ impl Assessor<'_> {
         // not depend on which flags were passed.
         let merged = ancestor
             || content
-            || (!args.includes_merged()
-                && self.targets.has_content_merge(self.git, self.root, &tip));
+            || (!args.includes_merged() && self.targets.has_content_merge(&self.content, &tip));
         let safe = recoverable || merged;
         let block = (!safe && !args.force).then_some(Block::Unsafe);
         tracing::trace!(branch = %name, ?reason, ancestor, content, gone, recoverable, safe, "prune: branch classified");
@@ -396,13 +497,6 @@ impl Assessor<'_> {
         })
     }
 
-    /// Whether deleting local branch `name` loses no work — re-checked under the
-    /// repo lock, since the branch may have moved since selection.
-    pub(super) fn branch_is_safe(&self, name: &str) -> bool {
-        let tip = branch_ref(name);
-        self.recoverable(&tip) || self.targets.is_merged(self.git, self.root, self.repo, &tip)
-    }
-
     /// Whether `branch`'s upstream is configured but its tracking ref is gone.
     fn upstream_gone(&self, branch: Option<&str>) -> bool {
         branch
@@ -410,14 +504,16 @@ impl Assessor<'_> {
             .is_some_and(|u| u.is_gone)
     }
 
-    /// [`is_recoverable`] for `tip`, keeping the local default branch, and
-    /// treating a failed check as unrecoverable so a git error can never be the
-    /// reason work is deleted.
+    /// Whether every commit on `tip` is on a remote or the local default
+    /// branch, from the selection cache (checked now when not prefetched). A
+    /// tip that does not resolve, or a failed check, reads as unrecoverable so
+    /// a git error can never be the reason work is deleted.
     pub(super) fn recoverable(&self, tip: &str) -> bool {
-        let keep: Vec<&str> = self.targets.local_default_ref().into_iter().collect();
-        is_recoverable(self.git, self.root, tip, &keep).unwrap_or_else(|e| {
-            tracing::warn!(tip, error = %e, "prune: recoverability check failed");
-            false
-        })
+        let Some(id) = self.commit_of(tip) else {
+            tracing::warn!(tip, "prune: recoverability check on an unknown tip");
+            return false;
+        };
+        self.prefetch_recoverable([id.as_str()]);
+        self.recoverable.borrow().get(&id).copied().unwrap_or(false)
     }
 }
