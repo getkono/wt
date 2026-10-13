@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::cli::PruneArgs;
 use crate::error::Result;
-use crate::git::aheadbehind::is_recoverable;
+use crate::git::aheadbehind::recoverable_tips;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
 use crate::git::merged::is_content_merged;
@@ -410,14 +410,20 @@ impl Assessor<'_> {
             .is_some_and(|u| u.is_gone)
     }
 
-    /// [`is_recoverable`] for `tip`, keeping the local default branch, and
-    /// treating a failed check as unrecoverable so a git error can never be the
-    /// reason work is deleted.
+    /// [`recoverable_tips`] for `tip`, keeping the local default branch, and
+    /// treating a tip that does not resolve, or a failed check, as
+    /// unrecoverable so a git error can never be the reason work is deleted.
     pub(super) fn recoverable(&self, tip: &str) -> bool {
+        let Some(id) = resolve_hex(self.repo.gix(), tip) else {
+            tracing::warn!(tip, "prune: recoverability check on an unknown tip");
+            return false;
+        };
         let keep: Vec<&str> = self.targets.local_default_ref().into_iter().collect();
-        is_recoverable(self.git, self.root, tip, &keep).unwrap_or_else(|e| {
-            tracing::warn!(tip, error = %e, "prune: recoverability check failed");
-            false
-        })
+        recoverable_tips(self.git, self.root, &[&id], &keep)
+            .map(|recoverable| recoverable.contains(&id))
+            .unwrap_or_else(|e| {
+                tracing::warn!(tip, error = %e, "prune: recoverability check failed");
+                false
+            })
     }
 }
