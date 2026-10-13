@@ -7,6 +7,8 @@
 //! The check fails safe: an error, a conflict, or an older `git` reads as "not
 //! merged", so a failed check can never be the reason work is deleted.
 
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::git::cli::GitCli;
@@ -35,39 +37,102 @@ use crate::git::cli::GitCli;
 /// `false`.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) fn is_content_merged(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> bool {
-    let target_tree = format!("{target}^{{tree}}");
-    let Ok(expected) = git.run(dir, &["rev-parse", "--verify", "--quiet", &target_tree]) else {
-        return false;
-    };
-    if !changes_anything(git, dir, tip, target) {
-        return false;
-    }
-    let Some(overrides) = driver_overrides(git, dir) else {
-        tracing::debug!(
-            tip,
-            target,
-            "merge drivers unreadable: content check skipped"
-        );
-        return false;
-    };
-    let mut argv: Vec<&str> = Vec::new();
-    for o in &overrides {
-        argv.extend(["-c", o.as_str()]);
-    }
-    argv.extend(["merge-tree", "--write-tree", "--no-messages", target, tip]);
-    match git.run_raw(dir, &argv) {
-        Ok(out) if out.success => out.stdout.lines().next().map(str::trim) == Some(expected.trim()),
-        Ok(out) => {
-            // Exit 1 is a conflict; anything else (an old git, unrelated
-            // histories, an unknown ref) is logged so a surprising "not merged"
-            // is traceable.
-            tracing::debug!(tip, target, stderr = %out.stderr.trim(), "merge-tree: not a clean no-op");
-            false
+    ContentCheck::new(git, dir).is_merged(tip, target)
+}
+
+/// [`is_content_merged`] for many tips and targets in one run: what does not
+/// depend on the tip — the merge-driver overrides and each target's tree — is
+/// read once and reused, so each further check costs a `merge-base`, one
+/// `rev-parse`, and the `merge-tree` itself. Only for the span of one command:
+/// config or a target that changes meanwhile is not seen.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) struct ContentCheck<'a> {
+    git: &'a dyn GitCli,
+    dir: &'a Path,
+    overrides: OnceCell<Option<Vec<String>>>,
+    target_trees: RefCell<HashMap<String, Option<String>>>,
+}
+
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+impl<'a> ContentCheck<'a> {
+    /// A check run with `git` in `dir`; nothing is read until the first one.
+    pub(crate) fn new(git: &'a dyn GitCli, dir: &'a Path) -> Self {
+        ContentCheck {
+            git,
+            dir,
+            overrides: OnceCell::new(),
+            target_trees: RefCell::new(HashMap::new()),
         }
-        Err(error) => {
-            tracing::debug!(tip, target, %error, "merge-tree could not run");
-            false
+    }
+
+    /// Whether every change `tip` introduces is already in `target` (see
+    /// [`is_content_merged`]).
+    pub(crate) fn is_merged(&self, tip: &str, target: &str) -> bool {
+        let (git, dir) = (self.git, self.dir);
+        let Some(expected) = self.target_tree(target) else {
+            return false;
+        };
+        if !changes_anything(git, dir, tip, target) {
+            return false;
         }
+        let Some(overrides) = self
+            .overrides
+            .get_or_init(|| driver_overrides(git, dir))
+            .as_deref()
+        else {
+            tracing::debug!(
+                tip,
+                target,
+                "merge drivers unreadable: content check skipped"
+            );
+            return false;
+        };
+        let mut argv: Vec<&str> = Vec::new();
+        for o in overrides {
+            argv.extend(["-c", o.as_str()]);
+        }
+        argv.extend(["merge-tree", "--write-tree", "--no-messages", target, tip]);
+        match git.run_raw(dir, &argv) {
+            Ok(out) if out.success => {
+                out.stdout.lines().next().map(str::trim) == Some(expected.as_str())
+            }
+            Ok(out) => {
+                // Exit 1 is a conflict; anything else (an old git, unrelated
+                // histories, an unknown ref) is logged so a surprising "not
+                // merged" is traceable.
+                tracing::debug!(tip, target, stderr = %out.stderr.trim(), "merge-tree: not a clean no-op");
+                false
+            }
+            Err(error) => {
+                tracing::debug!(tip, target, %error, "merge-tree could not run");
+                false
+            }
+        }
+    }
+
+    /// `target`'s tree id, read once per target; `None` when it does not
+    /// resolve.
+    fn target_tree(&self, target: &str) -> Option<String> {
+        if let Some(tree) = self.target_trees.borrow().get(target) {
+            return tree.clone();
+        }
+        let tree = self
+            .git
+            .run(
+                self.dir,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{target}^{{tree}}"),
+                ],
+            )
+            .ok()
+            .map(|t| t.trim().to_string());
+        self.target_trees
+            .borrow_mut()
+            .insert(target.to_string(), tree.clone());
+        tree
     }
 }
 
@@ -125,21 +190,20 @@ fn changes_anything(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> bo
     let Ok(base) = git.run(dir, &["merge-base", target, tip]) else {
         return false;
     };
-    let tree_of = |rev: &str| {
-        git.run(
-            dir,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{rev}^{{tree}}"),
-            ],
-        )
-        .ok()
-        .map(|t| t.trim().to_string())
+    // Both trees in one call: `rev-parse` prints one id per argument, and
+    // fails as a whole if either does not resolve.
+    let Ok(trees) = git.run(
+        dir,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", base.trim()),
+            &format!("{tip}^{{tree}}"),
+        ],
+    ) else {
+        return false;
     };
-    match (tree_of(base.trim()), tree_of(tip)) {
-        (Some(base_tree), Some(tip_tree)) => base_tree != tip_tree,
+    match trees.split_whitespace().collect::<Vec<_>>()[..] {
+        [base_tree, tip_tree] => base_tree != tip_tree,
         _ => false,
     }
 }
@@ -415,6 +479,50 @@ mod tests {
         repo.commit_all("unrelated root");
         repo.git(&["checkout", "-q", "main"]);
         assert!(!merged(&repo, "stray"));
+    }
+
+    /// Real git that records the subcommand of every call.
+    #[derive(Default)]
+    struct Counting(RefCell<Vec<String>>);
+    impl GitCli for Counting {
+        fn run_raw(
+            &self,
+            repo: &Path,
+            args: &[&str],
+        ) -> crate::error::Result<crate::git::GitOutput> {
+            let verb = args
+                .iter()
+                .find(|a| !a.starts_with('-') && !a.contains('='))
+                .unwrap_or(&"");
+            self.0.borrow_mut().push(verb.to_string());
+            RealGit.run_raw(repo, args)
+        }
+    }
+
+    impl Counting {
+        fn count(&self, verb: &str) -> usize {
+            self.0.borrow().iter().filter(|v| *v == verb).count()
+        }
+    }
+
+    #[test]
+    fn one_check_reads_drivers_and_target_tree_once_for_many_tips() {
+        let repo = TestRepo::init();
+        for name in ["a", "b", "c"] {
+            topic(&repo, name, &[(&format!("{name}.txt"), "x\n")]);
+            squash(&repo, name);
+        }
+        topic(&repo, "open", &[("open.txt", "x\n")]);
+        let git = Counting::default();
+        let check = ContentCheck::new(&git, repo.root());
+        for name in ["a", "b", "c"] {
+            assert!(check.is_merged(name, "refs/heads/main"), "{name}");
+        }
+        assert!(!check.is_merged("open", "refs/heads/main"));
+        assert_eq!(git.count("config"), 1);
+        assert_eq!(git.count("merge-tree"), 4);
+        // One target tree, then one combined base/tip tree read per tip.
+        assert_eq!(git.count("rev-parse"), 1 + 4);
     }
 
     #[test]
