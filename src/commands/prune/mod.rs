@@ -415,6 +415,17 @@ fn changed_since_assessed(
 /// many branches go.
 const BRANCHES_PER_DELETE: usize = 256;
 
+/// What becomes of one bare-branch candidate under the lock.
+#[derive(Debug, PartialEq, Eq)]
+enum Fate {
+    /// Safe, and still where it was checked: deleted.
+    Delete,
+    /// Kept, and said why.
+    Skip(Block),
+    /// Deleted by something else meanwhile: skipped quietly.
+    Gone,
+}
+
 /// Deletes the bare-branch candidates `names`, in order, returning how many
 /// were deleted. Each one's safety — every commit on a remote or the default
 /// branch, or every change in the default branch — is re-checked under the
@@ -461,7 +472,7 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
         let ids: Vec<String> = present.iter().map(|(_, id)| id.to_string()).collect();
         assessor.recoverable_now(&ids)
     };
-    let mut outcomes: Vec<(&str, Option<Block>)> = present
+    let mut outcomes: Vec<(&str, Fate)> = present
         .iter()
         .map(|&(name, id)| {
             let safe = force
@@ -469,32 +480,40 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
                 || assessor
                     .targets
                     .is_merged(&removal.content, assessor.repo, id);
-            (name, (!safe).then_some(Block::Unsafe))
+            let fate = if safe {
+                Fate::Delete
+            } else {
+                Fate::Skip(Block::Unsafe)
+            };
+            (name, fate)
         })
         .collect();
     // The checks above take a while, and the lock keeps out only `wt`: a branch
     // that moved meanwhile was checked at a commit it no longer names, so it is
     // kept. What is left between this read and the delete is one spawn. Under
     // `--force` nothing was checked, so nothing is re-read.
-    if !force && outcomes.iter().any(|(_, block)| block.is_none()) {
+    if !force && outcomes.iter().any(|(_, fate)| *fate == Fate::Delete) {
         let checked: HashMap<&str, &str> = present.iter().copied().collect();
         let now = branch_tips(git, root);
-        for (name, block) in &mut outcomes {
-            if block.is_some() {
+        for (name, fate) in &mut outcomes {
+            if *fate != Fate::Delete {
                 continue;
             }
-            match &now {
-                Ok(now) if now.get(*name).map(String::as_str) != checked.get(name).copied() => {
-                    *block = Some(Block::Moved);
-                }
-                Ok(_) => {}
-                Err(_) => *block = Some(Block::Unreadable),
-            }
+            *fate = match &now {
+                Ok(now) => match now.get(*name) {
+                    None => Fate::Gone,
+                    Some(id) if Some(id.as_str()) != checked.get(name).copied() => {
+                        Fate::Skip(Block::Moved)
+                    }
+                    Some(_) => Fate::Delete,
+                },
+                Err(_) => Fate::Skip(Block::Unreadable),
+            };
         }
     }
     let doomed: Vec<&str> = outcomes
         .iter()
-        .filter(|(_, block)| block.is_none())
+        .filter(|(_, fate)| *fate == Fate::Delete)
         .map(|(name, _)| *name)
         .collect();
     for chunk in doomed.chunks(BRANCHES_PER_DELETE) {
@@ -517,12 +536,19 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
     };
     // Every branch is reported in candidate order, as it was checked.
     let mut deleted = 0_usize;
-    for (name, block) in outcomes {
-        if let Some(block) = block {
-            cx.err
-                .line(&format!("skipping {name} (branch): {}", block.message()))?;
-            tracing::debug!(branch = %name, ?block, "prune: skip branch");
-            continue;
+    for (name, fate) in outcomes {
+        match fate {
+            Fate::Skip(block) => {
+                cx.err
+                    .line(&format!("skipping {name} (branch): {}", block.message()))?;
+                tracing::debug!(branch = %name, ?block, "prune: skip branch");
+                continue;
+            }
+            Fate::Gone => {
+                tracing::debug!(branch = %name, "prune: branch already deleted");
+                continue;
+            }
+            Fate::Delete => {}
         }
         let gone = match &left {
             Some(left) => !left.contains_key(name),
@@ -559,29 +585,46 @@ fn delete_branch(cx: &mut Cx, git: &dyn GitCli, root: &Path, name: &str) -> Resu
 
 /// Every local branch's tip, read now: short name to commit id.
 fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>> {
-    // `%(*objectname)` is the commit a branch pointing at an annotated tag
-    // peels to (empty otherwise): reachability is a question about commits,
-    // and a tag object's own id is never among them.
     let out = git.run(
         root,
         &[
             "for-each-ref",
-            "--format=%(objectname) %(*objectname) %(refname)",
+            "--format=%(objectname) %(objecttype) %(refname)",
             "refs/heads/",
         ],
     )?;
-    Ok(out
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.splitn(3, ' ');
-            let (id, peeled, name) = (fields.next()?, fields.next()?, fields.next()?);
-            let id = if peeled.is_empty() { id } else { peeled };
-            Some((
-                name.strip_prefix("refs/heads/")?.to_string(),
-                id.to_string(),
-            ))
-        })
-        .collect())
+    let mut tips = HashMap::new();
+    for line in out.lines() {
+        let mut fields = line.splitn(3, ' ');
+        let (Some(id), Some(kind), Some(name)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(name) = name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        // Reachability is a question about commits, and a tag object's own
+        // id is never among them: a branch pointing at an annotated tag is
+        // peeled to its commit — fully, which `%(*objectname)` does not do
+        // for a tag of a tag on every git. One that cannot be peeled keeps
+        // its own id, so it still reads as present, and as unrecoverable.
+        let id = if kind == "commit" {
+            id.to_string()
+        } else {
+            git.run(
+                root,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{id}^{{commit}}"),
+                ],
+            )
+            .map_or_else(|_| id.to_string(), |peeled| peeled.trim().to_string())
+        };
+        tips.insert(name.to_string(), id);
+    }
+    Ok(tips)
 }
 
 /// Whether the local branch `name` is known to be gone: `rev-parse --quiet`
@@ -995,10 +1038,10 @@ mod tests {
                     .then_some("fatal: no")
             })),
         );
-        t.cx.input = Box::new(ActsThenConfirms {
-            dir: repo.root().to_path_buf(),
-            args: vec!["branch", "-f", "b-unsafe", "wip"],
-        });
+        t.cx.input = Box::new(git_then_confirm(
+            &repo,
+            &["branch", "-f", "b-unsafe", "wip"],
+        ));
         super::run(&mut t.cx, &all_run(), false).unwrap();
         let err = t.err.contents();
         let at = |needle: &str| {
@@ -1015,15 +1058,15 @@ mod tests {
         // safety check and the delete: the branch moves on the re-read.
         let repo = TestRepo::init();
         bare_branch(&repo, "old");
-        let reads = std::sync::atomic::AtomicUsize::new(0);
-        let moved = std::sync::Arc::new(MovesOnSecondRead {
-            reads,
-            repo: repo.root().to_path_buf(),
+        let dir = repo.root().to_path_buf();
+        let err = run_yes_on_tips_read(&repo, move |read| {
+            if read == RE_READ {
+                let tree = repo_git(&dir, &["rev-parse", "old^{tree}"]);
+                let commit = repo_git(&dir, &["commit-tree", &tree, "-p", "old", "-m", "late"]);
+                repo_git(&dir, &["update-ref", "refs/heads/old", &commit]);
+            }
+            false
         });
-        let mut t = crate::testutil::test_cx_with_git(&[], repo.root().to_str().unwrap(), moved);
-        t.cx.assume_yes = true;
-        super::run(&mut t.cx, &all_run(), false).unwrap();
-        let err = t.err.contents();
         assert!(
             err.contains("skipping old (branch): moved since it was checked"),
             "{err}"
@@ -1031,28 +1074,85 @@ mod tests {
         assert!(has_branch(&repo, "old"));
     }
 
-    /// Real git, which commits onto `old` just before the second
-    /// `for-each-ref` (the re-read right before the delete).
-    struct MovesOnSecondRead {
-        reads: std::sync::atomic::AtomicUsize,
-        repo: std::path::PathBuf,
+    #[test]
+    fn a_branch_deleted_elsewhere_before_its_delete_is_skipped_quietly() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let dir = repo.root().to_path_buf();
+        let err = run_yes_on_tips_read(&repo, move |read| {
+            if read == RE_READ {
+                repo_git(&dir, &["branch", "-D", "old"]);
+            }
+            false
+        });
+        assert!(!err.contains("skipping old"), "{err}");
+        assert!(!err.contains("could not delete"), "{err}");
+        assert!(err.contains("pruned 0 item(s)"), "{err}");
     }
-    impl crate::git::cli::GitCli for MovesOnSecondRead {
+
+    #[test]
+    fn an_unreadable_read_back_asks_git_branch_by_branch() {
+        // The batch deleted the branch, but listing what is left fails: each
+        // branch is then asked after on its own, and counts once gone.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let err = run_yes_on_tips_read(&repo, |read| read == READ_BACK);
+        assert!(err.contains("pruned 1 item(s)"), "{err}");
+        assert!(!err.contains("could not delete"), "{err}");
+        assert!(!has_branch(&repo, "old"));
+    }
+
+    /// The `for-each-ref` reads of the branch removal: under the lock, right
+    /// before the delete, and after it.
+    const RE_READ: usize = 1;
+    const READ_BACK: usize = 2;
+
+    /// `git` in `dir`, trimmed stdout.
+    fn repo_git(dir: &std::path::Path, args: &[&str]) -> String {
+        crate::git::cli::GitCli::run(&RealGit, dir, args)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// Runs a real `--all -y` prune whose git calls `on_read(n)` before the
+    /// `n`th `for-each-ref` (from 0); it returning `true` fails that read.
+    /// Returns stderr.
+    fn run_yes_on_tips_read(
+        repo: &TestRepo,
+        on_read: impl Fn(usize) -> bool + Send + Sync + 'static,
+    ) -> String {
+        let git = std::sync::Arc::new(OnTipsRead {
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            on_read: Box::new(on_read),
+        });
+        let mut t = crate::testutil::test_cx_with_git(&[], repo.root().to_str().unwrap(), git);
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, &all_run(), false).unwrap();
+        t.err.contents()
+    }
+
+    /// Real git that hands each `for-each-ref` to `on_read` first.
+    struct OnTipsRead {
+        reads: std::sync::atomic::AtomicUsize,
+        on_read: Box<dyn Fn(usize) -> bool + Send + Sync>,
+    }
+    impl crate::git::cli::GitCli for OnTipsRead {
         fn run_raw(
             &self,
             repo: &std::path::Path,
             args: &[&str],
         ) -> crate::error::Result<crate::git::cli::GitOutput> {
             use std::sync::atomic::Ordering;
-            if args.first() == Some(&"for-each-ref")
-                && self.reads.fetch_add(1, Ordering::SeqCst) == 1
-            {
-                let tree = RealGit.run(&self.repo, &["rev-parse", "old^{tree}"])?;
-                let commit = RealGit.run(
-                    &self.repo,
-                    &["commit-tree", tree.trim(), "-p", "old", "-m", "late"],
-                )?;
-                RealGit.run(&self.repo, &["update-ref", "refs/heads/old", commit.trim()])?;
+            if args.first() == Some(&"for-each-ref") {
+                let read = self.reads.fetch_add(1, Ordering::SeqCst);
+                if (self.on_read)(read) {
+                    return Ok(crate::git::cli::GitOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "fatal: refs".into(),
+                    });
+                }
             }
             RealGit.run_raw(repo, args)
         }
@@ -1628,17 +1728,66 @@ mod tests {
         assert!(!has_branch(&repo, "squashed"));
     }
 
-    /// Answers the prompt `y`, after running `git <args>` in `dir` — standing
-    /// in for something done while the prompt waited.
-    struct ActsThenConfirms {
-        dir: std::path::PathBuf,
-        args: Vec<&'static str>,
-    }
+    /// Answers the prompt `y`, after running its action — standing in for
+    /// something done while the prompt waited.
+    struct ActsThenConfirms(Box<dyn FnMut() + Send>);
     impl crate::cx::Input for ActsThenConfirms {
         fn read_line(&mut self) -> crate::error::Result<String> {
-            crate::git::cli::GitCli::run(&RealGit, &self.dir, &self.args)?;
+            (self.0)();
             Ok("y\n".into())
         }
+    }
+
+    /// [`ActsThenConfirms`] running `git <args>` in `repo`.
+    fn git_then_confirm(repo: &TestRepo, args: &'static [&'static str]) -> ActsThenConfirms {
+        let dir = repo.root().to_path_buf();
+        ActsThenConfirms(Box::new(move || {
+            repo_git(&dir, args);
+        }))
+    }
+
+    #[test]
+    fn a_branch_moved_onto_a_nested_tag_while_the_prompt_waits_is_unsafe() {
+        // Under the lock the tip is a tag of a tag of work found nowhere
+        // else; it must be peeled all the way to that commit.
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        diverged_branch(&repo, "work");
+        repo.git(&["tag", "-a", "-m", "inner", "v-inner", "work"]);
+        repo.git(&["tag", "-a", "-m", "outer", "v-outer", "v-inner"]);
+        let outer = repo.git(&["rev-parse", "v-outer"]).trim().to_string();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let root = repo.root().to_path_buf();
+        t.cx.input = Box::new(ActsThenConfirms(Box::new(move || {
+            // Porcelain refuses a tag on a branch; the ref file does not.
+            std::fs::write(root.join(".git/refs/heads/old"), format!("{outer}\n")).unwrap();
+            repo_git(&root, &["branch", "-D", "work"]);
+            repo_git(&root, &["tag", "-d", "v-inner", "v-outer"]);
+        })));
+        super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.contains("skipping old (branch): has work on no remote"),
+            "{err}"
+        );
+        assert!(has_branch(&repo, "old"));
+    }
+
+    #[test]
+    fn unreadable_metadata_is_cleared_for_every_deleted_branch() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        crate::config::wtconfig::mark_created_by_wt(&RealGit, repo.root(), "old").unwrap();
+        let err = run_yes_with(
+            &repo,
+            Refuses(|args| {
+                (args.first() == Some(&"config") && args.contains(&"--get-regexp"))
+                    .then_some("fatal: config")
+            }),
+        );
+        assert!(err.contains("pruned 1 item(s)"), "{err}");
+        let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
+        assert!(!crate::config::wtconfig::read_meta(r.gix(), "old").created_by_wt);
     }
 
     #[test]
@@ -1655,10 +1804,7 @@ mod tests {
             "{merged}"
         );
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-        t.cx.input = Box::new(ActsThenConfirms {
-            dir: repo.root().to_path_buf(),
-            args: vec!["revert", "--no-edit", "HEAD"],
-        });
+        t.cx.input = Box::new(git_then_confirm(&repo, &["revert", "--no-edit", "HEAD"]));
         super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
         let err = t.err.contents();
         assert!(
