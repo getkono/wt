@@ -455,10 +455,10 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
             return Ok(0);
         }
     };
-    let present: Vec<(&str, &str)> = names
+    let present: Vec<(&str, Option<&str>)> = names
         .iter()
         .filter_map(|name| match tips.get(*name) {
-            Some(id) => Some((*name, id.as_str())),
+            Some(id) => Some((*name, id.as_deref())),
             None => {
                 tracing::debug!(branch = %name, "prune: branch already deleted");
                 None
@@ -469,17 +469,24 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
     let recoverable = if force {
         HashSet::new()
     } else {
-        let ids: Vec<String> = present.iter().map(|(_, id)| id.to_string()).collect();
+        let ids: Vec<String> = present
+            .iter()
+            .filter_map(|(_, id)| id.map(str::to_string))
+            .collect();
         assessor.recoverable_now(&ids)
     };
     let mut outcomes: Vec<(&str, Fate)> = present
         .iter()
         .map(|&(name, id)| {
+            // A tip with no commit has nothing to check, so nothing vouches
+            // for it — as at selection.
             let safe = force
-                || recoverable.contains(id)
-                || assessor
-                    .targets
-                    .is_merged(&removal.content, assessor.repo, id);
+                || id.is_some_and(|id| {
+                    recoverable.contains(id)
+                        || assessor
+                            .targets
+                            .is_merged(&removal.content, assessor.repo, id)
+                });
             let fate = if safe {
                 Fate::Delete
             } else {
@@ -493,7 +500,7 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
     // kept. What is left between this read and the delete is one spawn. Under
     // `--force` nothing was checked, so nothing is re-read.
     if !force && outcomes.iter().any(|(_, fate)| *fate == Fate::Delete) {
-        let checked: HashMap<&str, &str> = present.iter().copied().collect();
+        let checked: HashMap<&str, Option<&str>> = present.iter().copied().collect();
         let now = branch_tips(git, root);
         for (name, fate) in &mut outcomes {
             if *fate != Fate::Delete {
@@ -502,7 +509,7 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
             *fate = match &now {
                 Ok(now) => match now.get(*name) {
                     None => Fate::Gone,
-                    Some(id) if Some(id.as_str()) != checked.get(name).copied() => {
+                    Some(id) if Some(id.as_deref()) != checked.get(name).copied() => {
                         Fate::Skip(Block::Moved)
                     }
                     Some(_) => Fate::Delete,
@@ -583,8 +590,9 @@ fn delete_branch(cx: &mut Cx, git: &dyn GitCli, root: &Path, name: &str) -> Resu
     }
 }
 
-/// Every local branch's tip, read now: short name to commit id.
-fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>> {
+/// Every local branch's tip, read now: short name to commit id, or `None` for
+/// a branch whose tip is no commit at all.
+fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, Option<String>>> {
     let out = git.run(
         root,
         &[
@@ -606,10 +614,10 @@ fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>>
         // Reachability is a question about commits, and a tag object's own
         // id is never among them: a branch pointing at an annotated tag is
         // peeled to its commit — fully, which `%(*objectname)` does not do
-        // for a tag of a tag on every git. One that cannot be peeled keeps
-        // its own id, so it still reads as present, and as unrecoverable.
+        // for a tag of a tag on every git. One that cannot be peeled to a
+        // commit (a tag of a tree) is present, with no commit to check.
         let id = if kind == "commit" {
-            id.to_string()
+            Some(id.to_string())
         } else {
             git.run(
                 root,
@@ -620,7 +628,8 @@ fn branch_tips(git: &dyn GitCli, root: &Path) -> Result<HashMap<String, String>>
                     &format!("{id}^{{commit}}"),
                 ],
             )
-            .map_or_else(|_| id.to_string(), |peeled| peeled.trim().to_string())
+            .ok()
+            .map(|peeled| peeled.trim().to_string())
         };
         tips.insert(name.to_string(), id);
     }
@@ -1088,6 +1097,41 @@ mod tests {
         assert!(!err.contains("skipping old"), "{err}");
         assert!(!err.contains("could not delete"), "{err}");
         assert!(err.contains("pruned 0 item(s)"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_re_read_before_the_delete_deletes_nothing() {
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        let err = run_yes_on_tips_read(&repo, |read| read == RE_READ);
+        assert!(
+            err.contains("skipping old (branch): cannot read its git state"),
+            "{err}"
+        );
+        assert!(err.contains("pruned 0 item(s)"), "{err}");
+        assert!(has_branch(&repo, "old"));
+    }
+
+    #[test]
+    fn a_branch_moved_onto_a_tag_of_a_tree_while_the_prompt_waits_is_kept() {
+        // No commit to check, so nothing vouches for it: `rev-list` would
+        // print nothing for a tree, which must not read as "recoverable".
+        let repo = TestRepo::init();
+        bare_branch(&repo, "old");
+        repo.git(&["tag", "-a", "-m", "a tree", "v-tree", "HEAD^{tree}"]);
+        let tag = repo.git(&["rev-parse", "v-tree"]).trim().to_string();
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        let root = repo.root().to_path_buf();
+        t.cx.input = Box::new(ActsThenConfirms(Box::new(move || {
+            std::fs::write(root.join(".git/refs/heads/old"), format!("{tag}\n")).unwrap();
+        })));
+        super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
+        let err = t.err.contents();
+        assert!(
+            err.contains("skipping old (branch): has work on no remote"),
+            "{err}"
+        );
+        assert!(has_branch(&repo, "old"));
     }
 
     #[test]
