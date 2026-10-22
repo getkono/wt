@@ -1834,10 +1834,11 @@ mod tests {
     }
 
     #[test]
-    fn a_squash_merge_reverted_while_the_prompt_waits_keeps_the_branch() {
-        // Selected as merged by content; main then backs the squash out, so
-        // the branch's work exists nowhere else. The re-check under the lock
-        // must see the new main, not the tree selection read.
+    fn a_squash_merge_dropped_while_the_prompt_waits_keeps_the_branch() {
+        // Selected as merged by content; main then drops the squash commit
+        // (a revert would not do: the squash commit would still hold the
+        // work), so the branch's work exists nowhere else. The re-check under
+        // the lock must see the new main, not the tree selection read.
         let repo = TestRepo::init();
         diverged_branch(&repo, "feat");
         squash_into_main(&repo, "feat");
@@ -1847,7 +1848,10 @@ mod tests {
             "{merged}"
         );
         let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
-        t.cx.input = Box::new(git_then_confirm(&repo, &["revert", "--no-edit", "HEAD"]));
+        t.cx.input = Box::new(git_then_confirm(
+            &repo,
+            &["reset", "-q", "--hard", "HEAD~1"],
+        ));
         super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
         let err = t.err.contents();
         assert!(
@@ -1855,6 +1859,23 @@ mod tests {
             "{err}"
         );
         assert!(has_branch(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_gone_squash_merged_branch_main_edited_since_is_pruned() {
+        // Issue #113: main squashed the branch in, then rewrote its line, so
+        // merging it conflicts; the squash commit still holds its tree.
+        let repo = TestRepo::init();
+        diverged_branch(&repo, "feat");
+        give_gone_upstream(&repo, "feat");
+        squash_into_main(&repo, "feat");
+        repo.write("feat.txt", "edited\n");
+        repo.commit_all("main edits feat.txt");
+        let all = report(&repo, &all_dry_run());
+        assert!(
+            all.contains("would remove feat (branch): merged by content"),
+            "{all}"
+        );
     }
 
     #[test]

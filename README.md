@@ -229,11 +229,17 @@ These are the things worth knowing up front; the rest is discoverable from
     local copy or `origin`'s. A branch counts as merged when it is an ancestor of
     the default branch, or when merging it would change nothing. That covers
     squash merges, rebase merges, work split across several PRs, and branches made
-    only of merges. A branch whose own commits add up to no change is never
+    only of merges. When the default branch has since edited the same lines,
+    a branch still counts as merged if one commit on the default branch since
+    the merge base has the branch's tree, or makes the branch's net diff (its
+    squash commit). That includes a change the default branch later reverted,
+    as for an ordinary merge: the commit that landed it keeps the work.
+    A branch whose own commits add up to no change is never
     merged by content. Custom merge drivers from `.gitattributes` (such as
     `merge=ours`) are disabled for this check, so a file one governs reads as not
     merged. `merge=union` files and `merge.default` are merged as plain text.
-    The content check needs git ≥ 2.38. On older git only ancestry counts.
+    The merge-tree half of the content check needs git ≥ 2.38. On older git
+    only ancestry and the history match count.
   - `--gone`: worktrees and branches whose upstream was deleted, plus any missing
     worktrees.
   - `--pushed`: branches without a worktree, and detached worktrees, whose every

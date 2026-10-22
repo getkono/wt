@@ -4,6 +4,12 @@
 //! parents all landed. `wt prune` falls back to this when ancestry says "not
 //! merged".
 //!
+//! A branch whose squash commit the target later edited no longer merges as a
+//! no-op, so the target's own history since the merge base is searched as
+//! well: a commit whose tree is the tip's tree, or a single commit whose diff
+//! is the branch's net diff (the squash commit itself), means every byte of
+//! the branch is recoverable from the target.
+//!
 //! The check fails safe: an error, a conflict, or an older `git` reads as "not
 //! merged", so a failed check can never be the reason work is deleted.
 
@@ -16,9 +22,10 @@ use crate::git::cli::GitCli;
 /// The content check, run with one `git` in one directory for any number of
 /// tips and targets: what does not depend on the tip — the merge-driver
 /// overrides and each target's tree — is read once and reused, so each check
-/// costs a `merge-base`, one `rev-parse`, and the `merge-tree` itself. Lives
-/// for the span of one command: config or a target that changes meanwhile is
-/// not seen.
+/// costs a `merge-base`, one `rev-parse`, and the `merge-tree` itself, plus —
+/// only when that merge is not a no-op — two `log`s and two `diff`s of the
+/// history search. Lives for the span of one command: config or a target that
+/// changes meanwhile is not seen.
 #[cfg_attr(not(feature = "cli"), allow(dead_code))]
 pub(crate) struct ContentCheck<'a> {
     git: &'a dyn GitCli,
@@ -45,11 +52,15 @@ impl<'a> ContentCheck<'a> {
     /// *not* an ancestor of `target` — ancestry is the cheaper, stronger test
     /// and callers try it first.
     ///
-    /// This is a tree test, not a patch test, on purpose: a patch-equivalence
-    /// check (`git cherry`) still matches a change the target later reverted,
-    /// which would make reverted work look safe to delete. The cost is that a
-    /// change the target has since edited on the same lines conflicts and reads
-    /// as "not merged" — the safe direction to be wrong in.
+    /// When that merge is not a clean no-op — typically because the target
+    /// edited the same lines after taking the change — the target's history
+    /// since the merge base is searched instead (see [`landed_in_history`]):
+    /// a commit there whose tree is the tip's tree, or one whose diff is the
+    /// branch's net diff, holds all of the branch's work. Either still counts
+    /// a change the target later reverted as merged, as ancestry does for a
+    /// merge commit that was reverted: the work stays recoverable from the
+    /// commit that landed it. A change the target edited and that no single
+    /// commit holds whole still reads as "not merged" — the safe direction.
     ///
     /// A branch whose final tree equals its merge base's — nothing but empty
     /// commits, or work it added and then backed out itself — also merges as a
@@ -59,16 +70,26 @@ impl<'a> ContentCheck<'a> {
     ///
     /// `merge-tree` writes the merged tree to the object store; it creates no
     /// ref, so the object is garbage-collected like any other unreachable one.
-    /// A conflict, unrelated histories, or a `git` without
-    /// `merge-tree --write-tree` returns `false`.
+    /// Unrelated histories, a `git` without `merge-tree --write-tree` and no
+    /// history match, or any failure returns `false`. The history search
+    /// consults no merge driver, so it runs even when the driver overrides
+    /// cannot be built.
     pub(crate) fn is_merged(&self, tip: &str, target: &str) -> bool {
         let (git, dir) = (self.git, self.dir);
         let Some(expected) = self.target_tree(target) else {
             return false;
         };
-        if !changes_anything(git, dir, tip, target) {
+        let Some((base, tip_tree)) = changed_base(git, dir, tip, target) else {
             return false;
-        }
+        };
+        self.merges_as_no_op(tip, target, &expected)
+            || landed_in_history(git, dir, &base, (tip, &tip_tree), target)
+    }
+
+    /// Whether `git merge-tree --write-tree target tip` succeeds and writes
+    /// `expected`, `target`'s own tree, with the driver overrides applied.
+    fn merges_as_no_op(&self, tip: &str, target: &str, expected: &str) -> bool {
+        let (git, dir) = (self.git, self.dir);
         let Some(overrides) = self
             .overrides
             .get_or_init(|| driver_overrides(git, dir))
@@ -87,9 +108,7 @@ impl<'a> ContentCheck<'a> {
         }
         argv.extend(["merge-tree", "--write-tree", "--no-messages", target, tip]);
         match git.run_raw(dir, &argv) {
-            Ok(out) if out.success => {
-                out.stdout.lines().next().map(str::trim) == Some(expected.as_str())
-            }
+            Ok(out) if out.success => out.stdout.lines().next().map(str::trim) == Some(expected),
             Ok(out) => {
                 // Exit 1 is a conflict; anything else (an old git, unrelated
                 // histories, an unknown ref) is logged so a surprising "not
@@ -177,29 +196,163 @@ fn driver_overrides(git: &dyn GitCli, dir: &Path) -> Option<Vec<String>> {
     Some(overrides)
 }
 
-/// Whether `tip`'s tree differs from the tree of its merge base with `target`
-/// — i.e. the branch's net effect is not empty. Any failure (no merge base
-/// included) reads as `false`, which the caller treats as "not merged".
-fn changes_anything(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> bool {
-    let Ok(base) = git.run(dir, &["merge-base", target, tip]) else {
-        return false;
-    };
+/// The merge base of `tip` and `target`, and `tip`'s tree, when that tree
+/// differs from the base's — i.e. the branch's net effect is not empty. Any
+/// failure (no merge base included) reads as `None`, which the caller treats
+/// as "not merged".
+fn changed_base(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> Option<(String, String)> {
+    let base = git.run(dir, &["merge-base", target, tip]).ok()?;
+    let base = base.trim();
     // Both trees in one call: `rev-parse` prints one id per argument, and
     // fails as a whole if either does not resolve.
-    let Ok(trees) = git.run(
+    let trees = git
+        .run(
+            dir,
+            &[
+                "rev-parse",
+                &format!("{base}^{{tree}}"),
+                &format!("{tip}^{{tree}}"),
+            ],
+        )
+        .ok()?;
+    match trees.split_whitespace().collect::<Vec<_>>()[..] {
+        [base_tree, tip_tree] if base_tree != tip_tree => {
+            Some((base.to_string(), tip_tree.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Fixed `git diff` options, so the branch's net diff and each target commit's
+/// diff are rendered alike whatever the user's diff configuration: no colour,
+/// external driver, textconv, or rename detection, full binary patches, and
+/// git's default prefixes, context, and algorithm. A binary delta patch is
+/// relative to its preimage, so it can be identical for different files;
+/// [`normalize_diff`] keeps a binary file's blob ids for that reason.
+const DIFF_OPTS: &[&str] = &[
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--no-relative",
+    "--binary",
+    "--unified=3",
+    "--diff-algorithm=myers",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "--submodule=short",
+];
+
+/// Whether the work of `tip` (whose tree is `tip_tree`, and whose merge base
+/// with `target` is `base`) is held by one commit of `base..target`: a commit
+/// whose tree is `tip_tree`, or a non-merge commit whose diff is the branch's
+/// net diff `git diff base tip`, compared without line numbers or blob ids
+/// (the squash commit, landed after the target moved on). Any failure — a
+/// path list too long for one command line included — reads as `false`.
+fn landed_in_history(
+    git: &dyn GitCli,
+    dir: &Path,
+    base: &str,
+    (tip, tip_tree): (&str, &str),
+    target: &str,
+) -> bool {
+    let range = format!("{base}..{target}");
+    let Ok(trees) = git.run(dir, &["log", "--format=%T", &range]) else {
+        return false;
+    };
+    if trees.lines().any(|t| t.trim() == tip_tree) {
+        tracing::debug!(
+            tip,
+            target,
+            "content check: a target commit has the tip's tree"
+        );
+        return true;
+    }
+    let Ok(net) = git.run(dir, &[&["diff"], DIFF_OPTS, &[base, tip]].concat()) else {
+        return false;
+    };
+    let Ok(paths) = git.run(
         dir,
-        &[
-            "rev-parse",
-            &format!("{}^{{tree}}", base.trim()),
-            &format!("{tip}^{{tree}}"),
-        ],
+        &["diff", "--no-renames", "--name-only", "-z", base, tip],
     ) else {
         return false;
     };
-    match trees.split_whitespace().collect::<Vec<_>>()[..] {
-        [base_tree, tip_tree] => base_tree != tip_tree,
-        _ => false,
+    let paths: Vec<&str> = paths.split('\0').filter(|p| !p.is_empty()).collect();
+    if paths.is_empty() {
+        return false;
     }
+    // Only commits touching the branch's paths can match; `--full-diff` still
+    // shows each one's whole diff, so a commit that also changed other paths
+    // does not match. A NUL never occurs in git's diff output (a file holding
+    // one is binary, and `--binary` encodes it), so it separates the commits.
+    let log = [
+        &[
+            "--literal-pathspecs",
+            "log",
+            "-p",
+            "--no-merges",
+            "--full-diff",
+            "--format=%x00",
+        ],
+        DIFF_OPTS,
+        &[range.as_str(), "--"],
+        &paths,
+    ]
+    .concat();
+    let Ok(commits) = git.run(dir, &log) else {
+        return false;
+    };
+    // Output is decoded lossily, so bytes that are not UTF-8 all read as
+    // U+FFFD and different edits could compare equal. A net diff holding one
+    // never matches: the safe direction, "not merged". A commit diff equal to
+    // one free of it holds none either, so both were decoded exactly.
+    if net.contains(char::REPLACEMENT_CHARACTER) {
+        return false;
+    }
+    let net = normalize_diff(&net);
+    let found = commits.split('\0').any(|diff| normalize_diff(diff) == net);
+    if found {
+        tracing::debug!(
+            tip,
+            target,
+            "content check: a target commit has the branch's net diff"
+        );
+    }
+    found
+}
+
+/// `diff` without what depends on where it was applied: hunk headers lose
+/// their line numbers and `index` lines their blob ids (keeping the mode), and
+/// blank lines are dropped (a diff line always has a prefix, so only the
+/// separators around a `git log` entry are blank). What each hunk adds,
+/// removes, and keeps as context is untouched. A binary file keeps its blob
+/// ids: its delta patch has no context lines, and the same delta applied to a
+/// different preimage makes a different file.
+fn normalize_diff(diff: &str) -> Vec<&str> {
+    let lines: Vec<&str> = diff.lines().filter(|line| !line.is_empty()).collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut start = 0;
+    while start < lines.len() {
+        // One file's section: from its `diff --git` header to the next one.
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.starts_with("diff --git "))
+            .map_or(lines.len(), |at| start + 1 + at);
+        let section = &lines[start..end];
+        let binary = section.contains(&"GIT binary patch");
+        out.extend(section.iter().map(|&line| {
+            if line.starts_with("@@ ") {
+                "@@"
+            } else if let Some(rest) = line.strip_prefix("index ").filter(|_| !binary) {
+                // `index OLD..NEW[ MODE]`
+                rest.split_once(' ').map_or("index", |(_, mode)| mode)
+            } else {
+                line
+            }
+        }));
+        start = end;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -283,24 +436,184 @@ mod tests {
     }
 
     #[test]
-    fn a_change_main_reverted_is_not_merged() {
-        // The patch is still in main's history, but its effect is not.
+    fn a_change_main_reverted_is_merged() {
+        // Its effect is gone from main, but the squash commit still holds it,
+        // as a reverted merge commit would.
         let repo = TestRepo::init();
         topic(&repo, "feat", &[("a.txt", "a\n")]);
         squash(&repo, "feat");
         repo.git(&["revert", "--no-edit", "HEAD"]);
-        assert!(!merged(&repo, "feat"));
+        assert!(merged(&repo, "feat"));
     }
 
     #[test]
-    fn a_change_main_edited_since_is_not_merged() {
-        // Conservative by design: main took the change, then rewrote the line.
+    fn a_change_main_edited_since_is_merged() {
+        // Main took the change, then rewrote the line: merge-tree conflicts,
+        // but the squash commit's tree is the tip's tree.
         let repo = TestRepo::init();
         topic(&repo, "feat", &[("a.txt", "one\n")]);
         squash(&repo, "feat");
         repo.write("a.txt", "two\n");
         repo.commit_all("main edits a");
+        assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_squash_landed_after_main_moved_on_then_edited_is_merged() {
+        // The squash commit's tree is not the tip's (main had moved on), but
+        // its diff is the branch's net diff, at other line numbers.
+        let repo = TestRepo::init();
+        repo.write("f.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+        repo.commit_all("f");
+        topic(
+            &repo,
+            "feat",
+            &[("f.txt", "1\n2\n3\n4\n5\n6\n7\nfeat\n8\n9\n")],
+        );
+        repo.write("f.txt", "0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n");
+        repo.write("other.txt", "o\n");
+        repo.commit_all("main moves on");
+        squash(&repo, "feat");
+        repo.write("f.txt", "0\n1\n2\n3\n4\n5\n6\n7\nFEAT\n8\n9\n");
+        repo.commit_all("main edits the feat line");
+        assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_main_commit_with_the_change_and_more_is_not_a_squash_match() {
+        // Main's commit adds the branch's line *and* another file, then edits
+        // the line: the branch's own diff matches no single commit.
+        let repo = TestRepo::init();
+        topic(&repo, "feat", &[("a.txt", "one\n")]);
+        repo.write("other.txt", "o\n");
+        repo.commit_all("main moves on");
+        repo.write("a.txt", "one\n");
+        repo.write("b.txt", "b\n");
+        repo.commit_all("main adds a and b");
+        repo.write("a.txt", "two\n");
+        repo.commit_all("main edits a");
+        // Neither tree matches either: the tip lacks `other.txt` and `b.txt`.
         assert!(!merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn unlanded_work_on_a_path_main_also_edits_is_not_merged() {
+        // A conflict, and no commit of main holds the branch's line.
+        let repo = TestRepo::init();
+        topic(&repo, "feat", &[("a.txt", "branch\n")]);
+        repo.write("a.txt", "main\n");
+        repo.commit_all("main adds a differently");
+        assert!(!merged(&repo, "feat"));
+    }
+
+    /// Writes raw bytes to `rel` in the repo's working tree.
+    fn write_bytes(repo: &TestRepo, rel: &str, content: &[u8]) {
+        std::fs::write(repo.root().join(rel), content).unwrap();
+    }
+
+    #[test]
+    fn an_edit_differing_only_in_non_utf8_bytes_is_not_merged() {
+        // Latin-1 `é` on the branch, `è` on main: both decode lossily to the
+        // same replacement character, but the bytes differ.
+        let repo = TestRepo::init();
+        repo.write("a.txt", "a\nb\nc\n");
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "a.txt", b"a\nb\xe9\nc\n");
+        repo.commit_all("branch edits b");
+        repo.git(&["checkout", "-q", "main"]);
+        write_bytes(&repo, "a.txt", b"a\nb\xe8\nc\n");
+        repo.commit_all("main edits b differently");
+        assert!(!merged(&repo, "feat"));
+    }
+
+    /// `len` bytes that do not compress, so git encodes an edit of a file
+    /// holding them as a delta rather than a literal.
+    fn noise(seed: u32, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state.to_be_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// A binary file: a NUL, `body`, then 100 copies of `tail`.
+    fn blob(body: &[u8], tail: u8) -> Vec<u8> {
+        [&[0][..], body, &[tail; 100]].concat()
+    }
+
+    #[test]
+    fn the_same_binary_delta_on_another_preimage_is_not_merged() {
+        // The branch and a main commit both turn the trailing `X`s into `Y`s,
+        // each copying an unchanged body the other does not have: the delta
+        // patches can be identical, but the files are not.
+        let repo = TestRepo::init();
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'X'));
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Y'));
+        repo.commit_all("branch edits the tail");
+        repo.git(&["checkout", "-q", "main"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(2, 6000), b'X'));
+        repo.commit_all("main replaces the body");
+        write_bytes(&repo, "f.bin", &blob(&noise(2, 6000), b'Y'));
+        repo.commit_all("main edits the tail");
+        assert!(!merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_binary_squash_main_edited_since_is_merged() {
+        let repo = TestRepo::init();
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'X'));
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Y'));
+        repo.commit_all("branch edits the tail");
+        repo.git(&["checkout", "-q", "main"]);
+        squash(&repo, "feat");
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Z'));
+        repo.commit_all("main edits the tail again");
+        assert!(merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn diffs_compare_without_line_numbers_or_blob_ids() {
+        let at = |n: usize, blob: &str| {
+            format!(
+                "\ndiff --git a/f b/f\nindex {blob}..ffff 100644\n--- a/f\n+++ b/f\n@@ -{n},3 +{n},4 @@ ctx\n a\n+b\n c\n"
+            )
+        };
+        assert_eq!(
+            normalize_diff(&at(1, "aaaa")),
+            normalize_diff(&at(40, "bbbb"))
+        );
+        assert_eq!(normalize_diff("index aaaa..bbbb\n"), ["index"]);
+        assert_eq!(normalize_diff("index aaaa..bbbb 100755\n"), ["100755"]);
+        assert_ne!(
+            normalize_diff(&at(1, "a")),
+            normalize_diff(&at(1, "a").replace("+b", "+B"))
+        );
+        // A binary file keeps its blob ids; the text file after it does not.
+        let binary = "diff --git a/g b/g\nindex 1111..2222 100644\nGIT binary patch\ndelta 5\n";
+        assert_eq!(
+            normalize_diff(&format!("{binary}{}", at(1, "aaaa"))),
+            [
+                "diff --git a/g b/g",
+                "index 1111..2222 100644",
+                "GIT binary patch",
+                "delta 5",
+                "diff --git a/f b/f",
+                "100644",
+                "--- a/f",
+                "+++ b/f",
+                "@@",
+                " a",
+                "+b",
+                " c",
+            ]
+        );
     }
 
     #[test]
@@ -463,11 +776,30 @@ mod tests {
 
     #[test]
     fn a_driver_name_that_cannot_be_overridden_fails_safe() {
+        // Work split across two squashes after main moved on: only the
+        // merge-tree no-op shows it landed, and that needs the overrides.
+        let repo = TestRepo::init();
+        repo.git(&["config", "merge.a=b.driver", "true"]);
+        topic(&repo, "combo", &[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        repo.write("other.txt", "o\n");
+        repo.commit_all("main moves on");
+        topic(&repo, "part-a", &[("a.txt", "a\n")]);
+        squash(&repo, "part-a");
+        topic(&repo, "part-b", &[("b.txt", "b\n")]);
+        squash(&repo, "part-b");
+        assert!(!merged(&repo, "combo"));
+        repo.git(&["config", "--unset", "merge.a=b.driver"]);
+        assert!(merged(&repo, "combo"));
+    }
+
+    #[test]
+    fn a_squash_match_needs_no_merge_driver_overrides() {
+        // The tip's tree is a commit of main, so no merge is consulted.
         let repo = TestRepo::init();
         repo.git(&["config", "merge.a=b.driver", "true"]);
         topic(&repo, "feat", &[("a.txt", "a\n")]);
         squash(&repo, "feat");
-        assert!(!merged(&repo, "feat"));
+        assert!(merged(&repo, "feat"));
     }
 
     #[test]
@@ -522,6 +854,9 @@ mod tests {
         assert_eq!(git.count("merge-tree"), 4);
         // One target tree, then one combined base/tip tree read per tip.
         assert_eq!(git.count("rev-parse"), 1 + 4);
+        // Only `open`, whose merge is not a no-op, searches main's history.
+        assert_eq!(git.count("log"), 2);
+        assert_eq!(git.count("diff"), 2);
     }
 
     #[test]
