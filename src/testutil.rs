@@ -645,7 +645,7 @@ pub(crate) fn give_upstream(repo: &TestRepo, branch: &str) {
 /// every `TestRepo` mutation would operate on the developer's real repository
 /// instead of the throwaway temp repo, silently corrupting it. Removing them
 /// makes `-C <dir>` authoritative so the fixture stays sandboxed.
-fn run_git(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn run_git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

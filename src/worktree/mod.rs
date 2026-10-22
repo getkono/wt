@@ -41,7 +41,7 @@ pub use crate::config::wtconfig::SCHEMA_VERSION;
 // surface is the `Workspace` API and the re-exported schema/lock types.
 #[cfg(feature = "cli")]
 pub(crate) use rows::{
-    build_rows, build_worktrees, enumerate_worktrees, guard_status, sort_worktrees,
+    build_rows, build_worktrees, enrich_worktree, enumerate_worktrees, guard_status, sort_worktrees,
 };
 // The synchronous branch-row listing and base-first sort exist for the TUI
 // (issue #47).

@@ -34,6 +34,7 @@
 //! [`clear_meta`] removes the whole `wt.<branch>` section, so it also removes
 //! keys this build has never heard of.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -281,6 +282,37 @@ pub fn clear_meta(git: &dyn GitCli, repo_root: &Path, branch: &str) -> Result<()
     Ok(())
 }
 
+/// The branches with a `wt.<branch>` section in the repository's own config —
+/// the ones [`clear_meta`] has anything to remove for — read now, in one
+/// `git config` call, so a bulk delete can skip the rest.
+#[cfg_attr(not(feature = "cli"), allow(dead_code))]
+pub(crate) fn meta_branches(git: &dyn GitCli, repo_root: &Path) -> Result<HashSet<String>> {
+    let out = git.run_raw(
+        repo_root,
+        &[
+            "config",
+            "--local",
+            "-z",
+            "--name-only",
+            "--get-regexp",
+            r"^wt\.",
+        ],
+    )?;
+    // Exit 1 with no output is "no such key"; anything else is a read failure.
+    if !out.success && !(out.stdout.is_empty() && out.stderr.trim().is_empty()) {
+        return Err(Error::Subprocess {
+            program: "git".into(),
+            stderr: out.stderr.trim().to_string(),
+        });
+    }
+    Ok(out
+        .stdout
+        .split('\0')
+        .filter_map(|key| key.strip_prefix("wt.")?.rsplit_once('.'))
+        .map(|(branch, _)| branch.to_string())
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +471,35 @@ mod tests {
         assert_eq!(meta(&repo, "topic"), WtMeta::default());
         // Clearing again (no section) is not an error.
         clear_meta(&RealGit, repo.root(), "topic").unwrap();
+    }
+
+    #[test]
+    fn meta_branches_names_each_branch_with_a_section() {
+        let repo = TestRepo::init();
+        assert!(meta_branches(&RealGit, repo.root()).unwrap().is_empty());
+        write_base_ref(&RealGit, repo.root(), "feat/v1.2", "main").unwrap();
+        mark_created_by_wt(&RealGit, repo.root(), "feat/v1.2").unwrap();
+        mark_created_by_wt(&RealGit, repo.root(), "Topic").unwrap();
+        let got = meta_branches(&RealGit, repo.root()).unwrap();
+        // A dotted branch name keeps its dots, and its case.
+        assert_eq!(
+            got,
+            HashSet::from(["feat/v1.2".to_string(), "Topic".to_string()])
+        );
+        clear_meta(&RealGit, repo.root(), "Topic").unwrap();
+        assert_eq!(
+            meta_branches(&RealGit, repo.root()).unwrap(),
+            HashSet::from(["feat/v1.2".to_string()])
+        );
+    }
+
+    #[test]
+    fn meta_branches_errors_on_an_unreadable_config() {
+        let repo = TestRepo::init();
+        let config = repo.root().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[broken\n");
+        std::fs::write(&config, text).unwrap();
+        assert!(meta_branches(&RealGit, repo.root()).is_err());
     }
 }
