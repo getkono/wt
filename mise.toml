@@ -9,6 +9,7 @@ pkl = "latest"                         # config language hk.pkl is written in
 "cargo:convco" = "0.6.4"               # Conventional Commits linter for the commit-msg hook + CI (built from source; not in mise's registry)
 "aqua:taiki-e/cargo-llvm-cov" = "latest"   # coverage (needs the llvm-tools-preview component)
 "cargo:cargo-mutants"         = "27.1.0"
+"aqua:charmbracelet/freeze"   = "0.2.2"     # renders the README screenshot (mise run svg)
 
 # After `mise install`, wire hk's git hooks through mise so they resolve hk and
 # convco without requiring shell activation. Skipped in CI, where the hooks
@@ -32,6 +33,10 @@ echo '  eval "$(wt shell-init bash)"    # bash'
 echo '  eval "$(wt shell-init zsh)"     # zsh'
 echo '  wt shell-init fish | source     # fish'
 '''
+
+[tasks.svg]
+description = "Regenerate the README screenshot (assets/wt.svg); needs tmux"
+run = "bash scripts/gen-svg.sh"
 
 [tasks.format]
 description = "Format the code"

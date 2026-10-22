@@ -1,5 +1,9 @@
 # wt
 
+<p align="center">
+  <img src="assets/wt.svg" alt="The wt TUI: worktrees and branches listed on the left, the selected worktree's path, branch, status, and commits on the right" width="100%">
+</p>
+
 `wt` is a CLI + TUI for Git worktrees and the GitHub pull requests on them: create
 a branch and its worktree in one step, jump between worktrees, check a PR out into
 its own directory, and clean up once the work merges. Git stays the source of
@@ -75,7 +79,7 @@ mise run lint         # Clippy, warnings as errors
 mise run coverage     # 80% line-coverage floor
 ```
 
-`mise tasks` lists the rest. Releases are cut by [release-plz](https://release-plz.dev);
+`mise tasks` lists the rest; `mise run svg` regenerates the screenshot above. Releases are cut by [release-plz](https://release-plz.dev);
 see [RELEASING.md](RELEASING.md).
 
 ## License
