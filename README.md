@@ -10,37 +10,13 @@ automatically.
 
 ### 1. Install
 
-#### Homebrew (recommended)
-
 ```bash
-brew install getkono/tap/wt
+mise use -g github:getkono/wt   # mise: prebuilt binary from GitHub Releases
+cargo install kono-wt           # cargo: build from crates.io (Rust via https://rustup.rs)
+brew install getkono/tap/wt     # Homebrew
 ```
 
-This pulls a prebuilt binary from the [getkono/homebrew-tap](https://github.com/getkono/homebrew-tap)
-tap (macOS arm64/x86_64 and Linux arm64/x86_64).
-
-#### Cargo (crates.io)
-
-The crate is published as [`kono-wt`](https://crates.io/crates/kono-wt) (the bare
-`wt` name was already taken); the installed binary is still `wt`.
-
-```bash
-cargo install kono-wt                               # installs `wt` to ~/.cargo/bin
-```
-
-#### From source
-
-You need the [Rust toolchain](https://rustup.rs) (rustup), `git` ≥ 2.20 on your
-`PATH`, and — only for PR commands — the [`gh` CLI](https://cli.github.com).
-
-```bash
-cargo install --git https://github.com/getkono/wt   # latest from master
-# or, from a checkout:
-cargo install --path .                              # installs `wt` to ~/.cargo/bin
-```
-
-Make sure `~/.cargo/bin` is on your `PATH`. Then enable shell integration
-(below) — that single step also gives you the best tab completion.
+Needs `git` ≥ 2.20, plus the [`gh` CLI](https://cli.github.com) for PR and issue commands.
 
 ### 2. Enable shell integration (required for navigation)
 
