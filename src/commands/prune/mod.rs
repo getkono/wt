@@ -1251,7 +1251,10 @@ mod tests {
         // preview says it will be skipped rather than promising its removal.
         assert!(!all.contains("wip"), "{all}");
         assert!(
-            skips.contains("skipping wip (branch): has work on no remote"),
+            skips.contains(
+                "skipping wip (branch): has work on no remote and could not confirm its \
+                 changes are in the default branch; use --force"
+            ),
             "{skips}"
         );
         // Same selection as `--merged --gone` here; each mode alone picks one.
