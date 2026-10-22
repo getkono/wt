@@ -225,9 +225,10 @@ fn changed_base(git: &dyn GitCli, dir: &Path, tip: &str, target: &str) -> Option
 
 /// Fixed `git diff` options, so the branch's net diff and each target commit's
 /// diff are rendered alike whatever the user's diff configuration: no colour,
-/// external driver, textconv, or rename detection, full binary patches (so two
-/// different binary edits never compare equal), and git's default prefixes,
-/// context, and algorithm.
+/// external driver, textconv, or rename detection, full binary patches, and
+/// git's default prefixes, context, and algorithm. A binary delta patch is
+/// relative to its preimage, so it can be identical for different files;
+/// [`normalize_diff`] keeps a binary file's blob ids for that reason.
 const DIFF_OPTS: &[&str] = &[
     "--no-color",
     "--no-ext-diff",
@@ -301,6 +302,13 @@ fn landed_in_history(
     let Ok(commits) = git.run(dir, &log) else {
         return false;
     };
+    // Output is decoded lossily, so bytes that are not UTF-8 all read as
+    // U+FFFD and different edits could compare equal. A net diff holding one
+    // never matches: the safe direction, "not merged". A commit diff equal to
+    // one free of it holds none either, so both were decoded exactly.
+    if net.contains(char::REPLACEMENT_CHARACTER) {
+        return false;
+    }
     let net = normalize_diff(&net);
     let found = commits.split('\0').any(|diff| normalize_diff(diff) == net);
     if found {
@@ -317,21 +325,34 @@ fn landed_in_history(
 /// their line numbers and `index` lines their blob ids (keeping the mode), and
 /// blank lines are dropped (a diff line always has a prefix, so only the
 /// separators around a `git log` entry are blank). What each hunk adds,
-/// removes, and keeps as context is untouched.
+/// removes, and keeps as context is untouched. A binary file keeps its blob
+/// ids: its delta patch has no context lines, and the same delta applied to a
+/// different preimage makes a different file.
 fn normalize_diff(diff: &str) -> Vec<&str> {
-    diff.lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
+    let lines: Vec<&str> = diff.lines().filter(|line| !line.is_empty()).collect();
+    let mut out = Vec::with_capacity(lines.len());
+    let mut start = 0;
+    while start < lines.len() {
+        // One file's section: from its `diff --git` header to the next one.
+        let end = lines[start + 1..]
+            .iter()
+            .position(|line| line.starts_with("diff --git "))
+            .map_or(lines.len(), |at| start + 1 + at);
+        let section = &lines[start..end];
+        let binary = section.contains(&"GIT binary patch");
+        out.extend(section.iter().map(|&line| {
             if line.starts_with("@@ ") {
                 "@@"
-            } else if let Some(rest) = line.strip_prefix("index ") {
+            } else if let Some(rest) = line.strip_prefix("index ").filter(|_| !binary) {
                 // `index OLD..NEW[ MODE]`
                 rest.split_once(' ').map_or("index", |(_, mode)| mode)
             } else {
                 line
             }
-        })
-        .collect()
+        }));
+        start = end;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -485,6 +506,78 @@ mod tests {
         assert!(!merged(&repo, "feat"));
     }
 
+    /// Writes raw bytes to `rel` in the repo's working tree.
+    fn write_bytes(repo: &TestRepo, rel: &str, content: &[u8]) {
+        std::fs::write(repo.root().join(rel), content).unwrap();
+    }
+
+    #[test]
+    fn an_edit_differing_only_in_non_utf8_bytes_is_not_merged() {
+        // Latin-1 `é` on the branch, `è` on main: both decode lossily to the
+        // same replacement character, but the bytes differ.
+        let repo = TestRepo::init();
+        repo.write("a.txt", "a\nb\nc\n");
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "a.txt", b"a\nb\xe9\nc\n");
+        repo.commit_all("branch edits b");
+        repo.git(&["checkout", "-q", "main"]);
+        write_bytes(&repo, "a.txt", b"a\nb\xe8\nc\n");
+        repo.commit_all("main edits b differently");
+        assert!(!merged(&repo, "feat"));
+    }
+
+    /// `len` bytes that do not compress, so git encodes an edit of a file
+    /// holding them as a delta rather than a literal.
+    fn noise(seed: u32, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                state.to_be_bytes()[0]
+            })
+            .collect()
+    }
+
+    /// A binary file: a NUL, `body`, then 100 copies of `tail`.
+    fn blob(body: &[u8], tail: u8) -> Vec<u8> {
+        [&[0][..], body, &[tail; 100]].concat()
+    }
+
+    #[test]
+    fn the_same_binary_delta_on_another_preimage_is_not_merged() {
+        // The branch and a main commit both turn the trailing `X`s into `Y`s,
+        // each copying an unchanged body the other does not have: the delta
+        // patches can be identical, but the files are not.
+        let repo = TestRepo::init();
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'X'));
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Y'));
+        repo.commit_all("branch edits the tail");
+        repo.git(&["checkout", "-q", "main"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(2, 6000), b'X'));
+        repo.commit_all("main replaces the body");
+        write_bytes(&repo, "f.bin", &blob(&noise(2, 6000), b'Y'));
+        repo.commit_all("main edits the tail");
+        assert!(!merged(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_binary_squash_main_edited_since_is_merged() {
+        let repo = TestRepo::init();
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'X'));
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Y'));
+        repo.commit_all("branch edits the tail");
+        repo.git(&["checkout", "-q", "main"]);
+        squash(&repo, "feat");
+        write_bytes(&repo, "f.bin", &blob(&noise(1, 6000), b'Z'));
+        repo.commit_all("main edits the tail again");
+        assert!(merged(&repo, "feat"));
+    }
+
     #[test]
     fn diffs_compare_without_line_numbers_or_blob_ids() {
         let at = |n: usize, blob: &str| {
@@ -501,6 +594,25 @@ mod tests {
         assert_ne!(
             normalize_diff(&at(1, "a")),
             normalize_diff(&at(1, "a").replace("+b", "+B"))
+        );
+        // A binary file keeps its blob ids; the text file after it does not.
+        let binary = "diff --git a/g b/g\nindex 1111..2222 100644\nGIT binary patch\ndelta 5\n";
+        assert_eq!(
+            normalize_diff(&format!("{binary}{}", at(1, "aaaa"))),
+            [
+                "diff --git a/g b/g",
+                "index 1111..2222 100644",
+                "GIT binary patch",
+                "delta 5",
+                "diff --git a/f b/f",
+                "100644",
+                "--- a/f",
+                "+++ b/f",
+                "@@",
+                " a",
+                "+b",
+                " c",
+            ]
         );
     }
 
