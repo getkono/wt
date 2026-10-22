@@ -139,7 +139,9 @@ pub(super) enum Block {
     Locked(Option<String>),
     /// Uncommitted changes. Overridden by `--force`.
     Dirty,
-    /// A branch holding work found on no remote and not in the default branch.
+    /// A branch holding work found on no remote whose changes could not be
+    /// confirmed in the default branch. The content check is one-sided — a
+    /// miss means unproven, not unmerged — so the message says only that.
     /// Overridden by `--force`.
     Unsafe,
     /// A bare branch that moved after its safety was re-checked under the
@@ -162,9 +164,9 @@ impl Block {
             Block::Locked(Some(reason)) => format!("locked ({reason}); use --locked"),
             Block::Locked(None) => "locked; use --locked".into(),
             Block::Dirty => "uncommitted changes; use --force".into(),
-            Block::Unsafe => {
-                "has work on no remote and not in the default branch; use --force".into()
-            }
+            Block::Unsafe => "has work on no remote and could not confirm its changes are in \
+                              the default branch; use --force"
+                .into(),
             Block::Moved => "moved since it was checked; run prune again".into(),
         }
     }
