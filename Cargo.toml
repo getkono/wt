@@ -126,3 +126,20 @@ assert_cmd = "2.2.2"
 insta = "1.47.2"
 predicates = "3.1.4"
 tempfile = "3.27.0"
+
+# Full debug info is what makes `target/` grow during fast iteration, so the
+# dev profile keeps only what a backtrace reads. This package keeps line
+# tables, so its panics and backtraces still name file:line; dependencies keep
+# no debug info at all, so their frames still name the function (that comes
+# from the symbol table) but generally lose file:line. `test` inherits both
+# settings from `dev`, and release is untouched. For full debug info, override
+# for one build instead of editing this — the first line covers this package,
+# the second the dependencies; pass both for everything:
+#
+#     CARGO_PROFILE_DEV_DEBUG=2 cargo build
+#     cargo --config 'profile.dev.package."*".debug=2' build
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
