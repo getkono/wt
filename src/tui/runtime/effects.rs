@@ -112,18 +112,48 @@ pub(super) fn run_materialize_command(
         .map_err(|e| e.to_string())
 }
 
+/// Why a TUI removal failed: refused because the worktree is locked, carrying
+/// the lock's reason for the override re-prompt (issue #126), or anything else,
+/// as the message to surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RemoveFailure {
+    /// The worktree is locked, with its reason if one was given.
+    Locked(Option<String>),
+    /// Any other failure, rendered.
+    Other(String),
+}
+
+impl RemoveFailure {
+    /// The status-bar text for this failure.
+    pub(super) fn message(&self) -> String {
+        match self {
+            RemoveFailure::Locked(Some(reason)) => format!("worktree is locked ({reason})"),
+            RemoveFailure::Locked(None) => "worktree is locked".into(),
+            RemoveFailure::Other(message) => message.clone(),
+        }
+    }
+}
+
 /// Removes the worktree matched by `query` (force semantics, as the confirm
-/// dialog is the guard).
-pub(super) fn run_remove_command(cx: &mut Cx, query: &str) -> std::result::Result<(), String> {
+/// dialog is the guard). A lock is overridden only when `unlock`, which only
+/// the locked re-prompt sets.
+pub(super) fn run_remove_command(
+    cx: &mut Cx,
+    query: &str,
+    unlock: bool,
+) -> std::result::Result<(), RemoveFailure> {
     let opts = commands::remove::RemoveOptions {
         force_remove: true,
         force_branch: false,
         keep_branch: false,
         no_hooks: false,
+        unlock,
     };
-    commands::remove::remove_query(cx, &CapturingHookRunner, query, &opts, false)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    match commands::remove::remove_query(cx, &CapturingHookRunner, query, &opts, false) {
+        Ok(_) => Ok(()),
+        Err(Error::WorktreeLocked { reason }) => Err(RemoveFailure::Locked(reason)),
+        Err(e) => Err(RemoveFailure::Other(e.to_string())),
+    }
 }
 
 /// Deletes the local branch of a worktree-less branch row (issue #53): a safe
@@ -349,13 +379,14 @@ pub(crate) fn do_create(
 /// Removes the worktree at `index` and refreshes. The confirm dialog is itself
 /// the guard, so the worktree is removed even if dirty/unpushed; but an unmerged
 /// branch is never force-deleted here (spec §10/§12) — only a fully-merged
-/// wt-created branch is cleaned up.
+/// wt-created branch is cleaned up. A lock is overridden only when `unlock`; a
+/// refused lock leaves the app in the locked re-prompt (issue #126).
 #[cfg(test)]
-pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: usize) {
-    let Some(query) = remove_query_of(app, index) else {
+pub(crate) fn do_remove(cx: &mut Cx, session: &Session, app: &mut App, index: usize, unlock: bool) {
+    let Some((job, _, _)) = resolve_job(app, Effect::Remove { index, unlock }) else {
         return;
     };
-    let outcome = run_job(JobCx::capture(cx), Job::Remove { query });
+    let outcome = run_job(JobCx::capture(cx), job);
     apply_outcome(cx, session, app, outcome);
 }
 
@@ -526,17 +557,36 @@ fn close_create_modal(app: &mut App) {
 }
 
 /// Applies a finished remove: report success/error in the status bar, return to
-/// the list, and refresh.
+/// the list, and refresh. A removal refused because the worktree is locked
+/// re-opens the confirm as the locked re-prompt instead, showing the lock's
+/// reason and offering the override (issue #126).
 pub(super) fn apply_remove(
     cx: &Cx,
     app: &mut App,
     query: &str,
-    result: std::result::Result<(), String>,
+    path: &Path,
+    result: std::result::Result<(), RemoveFailure>,
     root: &Path,
 ) {
     match result {
         Ok(()) => app.set_status(format!("removed {query}"), StatusKind::Success),
-        Err(e) => app.set_status(e, StatusKind::Error),
+        // Refused before anything changed, so the row still exists: re-find it
+        // by path, and re-prompt only when the user is idle — never clobbering
+        // an unrelated modal.
+        Err(RemoveFailure::Locked(reason)) => {
+            let index = app
+                .worktrees
+                .iter()
+                .position(|w| w.has_worktree && w.path == path);
+            match index {
+                Some(index) if app.may_apply_mode(JobHome::List) => {
+                    app.mode = Mode::ConfirmRemoveLocked { index, reason };
+                    return;
+                }
+                _ => app.set_status(RemoveFailure::Locked(reason).message(), StatusKind::Error),
+            }
+        }
+        Err(failure) => app.set_status(failure.message(), StatusKind::Error),
     }
     if app.may_apply_mode(JobHome::List) {
         app.mode = Mode::List;

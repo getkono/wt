@@ -42,6 +42,7 @@ pub(crate) fn run(cx: &mut Cx, hooks: &dyn HookRunner, args: &DropArgs, json: bo
         force_branch: false,
         keep_branch: true,
         no_hooks: args.no_hooks,
+        unlock: args.locked,
     };
     remove_resolved(cx, git, hooks, &session, &root, &worktree, &opts)?;
 
@@ -73,8 +74,30 @@ mod tests {
     fn args(force: bool) -> DropArgs {
         DropArgs {
             force,
+            locked: false,
             no_hooks: true,
         }
+    }
+
+    #[test]
+    fn locked_worktree_needs_locked_flag() {
+        // Issue #126: `drop` refuses a locked worktree in wt's words, and
+        // `--locked` (not `--force`) overrides it.
+        let repo = TestRepo::init();
+        make_wt(&repo, "held");
+        give_upstream(&repo, "held");
+        let wt = wt_dir(&repo, "held");
+        repo.git(&["worktree", "lock", &wt.to_string_lossy()]);
+        let err = run_in(&wt, &args(true), false).unwrap_err();
+        assert_eq!(err.to_string(), "worktree is locked; use --locked");
+        let locked = DropArgs {
+            locked: true,
+            ..args(false)
+        };
+        let (code, _, _) = run_in(&wt, &locked, false).unwrap();
+        assert_eq!(code, 0);
+        assert!(!repo.git(&["worktree", "list"]).contains("held"));
+        assert!(!repo.git(&["branch", "--list", "held"]).trim().is_empty());
     }
 
     /// Runs `wt drop` with the context's working directory set to `cwd`.

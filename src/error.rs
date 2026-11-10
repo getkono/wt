@@ -119,6 +119,15 @@ pub enum Error {
         unpushed: bool,
     },
 
+    /// Worktree removal was refused because the worktree is locked
+    /// (`git worktree lock`); the explicit unlock opt-in (`--locked`)
+    /// overrides it (issue #126).
+    #[error("worktree is locked{}; use --locked", lock_reason_suffix(reason.as_deref()))]
+    WorktreeLocked {
+        /// The reason recorded when the worktree was locked, if any.
+        reason: Option<String>,
+    },
+
     /// An operation failed for the reason described by the message.
     #[error("{0}")]
     Operation(String),
@@ -143,6 +152,12 @@ fn guard_reasons(dirty: bool, unpushed: bool) -> String {
         reasons.push("has unpushed work");
     }
     reasons.join(" and ")
+}
+
+/// Renders the ` (<reason>)` suffix for [`Error::WorktreeLocked`], matching
+/// `wt prune`'s locked-skip wording; empty when the lock has no reason.
+fn lock_reason_suffix(reason: Option<&str>) -> String {
+    reason.map(|r| format!(" ({r})")).unwrap_or_default()
 }
 
 impl Error {
@@ -275,6 +290,19 @@ mod tests {
             .to_string(),
             "worktree has unpushed work; use --force to remove anyway"
         );
+        // Names wt's own flag, never git's `remove -f -f` (issue #126).
+        assert_eq!(
+            Error::WorktreeLocked {
+                reason: Some("some reason".into()),
+            }
+            .to_string(),
+            "worktree is locked (some reason); use --locked"
+        );
+        assert_eq!(
+            Error::WorktreeLocked { reason: None }.to_string(),
+            "worktree is locked; use --locked"
+        );
+        assert_eq!(Error::WorktreeLocked { reason: None }.exit_code(), 1);
         assert_eq!(Error::GhUnavailable("nope".into()).to_string(), "nope");
         assert_eq!(Error::AgentUnavailable("nope".into()).to_string(), "nope");
         assert_eq!(Error::operation("op").to_string(), "op");

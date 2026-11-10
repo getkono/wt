@@ -387,7 +387,17 @@ pub(super) fn render_pr_picker(app: &App, state: &PrPickerState, frame: &mut Fra
 /// deletion decision can be made without leaving the dialog (issue #7). All of
 /// this is already on the [`crate::model::Worktree`] row; nothing new is read
 /// from git. The dialog grows to fit its content.
-pub(super) fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: Rect) {
+///
+/// `lock` is `Some` on the locked re-prompt (issue #126), carrying the lock's
+/// reason if one was given: the dialog then shows the lock and asks to remove
+/// the worktree anyway, which overrides it.
+pub(super) fn render_confirm(
+    app: &App,
+    index: usize,
+    lock: Option<Option<&str>>,
+    frame: &mut Frame,
+    area: Rect,
+) {
     let theme = Theme::with_palette(app.color, app.palette);
     let Some(worktree) = app.worktrees.get(index) else {
         return;
@@ -495,9 +505,23 @@ pub(super) fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: R
         }
     }
 
+    // The lock, on the re-prompt after git refused a locked worktree.
+    if let Some(reason) = lock {
+        let text = match reason {
+            Some(reason) => format!("(locked: {reason})"),
+            None => "(locked, no reason given)".to_string(),
+        };
+        lines.push(Line::from(Span::styled(text, theme.error())));
+    }
+
     lines.push(Line::from(""));
+    let prompt = if lock.is_some() {
+        "Remove anyway, overriding the lock? ["
+    } else {
+        "Remove this worktree? ["
+    };
     lines.push(Line::from(vec![
-        Span::raw("Remove this worktree? ["),
+        Span::raw(prompt),
         Span::styled("y", theme.warning()),
         Span::raw("/N]"),
     ]));
@@ -507,9 +531,14 @@ pub(super) fn render_confirm(app: &App, index: usize, frame: &mut Frame, area: R
     let height = lines.len() as u16 + 2;
     let rect = centered(area, 72, height);
     frame.render_widget(Clear, rect);
+    let title = if lock.is_some() {
+        "worktree is locked"
+    } else {
+        "confirm remove"
+    };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(Span::styled("confirm remove", theme.error())))
+            .block(Block::bordered().title(Span::styled(title, theme.error())))
             .wrap(Wrap { trim: false }),
         rect,
     );

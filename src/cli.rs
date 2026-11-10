@@ -332,6 +332,10 @@ pub(crate) struct RemoveArgs {
     /// Remove even when dirty or with unpushed work (work may be lost).
     #[arg(long)]
     pub(crate) force: bool,
+    /// Remove even when the worktree is locked (`git worktree remove --force
+    /// --force`). Separate from `--force`, which does not override a lock.
+    #[arg(long)]
+    pub(crate) locked: bool,
     /// Always keep the local branch.
     #[arg(long = "keep-branch")]
     pub(crate) keep_branch: bool,
@@ -346,6 +350,10 @@ pub(crate) struct DropArgs {
     /// Remove even when dirty or with unpushed work (work may be lost).
     #[arg(long)]
     pub(crate) force: bool,
+    /// Remove even when the worktree is locked (`git worktree remove --force
+    /// --force`). Separate from `--force`, which does not override a lock.
+    #[arg(long)]
+    pub(crate) locked: bool,
     /// Skip the pre-remove hook.
     #[arg(long = "no-hooks")]
     pub(crate) no_hooks: bool,
@@ -835,13 +843,30 @@ mod tests {
     }
 
     #[test]
+    fn remove_locked_is_its_own_opt_in() {
+        // Issue #126: `--locked` overrides a lock, separately from `--force`.
+        let remove = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Command::Remove(a)) => a,
+            _ => panic!("expected remove for {args:?}"),
+        };
+        let locked = remove(&["remove", "x", "--locked"]);
+        assert!(locked.locked && !locked.force);
+        assert!(!remove(&["remove", "x", "--force"]).locked);
+    }
+
+    #[test]
     fn drop_parses_with_flags_and_takes_no_query() {
         let cli = parse(&["drop", "--force", "--no-hooks"]).unwrap();
         match cli.command {
             Some(Command::Drop(a)) => {
                 assert!(a.force);
                 assert!(a.no_hooks);
+                assert!(!a.locked);
             }
+            _ => panic!("expected drop"),
+        }
+        match parse(&["drop", "--locked"]).unwrap().command {
+            Some(Command::Drop(a)) => assert!(a.locked && !a.force),
             _ => panic!("expected drop"),
         }
         // Bare `drop` is valid (no positional query).

@@ -299,7 +299,7 @@ fn dispatch_effect(
         // overlay (issue #46), dispatched by [`spawn_job`] from the event loop;
         // they never reach `dispatch_effect`.
         Effect::Create { .. }
-        | Effect::Remove(_)
+        | Effect::Remove { .. }
         | Effect::DeleteBranch { .. }
         | Effect::MaterializeBranch { .. }
         | Effect::CheckoutPr(_)
@@ -318,7 +318,7 @@ fn is_background_action(effect: &Effect) -> bool {
     matches!(
         effect,
         Effect::Create { .. }
-            | Effect::Remove(_)
+            | Effect::Remove { .. }
             | Effect::DeleteBranch { .. }
             | Effect::MaterializeBranch { .. }
             | Effect::CheckoutPr(_)
@@ -391,6 +391,10 @@ enum Job {
     Remove {
         /// The branch (or directory name) identifying the worktree to remove.
         query: String,
+        /// The worktree's path, to re-find its row for the locked re-prompt.
+        path: PathBuf,
+        /// Whether to override a lock (issue #126).
+        unlock: bool,
     },
     /// Delete the local branch `branch` of a worktree-less branch row (issue #53).
     DeleteBranch {
@@ -458,8 +462,10 @@ enum JobOutcome {
     Remove {
         /// The query that was removed (for the status text).
         query: String,
-        /// Success, or the error message to surface.
-        result: std::result::Result<(), String>,
+        /// The worktree's path, to re-find its row for the locked re-prompt.
+        path: PathBuf,
+        /// Success, or why it failed (a lock re-prompts, issue #126).
+        result: std::result::Result<(), RemoveFailure>,
     },
     /// A finished branch deletion (issue #53).
     DeleteBranch {
@@ -576,12 +582,21 @@ fn resolve_job(app: &App, effect: Effect) -> Option<(Job, JobKey, String)> {
                 label,
             ))
         }
-        Effect::Remove(index) => {
+        Effect::Remove { index, unlock } => {
             let worktree = app.worktrees.get(index)?;
-            let key = JobKey::Path(worktree.path.clone());
+            let path = worktree.path.clone();
+            let key = JobKey::Path(path.clone());
             let query = remove_query_of(app, index)?;
             let label = format!("Removing {query}");
-            Some((Job::Remove { query }, key, label))
+            Some((
+                Job::Remove {
+                    query,
+                    path,
+                    unlock,
+                },
+                key,
+                label,
+            ))
         }
         Effect::DeleteBranch { branch, force } => {
             let label = format!("Deleting branch {branch}");
@@ -702,9 +717,17 @@ fn run_job(jobcx: JobCx, job: Job) -> JobOutcome {
                 outcome,
             }
         }
-        Job::Remove { query } => {
-            let result = run_remove_command(&mut cx, &query);
-            JobOutcome::Remove { query, result }
+        Job::Remove {
+            query,
+            path,
+            unlock,
+        } => {
+            let result = run_remove_command(&mut cx, &query, unlock);
+            JobOutcome::Remove {
+                query,
+                path,
+                result,
+            }
         }
         Job::DeleteBranch { branch, force } => {
             let result = run_delete_branch_command(&mut cx, &branch, force);
@@ -757,7 +780,11 @@ fn apply_outcome(cx: &Cx, session: &Session, app: &mut App, outcome: JobOutcome)
             base,
             outcome,
         } => apply_create(cx, app, &branch, base, outcome, root),
-        JobOutcome::Remove { query, result } => apply_remove(cx, app, &query, result, root),
+        JobOutcome::Remove {
+            query,
+            path,
+            result,
+        } => apply_remove(cx, app, &query, &path, result, root),
         JobOutcome::DeleteBranch {
             branch,
             force,
@@ -1161,7 +1188,7 @@ mod tests {
             .iter()
             .position(|w| w.branch.as_deref() == Some("feature/x"))
             .unwrap();
-        do_remove(&mut t.cx, &session, &mut app, index);
+        do_remove(&mut t.cx, &session, &mut app, index, false);
         // The worktree is gone; the branch itself survives (not wt-created) and now
         // shows as a worktree-less branch row, so assert on the worktree row only.
         assert!(
@@ -1174,6 +1201,66 @@ mod tests {
                 .iter()
                 .any(|w| !w.has_worktree && w.branch.as_deref() == Some("feature/x"))
         );
+    }
+
+    #[test]
+    fn do_remove_locked_reprompts_then_overrides_the_lock() {
+        // Issue #126: a locked worktree is refused and re-opens the confirm as
+        // the locked re-prompt with its reason; confirming that removes it.
+        let repo = TestRepo::init();
+        repo.add_worktree("held", "../wt-held");
+        repo.git(&["worktree", "lock", "--reason", "in use", "../wt-held"]);
+        let held = repo.root().parent().unwrap().join("wt-held");
+        let (mut t, session, mut app) = setup(&repo);
+        let row = |app: &App| {
+            app.worktrees
+                .iter()
+                .position(|w| w.has_worktree && w.branch.as_deref() == Some("held"))
+        };
+        let index = row(&app).unwrap();
+        do_remove(&mut t.cx, &session, &mut app, index, false);
+        assert_eq!(
+            app.mode,
+            Mode::ConfirmRemoveLocked {
+                index,
+                reason: Some("in use".into()),
+            }
+        );
+        assert!(held.exists());
+
+        // The re-prompt's `y` returns to the list before the job runs.
+        app.mode = Mode::List;
+        do_remove(&mut t.cx, &session, &mut app, index, true);
+        assert_eq!(app.mode, Mode::List);
+        assert!(!held.exists());
+        assert!(row(&app).is_none());
+    }
+
+    #[test]
+    fn do_remove_locked_in_another_modal_reports_instead() {
+        // A finished job never clobbers a modal the user opened meanwhile.
+        let repo = TestRepo::init();
+        repo.add_worktree("held", "../wt-held");
+        repo.git(&["worktree", "lock", "../wt-held"]);
+        let (mut t, session, mut app) = setup(&repo);
+        let index = app
+            .worktrees
+            .iter()
+            .position(|w| w.has_worktree && w.branch.as_deref() == Some("held"))
+            .unwrap();
+        app.mode = Mode::Help;
+        do_remove(&mut t.cx, &session, &mut app, index, false);
+        assert_eq!(app.mode, Mode::Help);
+        assert_eq!(app.status_message.as_deref(), Some("worktree is locked"));
+    }
+
+    #[test]
+    fn remove_failure_messages() {
+        assert_eq!(
+            RemoveFailure::Locked(Some("r".into())).message(),
+            "worktree is locked (r)"
+        );
+        assert_eq!(RemoveFailure::Other("boom".into()).message(), "boom");
     }
 
     #[test]
@@ -1818,7 +1905,10 @@ mod tests {
             base: None,
             decision: None,
         }));
-        assert!(is_background_action(&Effect::Remove(0)));
+        assert!(is_background_action(&Effect::Remove {
+            index: 0,
+            unlock: false
+        }));
         assert!(is_background_action(&Effect::MaterializeBranch {
             branch: "x".into()
         }));
@@ -1854,8 +1944,19 @@ mod tests {
         assert_eq!(key, JobKey::New("feat/new".into()));
 
         // Remove resolves the query and keys on the target row's path.
-        let (job, key, label) = resolve_job(&a, Effect::Remove(1)).unwrap();
-        assert!(matches!(job, Job::Remove { query } if query == "feat/x"));
+        let (job, key, label) = resolve_job(
+            &a,
+            Effect::Remove {
+                index: 1,
+                unlock: true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            job,
+            Job::Remove { query, path, unlock: true }
+                if query == "feat/x" && path == a.worktrees[1].path
+        ));
         assert_eq!(label, "Removing feat/x");
         assert_eq!(key, JobKey::Path(a.worktrees[1].path.clone()));
 
@@ -1887,7 +1988,16 @@ mod tests {
     fn resolve_job_returns_none_for_missing_row() {
         use crate::tui::app::testutil::app as make_app;
         let a = make_app(&[("main", true)]);
-        assert!(resolve_job(&a, Effect::Remove(99)).is_none());
+        assert!(
+            resolve_job(
+                &a,
+                Effect::Remove {
+                    index: 99,
+                    unlock: false
+                }
+            )
+            .is_none()
+        );
         assert!(
             resolve_job(
                 &a,
@@ -1954,7 +2064,7 @@ mod tests {
         assert_eq!(canon(&t.cx.cwd), canon(&session.primary_root));
 
         // Remove the worktree the TUI was opened in (the background-job path).
-        run_remove_command(&mut t.cx, "feature/x").unwrap();
+        run_remove_command(&mut t.cx, "feature/x", false).unwrap();
         assert!(!linked.exists());
 
         // The session still opens: operations anchor at the surviving root.

@@ -307,7 +307,7 @@ impl Theme {
             Mode::PrPicker(_) => self.palette.magenta,
             Mode::PrCompose(_) => self.palette.green,
             Mode::Checkout(_) => self.palette.accent,
-            Mode::ConfirmRemove(_) => self.palette.red,
+            Mode::ConfirmRemove(_) | Mode::ConfirmRemoveLocked { .. } => self.palette.red,
             Mode::ConfirmCreate(_) => self.palette.green,
             Mode::ConfirmDeleteBranch { .. } => self.palette.red,
             Mode::ConfirmStaleBase(_) => self.palette.yellow,

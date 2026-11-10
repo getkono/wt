@@ -99,6 +99,13 @@ pub fn confirm_hints() -> &'static [Hint] {
     HINTS
 }
 
+/// Locked confirm-remove re-prompt hints (issue #126): `y` removes the worktree,
+/// overriding its lock; any other key cancels.
+pub fn confirm_remove_locked_hints() -> &'static [Hint] {
+    const HINTS: &[Hint] = &[hint("y", "remove (override lock)"), hint("Esc", "cancel")];
+    HINTS
+}
+
 /// Confirm-create dialog hints: `y` creates a worktree for the branch row and
 /// switches into it; any other key cancels (issue #47).
 pub fn confirm_create_hints() -> &'static [Hint] {
@@ -183,6 +190,7 @@ mod tests {
             compose_edit_hints(),
             checkout_hints(),
             confirm_hints(),
+            confirm_remove_locked_hints(),
             confirm_create_hints(),
             confirm_delete_branch_hints(),
             confirm_stale_base_hints(),
@@ -282,6 +290,12 @@ mod tests {
                 });
             }
             "confirm" => a.mode = Mode::ConfirmRemove(0),
+            "confirm_remove_locked" => {
+                a.mode = Mode::ConfirmRemoveLocked {
+                    index: 0,
+                    reason: Some("in use".into()),
+                }
+            }
             "confirm_create" => a.mode = Mode::ConfirmCreate(0),
             "confirm_delete_branch" => {
                 a.mode = Mode::ConfirmDeleteBranch {
@@ -341,6 +355,7 @@ mod tests {
         assert_hints_live("compose", compose_edit_hints());
         assert_hints_live("checkout", checkout_hints());
         assert_hints_live("confirm", confirm_hints());
+        assert_hints_live("confirm_remove_locked", confirm_remove_locked_hints());
         assert_hints_live("confirm_create", confirm_create_hints());
         assert_hints_live("confirm_delete_branch", confirm_delete_branch_hints());
         assert_hints_live("confirm_stale_base", confirm_stale_base_hints());
