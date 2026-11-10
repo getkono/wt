@@ -183,6 +183,19 @@ mod tests {
     }
 
     #[test]
+    fn locked_worktree_is_marked_in_the_branch_column() {
+        let mut locked = wt("/repo/.worktrees/held", "held", false);
+        locked.is_locked = true;
+        let worktrees = vec![wt("/repo", "main", true), locked];
+        let table = render_table(&worktrees, &Column::ALL, &ctx(), 120, false);
+        let lines: Vec<&str> = table.lines().collect();
+        assert!(!lines[0].contains("(locked)"));
+        assert!(lines[1].contains("held (locked)"));
+        // The Path column stays aligned past the widened Branch column.
+        assert_eq!(lines[0].find(". "), lines[1].find(".worktrees"));
+    }
+
+    #[test]
     fn commit_column_truncates_in_narrow_terminal() {
         let mut w = wt("/repo", "main", true);
         w.commit = Some(Commit {

@@ -55,6 +55,21 @@ pub fn branch_display(worktree: &Worktree) -> String {
     }
 }
 
+/// The marker appended to a locked worktree's Branch cell (issue #127).
+pub const LOCKED_MARKER: &str = "(locked)";
+
+/// The Branch column cell: [`branch_display`], suffixed with
+/// [`LOCKED_MARKER`] for a locked worktree. The lock reason is left to
+/// `wt status` and `--json`, since it can be arbitrarily long.
+pub fn branch_cell(worktree: &Worktree) -> String {
+    let branch = branch_display(worktree);
+    if worktree.is_locked {
+        format!("{branch} {LOCKED_MARKER}")
+    } else {
+        branch
+    }
+}
+
 /// The ahead/behind cell: `↑N ↓M`, or `–` when there is no upstream.
 pub fn ahead_behind_cell(worktree: &Worktree) -> String {
     match (worktree.ahead, worktree.behind) {
@@ -106,7 +121,7 @@ pub fn cell(worktree: &Worktree, column: Column, ctx: &RenderCtx) -> String {
     match column {
         Column::Status => status_marker(worktree).to_string(),
         Column::Dirty => dirty_marker(worktree, ctx.show_untracked).to_string(),
-        Column::Branch => branch_display(worktree),
+        Column::Branch => branch_cell(worktree),
         Column::Path => path_cell(worktree, ctx.repo_root),
         Column::AheadBehind => ahead_behind_cell(worktree),
         Column::Commit => commit_cell(worktree, ctx.now),
@@ -132,6 +147,13 @@ pub(crate) fn status_block(worktree: &Worktree, entries: &[StatusEntry]) -> Stri
     }
     if let Some(base) = &worktree.base_ref {
         let _ = writeln!(out, "base:     {base}");
+    }
+    if worktree.is_locked {
+        let reason = worktree
+            .lock_reason
+            .as_deref()
+            .unwrap_or("(no reason given)");
+        let _ = writeln!(out, "locked:   {reason}");
     }
 
     if worktree.is_missing {
@@ -220,6 +242,41 @@ mod tests {
             timestamp: "2024-01-15T10:30:00Z".into(),
         });
         assert_eq!(branch_display(&w), "(HEAD detached @ abc1234)");
+    }
+
+    #[test]
+    fn branch_cell_marks_a_locked_worktree() {
+        let mut w = base();
+        assert_eq!(branch_cell(&w), "main");
+        w.is_locked = true;
+        w.lock_reason = Some("in use".into());
+        assert_eq!(branch_cell(&w), "main (locked)");
+        assert_eq!(
+            cell(
+                &w,
+                Column::Branch,
+                &RenderCtx {
+                    show_untracked: true,
+                    now: 0,
+                    repo_root: Path::new("/repo"),
+                }
+            ),
+            "main (locked)"
+        );
+        // The plain display (used by the TUI and `wt status`) is unchanged.
+        assert_eq!(branch_display(&w), "main");
+    }
+
+    #[test]
+    fn status_block_shows_lock_reason() {
+        let mut w = base();
+        assert!(!status_block(&w, &[]).contains("locked:"));
+        w.is_locked = true;
+        assert!(status_block(&w, &[]).contains("locked:   (no reason given)"));
+        w.lock_reason = Some("in use".into());
+        // Shown for a missing worktree too: a lock is what keeps it from pruning.
+        w.is_missing = true;
+        assert!(status_block(&w, &[]).contains("locked:   in use"));
     }
 
     #[test]
