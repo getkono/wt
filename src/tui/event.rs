@@ -53,8 +53,14 @@ pub enum Effect {
         /// The stale-base decision: `None` to pre-flight, else the chosen action.
         decision: Option<CreateDecision>,
     },
-    /// Remove the worktree at the given index (confirmed; force semantics).
-    Remove(usize),
+    /// Remove the worktree at `index` (confirmed; force semantics). `unlock`
+    /// also overrides a lock, set only from the locked re-prompt (issue #126).
+    Remove {
+        /// Index into [`App::worktrees`](crate::tui::app::App::worktrees).
+        index: usize,
+        /// Whether to remove the worktree even though it is locked.
+        unlock: bool,
+    },
     /// Delete the local branch `branch` of a worktree-less branch row (confirmed;
     /// issue #53). `force` uses `git branch -D` to delete an unmerged branch.
     DeleteBranch {
@@ -226,7 +232,7 @@ impl App {
             Mode::PrPicker(_) => self.key_pr(key),
             Mode::PrCompose(_) => self.key_compose(key),
             Mode::Checkout(_) => self.key_checkout_picker(key),
-            Mode::ConfirmRemove(_) => self.key_confirm(key),
+            Mode::ConfirmRemove(_) | Mode::ConfirmRemoveLocked { .. } => self.key_confirm(key),
             Mode::ConfirmCreate(_) => self.key_confirm_create(key),
             Mode::ConfirmDeleteBranch { .. } => self.key_confirm_delete_branch(key),
             Mode::ConfirmStaleBase(_) => self.key_confirm_stale_base(key),
@@ -615,16 +621,19 @@ impl App {
         Effect::None
     }
 
-    /// Confirm-remove key handling.
+    /// Confirm-remove key handling, for the first prompt and the locked
+    /// re-prompt (issue #126): `y`/`Y` removes, and on the re-prompt also
+    /// overrides the lock; any other key cancels.
     fn key_confirm(&mut self, key: KeyEvent) -> Effect {
-        let Mode::ConfirmRemove(index) = self.mode else {
-            return Effect::None;
+        let (index, unlock) = match self.mode {
+            Mode::ConfirmRemove(index) => (index, false),
+            Mode::ConfirmRemoveLocked { index, .. } => (index, true),
+            _ => return Effect::None,
         };
+        self.mode = Mode::List;
         if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-            self.mode = Mode::List;
-            Effect::Remove(index)
+            Effect::Remove { index, unlock }
         } else {
-            self.mode = Mode::List;
             Effect::None
         }
     }
@@ -1401,7 +1410,8 @@ mod tests {
         assert!(matches!(a.mode, Mode::ConfirmRemove(_)));
         let effect = a.handle_event(press(KeyCode::Char('y')));
         // index 1 = feat (default sort keeps order here).
-        assert!(matches!(effect, Effect::Remove(_)));
+        // The first prompt never overrides a lock (issue #126).
+        assert!(matches!(effect, Effect::Remove { unlock: false, .. }));
         assert_eq!(a.mode, Mode::List);
     }
 
@@ -1411,6 +1421,36 @@ mod tests {
         a.selected = 1;
         a.handle_event(press(KeyCode::Char('d')));
         let effect = a.handle_event(press(KeyCode::Char('n')));
+        assert_eq!(effect, Effect::None);
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn confirm_remove_locked_y_overrides_the_lock() {
+        let mut a = app(&[("main", true), ("feat", false)]);
+        a.mode = Mode::ConfirmRemoveLocked {
+            index: 1,
+            reason: Some("in use".into()),
+        };
+        let effect = a.handle_event(press(KeyCode::Char('Y')));
+        assert_eq!(
+            effect,
+            Effect::Remove {
+                index: 1,
+                unlock: true
+            }
+        );
+        assert_eq!(a.mode, Mode::List);
+    }
+
+    #[test]
+    fn confirm_remove_locked_other_key_cancels() {
+        let mut a = app(&[("main", true), ("feat", false)]);
+        a.mode = Mode::ConfirmRemoveLocked {
+            index: 1,
+            reason: None,
+        };
+        let effect = a.handle_event(press(KeyCode::Esc));
         assert_eq!(effect, Effect::None);
         assert_eq!(a.mode, Mode::List);
     }

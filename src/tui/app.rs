@@ -35,6 +35,15 @@ pub enum Mode {
     Checkout(CheckoutState),
     /// Confirm-remove dialog (the worktree index).
     ConfirmRemove(usize),
+    /// Re-prompt shown when a confirmed removal was refused because the worktree
+    /// is locked (issue #126): it shows the lock's reason, and confirming
+    /// overrides the lock.
+    ConfirmRemoveLocked {
+        /// Index into [`App::worktrees`] of the locked worktree.
+        index: usize,
+        /// The reason recorded when the worktree was locked, if any.
+        reason: Option<String>,
+    },
     /// Confirm creating a worktree for the worktree-less branch row at the given
     /// index, then switching into it (issue #47).
     ConfirmCreate(usize),

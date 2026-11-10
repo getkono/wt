@@ -55,7 +55,10 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::PrPicker(state) => modals::render_pr_picker(app, state, frame, area),
         Mode::PrCompose(state) => modals::render_pr_compose(app, state, frame, area),
         Mode::Checkout(state) => modals::render_checkout(app, state, frame, area),
-        Mode::ConfirmRemove(index) => modals::render_confirm(app, *index, frame, area),
+        Mode::ConfirmRemove(index) => modals::render_confirm(app, *index, None, frame, area),
+        Mode::ConfirmRemoveLocked { index, reason } => {
+            modals::render_confirm(app, *index, Some(reason.as_deref()), frame, area)
+        }
         Mode::ConfirmCreate(index) => modals::render_confirm_create(app, *index, frame, area),
         Mode::ConfirmDeleteBranch { index, force } => {
             modals::render_confirm_delete_branch(app, *index, *force, frame, area)
@@ -239,7 +242,7 @@ fn mode_label(mode: &Mode) -> &'static str {
         Mode::PrPicker(_) => "PR",
         Mode::PrCompose(_) => "COMPOSE",
         Mode::Checkout(_) => "CHECKOUT",
-        Mode::ConfirmRemove(_) => "REMOVE",
+        Mode::ConfirmRemove(_) | Mode::ConfirmRemoveLocked { .. } => "REMOVE",
         Mode::ConfirmCreate(_) => "CREATE",
         Mode::ConfirmDeleteBranch { .. } => "DELETE",
         Mode::ConfirmStaleBase(_) => "CREATE",
@@ -286,6 +289,7 @@ fn mode_hints(app: &App) -> Vec<(String, String)> {
         Mode::PrCompose(_) => hint_pairs(hints::compose_edit_hints()),
         Mode::Checkout(_) => hint_pairs(hints::checkout_hints()),
         Mode::ConfirmRemove(_) => hint_pairs(hints::confirm_hints()),
+        Mode::ConfirmRemoveLocked { .. } => hint_pairs(hints::confirm_remove_locked_hints()),
         Mode::ConfirmCreate(_) => hint_pairs(hints::confirm_create_hints()),
         Mode::ConfirmDeleteBranch { .. } => hint_pairs(hints::confirm_delete_branch_hints()),
         Mode::ConfirmStaleBase(_) => hint_pairs(hints::confirm_stale_base_hints()),
@@ -735,6 +739,33 @@ mod tests {
         assert!(text.contains("confirm remove"));
         assert!(text.contains("data may be lost"));
         assert!(text.contains("[y/N]"));
+        assert!(!text.contains("locked"));
+    }
+
+    #[test]
+    fn confirm_remove_locked_shows_reason_and_override() {
+        // Issue #126: the re-prompt names the lock and its reason, and asks to
+        // override it explicitly.
+        let mut a = app(&[("main", true)]);
+        a.worktrees.push(wt("held", false));
+        let index = a.worktrees.len() - 1;
+        a.mode = Mode::ConfirmRemoveLocked {
+            index,
+            reason: Some("claude agent 7".into()),
+        };
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("worktree is locked"));
+        assert!(text.contains("(locked: claude agent 7)"));
+        assert!(text.contains("overriding the lock? [y/N]"));
+        assert!(text.contains("REMOVE"));
+        assert!(text.contains("override lock"));
+
+        a.mode = Mode::ConfirmRemoveLocked {
+            index,
+            reason: None,
+        };
+        let text = render_to_text(&a, 100, 30);
+        assert!(text.contains("(locked, no reason given)"));
     }
 
     #[test]
