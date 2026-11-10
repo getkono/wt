@@ -11,6 +11,20 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.9.0](https://github.com/getkono/wt/compare/v1.8.1...v1.9.0) - 2026-11-10
+
+### Added
+
+- *(model)* show worktree lock state in list, --json and the TUI ([#130](https://github.com/getkono/wt/pull/130))
+
+### Fixed
+
+- *(remove)* add --locked to wt remove, wt drop and the TUI remove dialog ([#131](https://github.com/getkono/wt/pull/131))
+
+### Other
+
+- *(profile)* keep only line tables in dev, no debug info for deps ([#125](https://github.com/getkono/wt/pull/125))
+
 ## [1.8.1](https://github.com/getkono/wt/compare/v1.8.0...v1.8.1) - 2026-10-22
 
 ### Fixed
