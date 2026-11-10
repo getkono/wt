@@ -244,7 +244,9 @@ impl Workspace {
         create_in(&self.parts(&repo), git, hooks, options)
     }
 
-    /// Removes `worktree` under `options`, enforcing the dirty/unpushed safety
+    /// Removes `worktree` under `options`, refusing a locked worktree unless
+    /// [`RemoveOptions::unlock`] (returning [`Error::WorktreeLocked`]),
+    /// enforcing the dirty/unpushed safety
     /// guards (returning [`Error::RemoveGuarded`] when they block), running the
     /// `pre_remove` hook, pruning a missing worktree, and deleting a
     /// fully-merged wt-created branch per the configuration.
@@ -406,6 +408,12 @@ pub struct RemoveOptions {
     pub keep_branch: bool,
     /// Skip the `pre_remove` hook.
     pub no_hooks: bool,
+    /// Remove the worktree even when it is locked (`git worktree lock`),
+    /// passing `--force` twice to `git worktree remove`. Without it a locked
+    /// worktree is refused with [`Error::WorktreeLocked`] before the hook runs.
+    /// Independent of [`Self::force_remove`], as `wt prune --locked` is of
+    /// `--force` (issue #126).
+    pub unlock: bool,
 }
 
 /// How a hook invocation went, reported as data (the service never prints).
@@ -883,9 +891,28 @@ pub(crate) fn remove_in(
         .unwrap_or_default();
     let default = default_branch(ws.repo.gix());
 
+    // A locked worktree is refused up front, in wt's own words, unless the
+    // caller opted in: git's own refusal names `remove -f -f`, which no wt
+    // command accepts (issue #126). Read fresh rather than trusted from the row,
+    // which may predate the lock.
+    let lock = lock_state(git, ws.root, &worktree.path)?;
+    if let Some(reason) = &lock
+        && !options.unlock
+    {
+        return Err(Error::WorktreeLocked {
+            reason: reason.clone(),
+        });
+    }
+
     // A missing worktree: prune the admin record; no guards or hook apply.
     if worktree.is_missing {
         let _lock = acquire_repo_lock(ws.root, LOCK_TIMEOUT)?;
+        if lock.is_some() {
+            // `git worktree prune` keeps a locked record, so remove it by
+            // path; git accepts a missing directory once `--force` is doubled.
+            let path = worktree.path.to_string_lossy().into_owned();
+            ops::worktree_remove(git, ws.root, &path, true, true)?;
+        }
         ops::worktree_prune(git, ws.root)?;
         let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
         clear_metadata(git, ws.root, worktree);
@@ -908,8 +935,10 @@ pub(crate) fn remove_in(
     // and `remove.untracked_blocks` is off by default — so count untracked files
     // here whenever that force is what we are about to do. Otherwise a worktree
     // with submodules would quietly lose files that an identical worktree
-    // without them is protected from losing.
-    let untracked_blocks = ws.config.remove_untracked_blocks || needs_submodule_force;
+    // without them is protected from losing. Overriding a lock forces git the
+    // same way (`--force` twice), so it counts untracked files too (issue #126).
+    let unlocking = lock.is_some();
+    let untracked_blocks = ws.config.remove_untracked_blocks || needs_submodule_force || unlocking;
     let guard = rows::guard_status(worktree, untracked_blocks);
     if guard.blocks() && !options.force_remove {
         return Err(Error::RemoveGuarded {
@@ -952,13 +981,15 @@ pub(crate) fn remove_in(
     let path = worktree.path.to_string_lossy().into_owned();
 
     // The guards above are the real safety decision, and they took the submodule
-    // force into account, so passing it to git now weakens nothing.
+    // and lock forces into account, so passing them to git now weakens nothing.
+    // Only a worktree that is actually locked gets the doubled force: `unlock`
+    // on an unlocked one must not silently become `--force`.
     ops::worktree_remove(
         git,
         ws.root,
         &path,
         options.force_remove || needs_submodule_force,
-        false,
+        unlocking,
     )?;
 
     let branch_deleted = maybe_delete_branch(ws, git, worktree, &meta, options, &default);
@@ -969,6 +1000,17 @@ pub(crate) fn remove_in(
         forced_for_submodules,
         pre_remove,
     })
+}
+
+/// The lock on the worktree at `path`, read from `git worktree list
+/// --porcelain`: `None` when it is not locked (or no longer listed), else
+/// `Some` of its reason, which is `None` for a lock given without one.
+fn lock_state(git: &dyn GitCli, root: &Path, path: &Path) -> Result<Option<Option<String>>> {
+    let raws = crate::git::worktrees::enumerate(git, root)?;
+    Ok(raws
+        .into_iter()
+        .find(|raw| raw.is_locked && same_path(&raw.path, path))
+        .map(|raw| raw.lock_reason))
 }
 
 /// Deletes the branch if it is wt-created and either fully merged (and the
@@ -1916,6 +1958,7 @@ mod tests {
                     force_branch: true,
                     no_hooks: true,
                     keep_branch: false,
+                    unlock: false,
                 },
             )
             .unwrap();
@@ -1961,6 +2004,171 @@ mod tests {
             .unwrap();
         assert_eq!(removed.pre_remove, HookOutcome::Skipped);
         assert!(!repo.git(&["worktree", "list"]).contains("gone"));
+    }
+
+    #[test]
+    fn remove_locked_worktree_needs_unlock_even_with_force() {
+        // Issue #126: a lock is refused in wt's words (never git's `-f -f`
+        // hint), before the hook, and `force_remove` alone does not override it.
+        let repo = TestRepo::init();
+        repo.write(".wt.toml", "[hooks]\npre_remove = \"touch hook-ran\"\n");
+        repo.commit_all("config");
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("held"))
+            .unwrap();
+        let dir = created.path.to_string_lossy().into_owned();
+        repo.git(&["worktree", "lock", "--reason", "some reason", &dir]);
+        let row = row_for(&ws, "held");
+        for force_remove in [false, true] {
+            let err = ws
+                .remove(
+                    &RealGit,
+                    &RealHookRunner,
+                    &row,
+                    &RemoveOptions {
+                        force_remove,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::WorktreeLocked { reason: Some(r) } if r == "some reason"),
+                "{err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "worktree is locked (some reason); use --locked"
+            );
+        }
+        assert!(created.path.exists());
+        assert!(!created.path.join("hook-ran").exists(), "hook ran first");
+
+        // The explicit opt-in removes it; `force_remove` still governs guards.
+        ws.remove(
+            &RealGit,
+            &RealHookRunner,
+            &row,
+            &RemoveOptions {
+                force_remove: true,
+                unlock: true,
+                no_hooks: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!created.path.exists());
+        assert!(!repo.git(&["worktree", "list"]).contains("held"));
+    }
+
+    #[test]
+    fn remove_locked_worktree_without_a_reason() {
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("bare-lock"))
+            .unwrap();
+        repo.git(&["worktree", "lock", &created.path.to_string_lossy()]);
+        let row = row_for(&ws, "bare-lock");
+        let err = ws
+            .remove(&RealGit, &RealHookRunner, &row, &RemoveOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::WorktreeLocked { reason: None }));
+        assert_eq!(err.to_string(), "worktree is locked; use --locked");
+    }
+
+    #[test]
+    fn remove_missing_locked_worktree_needs_unlock() {
+        // `git worktree prune` keeps a locked record, so a missing locked
+        // worktree is refused, then removed by path once unlocked.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("lost"))
+            .unwrap();
+        repo.git(&[
+            "worktree",
+            "lock",
+            "--reason",
+            "pid 1",
+            &created.path.to_string_lossy(),
+        ]);
+        std::fs::remove_dir_all(&created.path).unwrap();
+        let row = row_for(&ws, "lost");
+        assert!(row.is_missing);
+        let err = ws
+            .remove(&RealGit, &RealHookRunner, &row, &RemoveOptions::default())
+            .unwrap_err();
+        assert!(matches!(err, Error::WorktreeLocked { .. }));
+        ws.remove(
+            &RealGit,
+            &RealHookRunner,
+            &row,
+            &RemoveOptions {
+                unlock: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!repo.git(&["worktree", "list"]).contains("lost"));
+    }
+
+    #[test]
+    fn remove_with_unlock_on_an_unlocked_worktree_does_not_force_git() {
+        // `unlock` on an unlocked worktree must not become `--force`: git still
+        // refuses to delete untracked files the default guards do not count.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("free"))
+            .unwrap();
+        give_upstream(&repo, "free");
+        std::fs::write(created.path.join("scratch.txt"), "unsaved\n").unwrap();
+        let row = row_for(&ws, "free");
+        let unlock = RemoveOptions {
+            unlock: true,
+            no_hooks: true,
+            ..Default::default()
+        };
+        let err = ws
+            .remove(&RealGit, &RealHookRunner, &row, &unlock)
+            .unwrap_err();
+        assert!(matches!(err, Error::Subprocess { .. }), "{err:?}");
+        assert!(created.path.join("scratch.txt").exists());
+
+        std::fs::remove_file(created.path.join("scratch.txt")).unwrap();
+        let row = row_for(&ws, "free");
+        ws.remove(&RealGit, &RealHookRunner, &row, &unlock).unwrap();
+        assert!(!created.path.exists());
+    }
+
+    #[test]
+    fn remove_unlock_guards_untracked_files() {
+        // Overriding a lock forces git, which would take untracked files with
+        // it; the guard counts them so only `force_remove` can lose them.
+        let repo = TestRepo::init();
+        let ws = workspace(&repo);
+        let created = ws
+            .create(&RealGit, &RealHookRunner, &create_opts("held-dirty"))
+            .unwrap();
+        give_upstream(&repo, "held-dirty");
+        repo.git(&["worktree", "lock", &created.path.to_string_lossy()]);
+        std::fs::write(created.path.join("scratch.txt"), "unsaved\n").unwrap();
+        let row = row_for(&ws, "held-dirty");
+        let err = ws
+            .remove(
+                &RealGit,
+                &RealHookRunner,
+                &row,
+                &RemoveOptions {
+                    unlock: true,
+                    no_hooks: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::RemoveGuarded { dirty: true, .. }));
+        assert!(created.path.join("scratch.txt").exists());
     }
 
     #[test]

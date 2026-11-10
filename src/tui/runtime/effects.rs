@@ -120,6 +120,7 @@ pub(super) fn run_remove_command(cx: &mut Cx, query: &str) -> std::result::Resul
         force_branch: false,
         keep_branch: false,
         no_hooks: false,
+        unlock: false,
     };
     commands::remove::remove_query(cx, &CapturingHookRunner, query, &opts, false)
         .map(|_| ())

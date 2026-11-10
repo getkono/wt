@@ -24,13 +24,14 @@ use crate::worktree::{
 pub(crate) use crate::worktree::RemoveOptions;
 
 /// Builds options from the CLI flags, where `--force` forces both removal and
-/// unmerged-branch deletion.
+/// unmerged-branch deletion, and `--locked` alone overrides a lock.
 fn options_from_args(args: &RemoveArgs) -> RemoveOptions {
     RemoveOptions {
         force_remove: args.force,
         force_branch: args.force,
         keep_branch: args.keep_branch,
         no_hooks: args.no_hooks,
+        unlock: args.locked,
     }
 }
 
@@ -229,9 +230,35 @@ mod tests {
         RemoveArgs {
             query: query.to_string(),
             force,
+            locked: false,
             keep_branch,
             no_hooks: true,
         }
+    }
+
+    #[test]
+    fn locked_worktree_needs_locked_flag_not_force() {
+        // Issue #126: wt's own error names `--locked`, never git's `-f -f`.
+        let repo = TestRepo::init();
+        make_wt(&repo, "held");
+        give_upstream(&repo, "held");
+        let dir = wt_dir(&repo, "held").to_string_lossy().into_owned();
+        repo.git(&["worktree", "lock", "--reason", "some reason", &dir]);
+        for force in [false, true] {
+            let err = run(&repo, &args("held", force, false), false).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "worktree is locked (some reason); use --locked"
+            );
+        }
+        assert!(repo.git(&["worktree", "list"]).contains("held"));
+        let locked = RemoveArgs {
+            locked: true,
+            ..args("held", false, false)
+        };
+        let (code, _, _) = run(&repo, &locked, false).unwrap();
+        assert_eq!(code, 0);
+        assert!(!repo.git(&["worktree", "list"]).contains("held"));
     }
 
     fn run(repo: &TestRepo, a: &RemoveArgs, json: bool) -> Result<(u8, String, String)> {
@@ -330,6 +357,7 @@ mod tests {
             force_branch: false,
             keep_branch: false,
             no_hooks: true,
+            unlock: false,
         };
         let code =
             super::remove_query(&mut t.cx, &RealHookRunner, "tuionly", &opts, false).unwrap();
