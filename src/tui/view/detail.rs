@@ -53,6 +53,7 @@ pub(super) fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             Span::raw(base.clone()),
         ]));
     }
+    lines.extend(lock_line(worktree, &theme));
     if app.is_loaded(worktree) {
         let mut status_spans = vec![Span::styled("status: ", theme.label())];
         status_spans.extend(ahead_behind_spans(worktree, &theme, true, &glyphs));
@@ -107,6 +108,22 @@ pub(super) fn render_detail(app: &App, frame: &mut Frame, area: Rect) {
             .end_symbol(None);
         frame.render_stateful_widget(scrollbar, area.inner(Margin::new(0, 1)), &mut sb_state);
     }
+}
+
+/// The `locked:` line for a locked worktree (issue #127), carrying the recorded
+/// reason; `None` when the worktree is not locked.
+fn lock_line(worktree: &Worktree, theme: &Theme) -> Option<Line<'static>> {
+    if !worktree.is_locked {
+        return None;
+    }
+    let reason = worktree
+        .lock_reason
+        .clone()
+        .unwrap_or_else(|| "(no reason given)".to_string());
+    Some(Line::from(vec![
+        Span::styled("locked: ", theme.label()),
+        Span::styled(reason, theme.warning()),
+    ]))
 }
 
 /// Renders the detail pane for a worktree-less branch row (issue #47): the
@@ -208,5 +225,29 @@ fn detail_commits(lines: &mut Vec<Line<'static>>, worktree: &Worktree, theme: &T
             Span::raw(" "),
             Span::styled(format!("({})", rel(&c.timestamp)), theme.time()),
         ]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::testutil::wt;
+
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn lock_line_shows_the_reason_or_a_placeholder() {
+        let theme = Theme::new(false);
+        let mut w = wt("feature/x", false);
+        assert!(lock_line(&w, &theme).is_none());
+        w.is_locked = true;
+        assert_eq!(
+            text(&lock_line(&w, &theme).unwrap()),
+            "locked: (no reason given)"
+        );
+        w.lock_reason = Some("in use".into());
+        assert_eq!(text(&lock_line(&w, &theme).unwrap()), "locked: in use");
     }
 }
