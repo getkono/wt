@@ -168,8 +168,15 @@ fn list_row(
             branch_display(worktree),
             theme.branch(worktree.is_current, worktree.is_detached),
         ),
-        Span::raw("  "),
     ];
+    if worktree.is_locked {
+        // The reason lives in the detail pane; the row only flags the lock.
+        spans.push(Span::styled(
+            format!(" {}", crate::output::render::LOCKED_MARKER),
+            theme.warning(),
+        ));
+    }
+    spans.push(Span::raw("  "));
     // While a job runs on the row, its label stands in for the async cells (which
     // may be mid-change) rather than crowding them; otherwise render the cells.
     if let Some(label) = job {
@@ -185,4 +192,36 @@ fn list_row(
         spans.extend(pr_spans(worktree, theme, loaded, glyphs));
     }
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::testutil::wt;
+
+    fn row_text(worktree: &Worktree) -> String {
+        let line = list_row(
+            worktree,
+            &Glyphs::new(false),
+            &Theme::new(false),
+            true,
+            true,
+            0,
+            None,
+            0,
+        );
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn locked_row_is_flagged_after_the_branch() {
+        let mut w = wt("feature/x", false);
+        assert!(!row_text(&w).contains("(locked)"));
+        w.is_locked = true;
+        w.lock_reason = Some("in use".into());
+        let text = row_text(&w);
+        assert!(text.contains("feature/x (locked)"), "{text:?}");
+        // The reason is left to the detail pane.
+        assert!(!text.contains("in use"));
+    }
 }

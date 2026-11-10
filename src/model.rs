@@ -37,6 +37,12 @@ pub struct Worktree {
     pub is_missing: bool,
     /// Whether the worktree has a detached HEAD.
     pub is_detached: bool,
+    /// Whether the worktree is locked (`git worktree lock`). Additive to the §7
+    /// schema (issue #127), so [`SCHEMA_VERSION`] is unchanged.
+    pub is_locked: bool,
+    /// The reason recorded when the worktree was locked; `None` when it is not
+    /// locked or was locked without a reason.
+    pub lock_reason: Option<String>,
     /// Whether tracked files are modified/staged; `None` when missing.
     pub dirty: Option<bool>,
     /// Whether untracked files are present; `None` when missing.
@@ -97,6 +103,8 @@ impl Worktree {
             is_main: false,
             is_missing: false,
             is_detached: false,
+            is_locked: false,
+            lock_reason: None,
             dirty: None,
             has_untracked: None,
             ahead: None,
@@ -372,6 +380,8 @@ mod tests {
         "is_main": false,
         "is_missing": false,
         "is_detached": false,
+        "is_locked": false,
+        "lock_reason": null,
         "dirty": true,
         "has_untracked": false,
         "ahead": 2,
@@ -398,6 +408,8 @@ mod tests {
             is_main: false,
             is_missing: false,
             is_detached: false,
+            is_locked: false,
+            lock_reason: None,
             dirty: Some(true),
             has_untracked: Some(false),
             ahead: Some(2),
@@ -483,6 +495,21 @@ mod tests {
         assert!(v["branch"].is_null());
         assert!(v["slug"].is_null());
         assert_eq!(v["is_detached"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn locked_worktree_serializes_lock_fields() {
+        let mut wt = Worktree::new(PathBuf::from("/l"));
+        let v = serde_json::to_value(&wt).unwrap();
+        assert_eq!(v["is_locked"], serde_json::json!(false));
+        assert!(v["lock_reason"].is_null());
+        wt.is_locked = true;
+        wt.lock_reason = Some("being used".into());
+        let v = serde_json::to_value(&wt).unwrap();
+        assert_eq!(v["is_locked"], serde_json::json!(true));
+        assert_eq!(v["lock_reason"], serde_json::json!("being used"));
+        // Additive: the schema version is not bumped (issue #127).
+        assert_eq!(v["schema_version"], serde_json::json!(1));
     }
 
     #[test]

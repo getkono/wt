@@ -48,6 +48,8 @@ pub(crate) fn enumerate_worktrees(repo: &Repo, git: &dyn GitCli) -> Result<Vec<W
         wt.is_main = raw.is_main;
         wt.is_missing = raw.is_missing;
         wt.is_detached = raw.is_detached;
+        wt.is_locked = raw.is_locked;
+        wt.lock_reason = raw.lock_reason.clone();
         wt.branch = raw.branch.clone();
         wt.slug = raw.branch.as_deref().map(slugify);
         wt.is_current = current
@@ -524,6 +526,30 @@ mod tests {
         let commit = det.commit.as_ref().expect("tip commit filled from HEAD");
         assert_eq!(commit.subject, "init");
         assert!(head.starts_with(&commit.hash));
+    }
+
+    #[test]
+    fn locked_worktree_carries_lock_state() {
+        let repo = TestRepo::init();
+        repo.add_worktree("held", "../wt-held");
+        repo.add_worktree("held-bare", "../wt-held-bare");
+        repo.git(&["worktree", "lock", "--reason", "in use", "../wt-held"]);
+        repo.git(&["worktree", "lock", "../wt-held-bare"]);
+        let r = Repo::discover(repo.root()).unwrap();
+        let worktrees = build_worktrees(&r, &RealGit).unwrap();
+        let find = |b: &str| {
+            worktrees
+                .iter()
+                .find(|w| w.branch.as_deref() == Some(b))
+                .unwrap()
+        };
+        let held = find("held");
+        assert!(held.is_locked);
+        assert_eq!(held.lock_reason.as_deref(), Some("in use"));
+        let bare = find("held-bare");
+        assert!(bare.is_locked && bare.lock_reason.is_none());
+        let main = find("main");
+        assert!(!main.is_locked && main.lock_reason.is_none());
     }
 
     #[test]

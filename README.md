@@ -41,7 +41,7 @@ wt switch                       # fuzzy-pick a worktree to jump to
 wt pr 42                        # check out PR #42 into its own worktree
 wt issue 123                    # worktree for issue #123, with a proposed branch name
 wt new feat/x --start claude    # set up the worktree, then run a command in it
-wt list                         # every worktree, with dirty and ahead/behind state
+wt list                         # every worktree, with dirty, ahead/behind, and lock state
 wt drop                         # remove the worktree you're in, keep the branch
 wt prune --all --dry-run        # preview cleaning up merged and stale work
 ```
