@@ -26,7 +26,7 @@ use crate::git::{
 use crate::model::Worktree;
 use crate::worktree::{enrich_worktree, enumerate_worktrees, lock_repo};
 
-use assess::{Assessor, Block, MergeTargets, Subject, Verdict};
+use assess::{Assessor, Block, MergeTargets, PrProof, Subject, Verdict};
 
 /// Selects and removes prune candidates after confirmation (spec §7/§12).
 pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
@@ -37,6 +37,8 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     }
     let git = cx.git.clone();
     let git = git.as_ref();
+    let gh = cx.gh.clone();
+    let gh = gh.as_ref();
     let session = open_session(cx, git)?;
     let root = session.primary_root.clone();
     // "Gone" and "still on the remote" are only as true as the remote-tracking
@@ -53,7 +55,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let raws = enumerate(git, &root)?;
     let targets = MergeTargets::resolve(&session.repo);
     let current = current_branch(session.repo.gix());
-    let assessor = Assessor::new(git, &root, &session.repo, args, &targets);
+    let assessor = Assessor::new(git, gh, &root, &session.repo, args, &targets);
     // Every branch tip and detached HEAD in one recoverability check, rather
     // than one `git` per subject.
     let branch_refs: Vec<String> = local_branches(session.repo.gix())?
@@ -191,7 +193,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     // Worktree candidates come first, one at a time; the bare branches left
     // then go in one batch.
     let mut kept: HashSet<&str> = HashSet::new();
-    let mut branches: Vec<&str> = Vec::new();
+    let mut branches: Vec<(&str, Option<&PrProof>)> = Vec::new();
     for verdict in &candidates {
         match &verdict.subject {
             Subject::Worktree {
@@ -214,7 +216,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
                 }
             }
             Subject::Branch { name, .. } if kept.contains(name.as_str()) => {}
-            Subject::Branch { name, .. } => branches.push(name),
+            Subject::Branch { name, via, .. } => branches.push((name, via.as_ref())),
         }
     }
     removed += remove_branches(cx, &removal, &branches)?;
@@ -435,7 +437,15 @@ enum Fate {
 /// upstream), many per call. A branch already gone (deleted with its worktree)
 /// is skipped quietly, and a delete failure is reported per branch and skipped
 /// rather than aborting the whole prune.
-fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Result<usize> {
+///
+/// A branch selection proved merged through a pull request comes with that
+/// [`PrProof`], which is re-checked against its tip now, from local objects:
+/// the pull request's head is not fetched again.
+fn remove_branches(
+    cx: &mut Cx,
+    removal: &Removal<'_, '_>,
+    names: &[(&str, Option<&PrProof>)],
+) -> Result<usize> {
     if names.is_empty() {
         return Ok(0);
     }
@@ -446,7 +456,7 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
         Err(error) => {
             // Which branch is where is unknown, so none is deleted.
             tracing::warn!(%error, "prune: cannot read branch tips");
-            for name in names {
+            for (name, _) in names {
                 cx.err.line(&format!(
                     "skipping {name} (branch): {}",
                     Block::Unreadable.message()
@@ -455,9 +465,13 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
             return Ok(0);
         }
     };
+    let proofs: HashMap<&str, &PrProof> = names
+        .iter()
+        .filter_map(|(name, proof)| Some((*name, (*proof)?)))
+        .collect();
     let present: Vec<(&str, Option<&str>)> = names
         .iter()
-        .filter_map(|name| match tips.get(*name) {
+        .filter_map(|(name, _)| match tips.get(*name) {
             Some(id) => Some((*name, id.as_deref())),
             None => {
                 tracing::debug!(branch = %name, "prune: branch already deleted");
@@ -486,6 +500,9 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
                         || assessor
                             .targets
                             .is_merged(&removal.content, assessor.repo, id)
+                        || proofs.get(name).is_some_and(|proof| {
+                            assessor.pr_head_holds(&removal.content, id, &proof.head)
+                        })
                 });
             let fate = if safe {
                 Fate::Delete
@@ -678,7 +695,9 @@ fn verdict_json(worktrees: &[Worktree], verdict: &Verdict) -> Result<String> {
             }
             Ok(row.to_string())
         }
-        Subject::Branch { name, merged, safe } => Ok(serde_json::json!({
+        Subject::Branch {
+            name, merged, safe, ..
+        } => Ok(serde_json::json!({
             "branch": name,
             "kind": "branch",
             "merged": merged,
@@ -1476,7 +1495,8 @@ mod tests {
     ) {
         let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
         let targets = super::MergeTargets::resolve(&r);
-        let assessor = super::Assessor::new(git, repo.root(), &r, args, &targets);
+        let gh = crate::testutil::FakeGh::unavailable();
+        let assessor = super::Assessor::new(git, &gh, repo.root(), &r, args, &targets);
         f(&assessor);
     }
 

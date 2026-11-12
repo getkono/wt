@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::PruneArgs;
 use crate::error::Result;
+use crate::gh::{GhClient, MergedPr, remote_slug};
 use crate::git::aheadbehind::recoverable_tips;
 use crate::git::cli::GitCli;
 use crate::git::discover::Repo;
@@ -93,6 +94,10 @@ pub(super) enum Reason {
     /// Not an ancestor, but every change is already in the default branch
     /// (a squash or rebase merge, or work split across several merges).
     MergedByContent,
+    /// An older prefix of the head of the merged pull request with this
+    /// number, whose head is itself merged into the default branch (see
+    /// [`PrProof`]).
+    MergedViaPr(u64),
     /// Its branch's upstream was configured and is now gone.
     UpstreamGone,
     /// A worktree whose directory is gone.
@@ -102,15 +107,31 @@ pub(super) enum Reason {
 }
 
 impl Reason {
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(self) -> String {
         match self {
-            Reason::Merged => "merged",
-            Reason::MergedByContent => "merged by content",
-            Reason::UpstreamGone => "upstream gone",
-            Reason::Missing => "missing",
-            Reason::Pushed => "pushed",
+            Reason::Merged => "merged".into(),
+            Reason::MergedByContent => "merged by content".into(),
+            Reason::MergedViaPr(number) => format!("merged via #{number}"),
+            Reason::UpstreamGone => "upstream gone".into(),
+            Reason::Missing => "missing".into(),
+            Reason::Pushed => "pushed".into(),
         }
     }
+}
+
+/// A merged pull request that vouches for a branch no other check could: the
+/// branch's tip is an ancestor of `head`, the commit the pull request's head
+/// pointed at when it merged, and `head` is itself merged into the default
+/// branch. Every commit on the tip is then reachable from `head`, whose work
+/// is in the default branch; `refs/pull/<number>/head` keeps it recoverable
+/// after the branch is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PrProof {
+    /// The pull request's number.
+    pub(super) number: u64,
+    /// Its head commit, fetched from `refs/pull/<number>/head` and equal to
+    /// the head the forge reported.
+    pub(super) head: String,
 }
 
 /// What keeps a qualifying subject, after the flags that override it
@@ -187,11 +208,14 @@ pub(super) enum Subject {
     },
     /// A local branch with no worktree (or whose worktree is being removed under
     /// `--all`). `merged` records whether it is merged into the default branch by
-    /// ancestry or content; `safe` whether deleting it loses no work.
+    /// ancestry, content, or a merged pull request; `safe` whether deleting it
+    /// loses no work. `via` is the pull request that proved it merged when
+    /// nothing else did, so the removal can re-check that proof under the lock.
     Branch {
         name: String,
         merged: bool,
         safe: bool,
+        via: Option<PrProof>,
     },
 }
 
@@ -213,6 +237,9 @@ pub(super) struct Verdict {
 /// fresh.
 pub(super) struct Assessor<'a> {
     pub(super) git: &'a dyn GitCli,
+    /// Asked only for a branch every local check refused (see
+    /// [`Assessor::merged_via_pr`]).
+    gh: &'a dyn GhClient,
     pub(super) root: &'a Path,
     pub(super) repo: &'a Repo,
     pub(super) args: &'a PruneArgs,
@@ -227,6 +254,7 @@ pub(super) struct Assessor<'a> {
 impl<'a> Assessor<'a> {
     pub(super) fn new(
         git: &'a dyn GitCli,
+        gh: &'a dyn GhClient,
         root: &'a Path,
         repo: &'a Repo,
         args: &'a PruneArgs,
@@ -234,6 +262,7 @@ impl<'a> Assessor<'a> {
     ) -> Self {
         Assessor {
             git,
+            gh,
             root,
             repo,
             args,
@@ -478,25 +507,180 @@ impl<'a> Assessor<'a> {
         } else {
             None
         };
-        if by_mode.is_none() && !args.includes_pushed() {
+        // Under `--merged` a branch no check has picked yet may still be
+        // proven merged through its pull request, below.
+        if by_mode.is_none() && !args.includes_pushed() && !args.includes_merged() {
             return None;
         }
         let recoverable = self.recoverable(&tip);
-        let reason = by_mode.or_else(|| recoverable.then_some(Reason::Pushed))?;
         // The content check above only runs under `--merged`; for a branch picked
         // otherwise, run it now, so `merged` (reported in `--json`) and safety do
         // not depend on which flags were passed.
-        let merged = ancestor
+        let merged_locally = ancestor
             || content
             || (!args.includes_merged() && self.targets.has_content_merge(&self.content, &tip));
+        // The pull-request fallback runs only for a branch every check above
+        // refused — merged by neither ancestry nor content, and with work on
+        // no remote — and that some selected mode would take once proven.
+        let via =
+            (!merged_locally && !recoverable && (args.includes_merged() || by_mode.is_some()))
+                .then(|| self.merged_via_pr(&name, &tip))
+                .flatten();
+        let by_mode = match &via {
+            Some(proof) if args.includes_merged() => Some(Reason::MergedViaPr(proof.number)),
+            _ => by_mode,
+        };
+        let reason = by_mode
+            .or_else(|| (args.includes_pushed() && recoverable).then_some(Reason::Pushed))?;
+        let merged = merged_locally || via.is_some();
         let safe = recoverable || merged;
         let block = (!safe && !args.force).then_some(Block::Unsafe);
-        tracing::trace!(branch = %name, ?reason, ancestor, content, gone, recoverable, safe, "prune: branch classified");
+        tracing::trace!(branch = %name, ?reason, ancestor, content, gone, recoverable, via = ?via.as_ref().map(|p| p.number), safe, "prune: branch classified");
         Some(Verdict {
-            subject: Subject::Branch { name, merged, safe },
+            subject: Subject::Branch {
+                name,
+                merged,
+                safe,
+                via,
+            },
             reason,
             block,
         })
+    }
+
+    /// The merged pull request that proves `name` (whose tip is `tip`) merged,
+    /// or `None` — the refusal stands — when there is none, or when it cannot
+    /// be asked: `--no-fetch`, no default branch, no hosted remote the branch
+    /// was pushed to, or `gh` missing, unauthenticated, or offline. Unknown is
+    /// never read as merged.
+    ///
+    /// The forge only names candidates: merged pull requests whose head is
+    /// this branch on the repository it was pushed to (so a fork's same-named
+    /// branch never matches) and whose base is the default branch. Each one's
+    /// head is fetched from `refs/pull/<n>/head` and must equal the head the
+    /// forge reported; the rest is proven locally (see
+    /// [`Self::pr_head_holds`]).
+    pub(super) fn merged_via_pr(&self, name: &str, tip: &str) -> Option<PrProof> {
+        if self.args.no_fetch {
+            tracing::debug!(branch = %name, "prune: --no-fetch; merged-PR lookup skipped");
+            return None;
+        }
+        let default = self.targets.default.as_deref()?;
+        let tip = self.commit_of(tip)?;
+        let Some((remote, (owner, repo_name))) = self.push_remote(name) else {
+            tracing::debug!(branch = %name, "prune: no hosted remote; merged-PR lookup skipped");
+            return None;
+        };
+        let prs = match self.gh.merged_prs_for_branch(self.root, name) {
+            Ok(prs) => prs,
+            Err(error) => {
+                tracing::debug!(branch = %name, %error, "prune: merged-PR lookup failed");
+                return None;
+            }
+        };
+        prs.iter()
+            .filter(|pr| {
+                let matches = pr.state.eq_ignore_ascii_case("merged")
+                    && pr.head_ref_name == name
+                    && pr.base_ref_name == default
+                    && !pr.is_cross_repository
+                    && pr.head_slug().is_some_and(|(o, n)| {
+                        o.eq_ignore_ascii_case(&owner) && n.eq_ignore_ascii_case(&repo_name)
+                    });
+                if !matches {
+                    tracing::debug!(branch = %name, pr = pr.number, "prune: merged PR filtered out");
+                }
+                matches
+            })
+            .find_map(|pr| {
+                let head = self.pin_pr_head(&remote, pr)?;
+                let holds = self.pr_head_holds(&self.content, &tip, &head);
+                tracing::debug!(branch = %name, pr = pr.number, %head, holds, "prune: merged PR checked");
+                holds.then_some(PrProof {
+                    number: pr.number,
+                    head,
+                })
+            })
+    }
+
+    /// The remote `name` pushes to, as git resolves it (`branch.<name>.pushRemote`,
+    /// `remote.pushDefault`, `branch.<name>.remote`, then `origin`), with the
+    /// `(owner, name)` its URL names; `None` when that remote has no hosted URL.
+    fn push_remote(&self, name: &str) -> Option<(String, (String, String))> {
+        let config = self.repo.gix().config_snapshot();
+        let read = |key: String| config.string(key.as_str()).map(|v| v.to_string());
+        let remote = read(format!("branch.{name}.pushRemote"))
+            .or_else(|| read("remote.pushDefault".into()))
+            .or_else(|| read(format!("branch.{name}.remote")))
+            .unwrap_or_else(|| "origin".into());
+        let url = read(format!("remote.{remote}.url"))?;
+        let slug = remote_slug(&url)?;
+        Some((remote, slug))
+    }
+
+    /// Fetches `refs/pull/<n>/head` from `remote` and returns the commit it
+    /// names, when that is the head the forge reported for `pr`. A failed
+    /// fetch, or a head that moved or differs, reads as `None`.
+    fn pin_pr_head(&self, remote: &str, pr: &MergedPr) -> Option<String> {
+        let refspec = format!("refs/pull/{}/head", pr.number);
+        if let Err(error) = self.git.run(
+            self.root,
+            &["fetch", "--quiet", "--no-tags", remote, &refspec],
+        ) {
+            tracing::debug!(pr = pr.number, %error, "prune: cannot fetch the PR head");
+            return None;
+        }
+        let fetched = self
+            .git
+            .run(
+                self.root,
+                &["rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}"],
+            )
+            .ok()?;
+        let fetched = fetched.trim();
+        if pr.head_ref_oid.is_empty() || !fetched.eq_ignore_ascii_case(&pr.head_ref_oid) {
+            tracing::debug!(pr = pr.number, fetched, reported = %pr.head_ref_oid, "prune: PR head differs from the reported one");
+            return None;
+        }
+        Some(fetched.to_string())
+    }
+
+    /// Whether `head` vouches for `tip` (commit ids), proven from local objects
+    /// alone: `tip` is an ancestor of `head`, `head` is merged into a default
+    /// target by ancestry or content ([`MergeTargets::is_merged`]), and `tip`'s
+    /// net diff is not empty. Any failure reads as `false`.
+    pub(super) fn pr_head_holds(&self, content: &ContentCheck<'_>, tip: &str, head: &str) -> bool {
+        let ancestor = self
+            .git
+            .run_raw(self.root, &["merge-base", "--is-ancestor", tip, head])
+            .is_ok_and(|out| out.success);
+        ancestor && self.targets.is_merged(content, self.repo, head) && self.changes_something(tip)
+    }
+
+    /// Whether `tip`'s tree differs from its merge base's with every target —
+    /// a branch whose net effect is empty may hold work no merge carried, so
+    /// it is never vouched for. Any failure reads as `false`.
+    fn changes_something(&self, tip: &str) -> bool {
+        !self.targets.refs.is_empty()
+            && self.targets.refs.iter().all(|target| {
+                let Ok(base) = self.git.run(self.root, &["merge-base", target, tip]) else {
+                    return false;
+                };
+                let base = base.trim();
+                self.git
+                    .run(
+                        self.root,
+                        &[
+                            "rev-parse",
+                            &format!("{base}^{{tree}}"),
+                            &format!("{tip}^{{tree}}"),
+                        ],
+                    )
+                    .is_ok_and(|trees| {
+                        matches!(trees.split_whitespace().collect::<Vec<_>>()[..],
+                                 [base_tree, tip_tree] if base_tree != tip_tree)
+                    })
+            })
     }
 
     /// Whether `branch`'s upstream is configured but its tracking ref is gone.
