@@ -10,8 +10,8 @@ use std::process::Command;
 
 use crate::error::{Error, Result};
 pub use types::{
-    Author, IssueLabel, IssueMilestone, IssueSummary, IssueType, IssueView, OpenPr, PrSummary,
-    PrView, pr_state,
+    Author, HeadRepository, IssueLabel, IssueMilestone, IssueSummary, IssueType, IssueView,
+    MergedPr, OpenPr, PrSummary, PrView, pr_state, remote_slug,
 };
 
 /// Performs GitHub pull-request operations via `gh`.
@@ -57,6 +57,19 @@ pub trait GhClient {
     /// Runs `gh pr edit` with the prebuilt `args`, returning stdout. Args are
     /// typically built by `sendit::build_edit_args`.
     fn edit_pr(&self, dir: &Path, args: &[String]) -> Result<String>;
+
+    /// The merged PRs whose head branch is named `branch`, most recent first.
+    /// The caller filters them by head repository and base, and proves each
+    /// against local git objects before relying on one.
+    ///
+    /// Defaulted for the same reason as [`GhClient::list_open_issues`]: a
+    /// client that does not override it finds nothing, which `wt prune` reads
+    /// as "not proven merged".
+    fn merged_prs_for_branch(&self, _dir: &Path, _branch: &str) -> Result<Vec<MergedPr>> {
+        Err(Error::GhUnavailable(
+            "GitHub merged-PR lookup is not supported by this client".into(),
+        ))
+    }
 
     /// Lists open PR numbers (for completion; best-effort).
     fn open_pr_numbers(&self, dir: &Path) -> Result<Vec<u64>> {
@@ -158,6 +171,24 @@ impl GhClient for RealGh {
         )?;
         let prs: Vec<OpenPr> = serde_json::from_str(&output).map_err(Error::from)?;
         Ok(prs.into_iter().next())
+    }
+
+    fn merged_prs_for_branch(&self, dir: &Path, branch: &str) -> Result<Vec<MergedPr>> {
+        let output = run_gh(
+            dir,
+            &[
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "merged",
+                "--json",
+                "number,state,headRefName,headRefOid,baseRefName,headRepository,\
+                 headRepositoryOwner,isCrossRepository",
+            ],
+        )?;
+        serde_json::from_str(&output).map_err(Error::from)
     }
 
     fn create_pr(&self, dir: &Path, args: &[String]) -> Result<String> {

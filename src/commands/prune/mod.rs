@@ -26,7 +26,7 @@ use crate::git::{
 use crate::model::Worktree;
 use crate::worktree::{enrich_worktree, enumerate_worktrees, lock_repo};
 
-use assess::{Assessor, Block, MergeTargets, Subject, Verdict};
+use assess::{Assessor, Block, MergeTargets, PrProof, Subject, Verdict};
 
 /// Selects and removes prune candidates after confirmation (spec §7/§12).
 pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
@@ -37,6 +37,8 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     }
     let git = cx.git.clone();
     let git = git.as_ref();
+    let gh = cx.gh.clone();
+    let gh = gh.as_ref();
     let session = open_session(cx, git)?;
     let root = session.primary_root.clone();
     // "Gone" and "still on the remote" are only as true as the remote-tracking
@@ -53,7 +55,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     let raws = enumerate(git, &root)?;
     let targets = MergeTargets::resolve(&session.repo);
     let current = current_branch(session.repo.gix());
-    let assessor = Assessor::new(git, &root, &session.repo, args, &targets);
+    let assessor = Assessor::new(git, gh, &root, &session.repo, args, &targets);
     // Every branch tip and detached HEAD in one recoverability check, rather
     // than one `git` per subject.
     let branch_refs: Vec<String> = local_branches(session.repo.gix())?
@@ -191,7 +193,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
     // Worktree candidates come first, one at a time; the bare branches left
     // then go in one batch.
     let mut kept: HashSet<&str> = HashSet::new();
-    let mut branches: Vec<&str> = Vec::new();
+    let mut branches: Vec<(&str, Option<&PrProof>)> = Vec::new();
     for verdict in &candidates {
         match &verdict.subject {
             Subject::Worktree {
@@ -214,7 +216,7 @@ pub(crate) fn run(cx: &mut Cx, args: &PruneArgs, json: bool) -> Result<u8> {
                 }
             }
             Subject::Branch { name, .. } if kept.contains(name.as_str()) => {}
-            Subject::Branch { name, .. } => branches.push(name),
+            Subject::Branch { name, via, .. } => branches.push((name, via.as_ref())),
         }
     }
     removed += remove_branches(cx, &removal, &branches)?;
@@ -435,7 +437,15 @@ enum Fate {
 /// upstream), many per call. A branch already gone (deleted with its worktree)
 /// is skipped quietly, and a delete failure is reported per branch and skipped
 /// rather than aborting the whole prune.
-fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Result<usize> {
+///
+/// A branch selection proved merged through a pull request comes with that
+/// [`PrProof`], which is re-checked against its tip now, from local objects:
+/// the pull request's head is not fetched again.
+fn remove_branches(
+    cx: &mut Cx,
+    removal: &Removal<'_, '_>,
+    names: &[(&str, Option<&PrProof>)],
+) -> Result<usize> {
     if names.is_empty() {
         return Ok(0);
     }
@@ -446,7 +456,7 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
         Err(error) => {
             // Which branch is where is unknown, so none is deleted.
             tracing::warn!(%error, "prune: cannot read branch tips");
-            for name in names {
+            for (name, _) in names {
                 cx.err.line(&format!(
                     "skipping {name} (branch): {}",
                     Block::Unreadable.message()
@@ -455,9 +465,13 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
             return Ok(0);
         }
     };
+    let proofs: HashMap<&str, &PrProof> = names
+        .iter()
+        .filter_map(|(name, proof)| Some((*name, (*proof)?)))
+        .collect();
     let present: Vec<(&str, Option<&str>)> = names
         .iter()
-        .filter_map(|name| match tips.get(*name) {
+        .filter_map(|(name, _)| match tips.get(*name) {
             Some(id) => Some((*name, id.as_deref())),
             None => {
                 tracing::debug!(branch = %name, "prune: branch already deleted");
@@ -486,6 +500,9 @@ fn remove_branches(cx: &mut Cx, removal: &Removal<'_, '_>, names: &[&str]) -> Re
                         || assessor
                             .targets
                             .is_merged(&removal.content, assessor.repo, id)
+                        || proofs.get(name).is_some_and(|proof| {
+                            assessor.pr_head_holds(&removal.content, id, &proof.head)
+                        })
                 });
             let fate = if safe {
                 Fate::Delete
@@ -678,7 +695,9 @@ fn verdict_json(worktrees: &[Worktree], verdict: &Verdict) -> Result<String> {
             }
             Ok(row.to_string())
         }
-        Subject::Branch { name, merged, safe } => Ok(serde_json::json!({
+        Subject::Branch {
+            name, merged, safe, ..
+        } => Ok(serde_json::json!({
             "branch": name,
             "kind": "branch",
             "merged": merged,
@@ -1476,7 +1495,8 @@ mod tests {
     ) {
         let r = crate::git::discover::Repo::discover(repo.root()).unwrap();
         let targets = super::MergeTargets::resolve(&r);
-        let assessor = super::Assessor::new(git, repo.root(), &r, args, &targets);
+        let gh = crate::testutil::FakeGh::unavailable();
+        let assessor = super::Assessor::new(git, &gh, repo.root(), &r, args, &targets);
         f(&assessor);
     }
 
@@ -2635,5 +2655,352 @@ mod tests {
         assert_eq!(pushed["merged"], serde_json::json!(true));
         let all = json_branch(&repo, &all_dry_run(), "feat").expect("merged");
         assert_eq!(all["merged"], serde_json::json!(true));
+    }
+
+    /// A [`crate::gh::GhClient`] whose merged-PR lookup returns `prs` whatever
+    /// the branch, counting the lookups; everything else is unavailable.
+    struct MergedPrs {
+        prs: Vec<crate::gh::MergedPr>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MergedPrs {
+        fn new(prs: Vec<crate::gh::MergedPr>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(MergedPrs {
+                prs,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl crate::gh::GhClient for MergedPrs {
+        fn merged_prs_for_branch(
+            &self,
+            _dir: &std::path::Path,
+            _branch: &str,
+        ) -> crate::error::Result<Vec<crate::gh::MergedPr>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.prs.clone())
+        }
+        fn list_open_prs(
+            &self,
+            _dir: &std::path::Path,
+        ) -> crate::error::Result<Vec<crate::gh::PrSummary>> {
+            Err(Error::GhUnavailable("fake".into()))
+        }
+        fn view_pr(
+            &self,
+            _dir: &std::path::Path,
+            _target: &str,
+        ) -> crate::error::Result<crate::gh::PrView> {
+            Err(Error::GhUnavailable("fake".into()))
+        }
+        fn default_branch(&self, _dir: &std::path::Path) -> crate::error::Result<Option<String>> {
+            Ok(None)
+        }
+        fn find_pr_for_branch(
+            &self,
+            _dir: &std::path::Path,
+            _branch: &str,
+        ) -> crate::error::Result<Option<crate::gh::OpenPr>> {
+            Err(Error::GhUnavailable("fake".into()))
+        }
+        fn create_pr(
+            &self,
+            _dir: &std::path::Path,
+            _args: &[String],
+        ) -> crate::error::Result<String> {
+            Err(Error::GhUnavailable("fake".into()))
+        }
+        fn edit_pr(
+            &self,
+            _dir: &std::path::Path,
+            _args: &[String],
+        ) -> crate::error::Result<String> {
+            Err(Error::GhUnavailable("fake".into()))
+        }
+    }
+
+    /// A merged PR from `feat` on `o/r` into `main`, with head `head`.
+    fn merged_pr(number: u64, head: &str) -> crate::gh::MergedPr {
+        crate::gh::MergedPr {
+            number,
+            state: "MERGED".into(),
+            head_ref_name: "feat".into(),
+            head_ref_oid: head.into(),
+            base_ref_name: "main".into(),
+            head_repository: Some(crate::gh::HeadRepository { name: "r".into() }),
+            head_repository_owner: Some(crate::gh::Author { login: "o".into() }),
+            is_cross_repository: false,
+        }
+    }
+
+    /// A clone of `https://github.com/o/r` (served from a local bare repo)
+    /// where `feat` was pushed, then gained a commit from another clone that
+    /// this one never fetched (PR #7's head, `refs/pull/7/head`), was
+    /// squash-merged into `main`, and had its remote branch deleted. `feat`'s
+    /// own commit is empty when `empty_tip`. Returns (local, remote, PR head).
+    fn squash_merged_pr_prefix(empty_tip: bool) -> (TestRepo, TestRepo, String) {
+        let remote = TestRepo::init_bare();
+        let repo = TestRepo::init();
+        let url = "https://github.com/o/r.git";
+        repo.git(&["remote", "add", "origin", url]);
+        let served = remote.root().to_str().unwrap();
+        repo.git(&["config", &format!("url.{served}.insteadOf"), url]);
+        repo.git(&["push", "-q", "origin", "main"]);
+        repo.git(&["remote", "set-head", "origin", "main"]);
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        if empty_tip {
+            repo.git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        } else {
+            repo.write("feat.txt", "first\n");
+            repo.commit_all("first");
+        }
+        repo.git(&["push", "-q", "-u", "origin", "feat"]);
+        repo.git(&["checkout", "-q", "-b", "elsewhere"]);
+        repo.write("feat.txt", "first\nsecond\n");
+        repo.commit_all("second");
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["push", "-q", "origin", "HEAD:refs/pull/7/head"]);
+        repo.git(&["checkout", "-q", "main"]);
+        squash_into_main(&repo, "elsewhere");
+        repo.git(&["branch", "-q", "-D", "elsewhere"]);
+        repo.git(&["push", "-q", "origin", "main", ":feat"]);
+        (repo, remote, head)
+    }
+
+    /// Runs prune over `repo` with `gh`, answering any prompt with `-y`, and
+    /// returns (stdout, stderr).
+    fn run_with_gh(
+        repo: &TestRepo,
+        gh: std::sync::Arc<dyn crate::gh::GhClient + Send + Sync>,
+        args: &PruneArgs,
+        json: bool,
+    ) -> (String, String) {
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = gh;
+        t.cx.assume_yes = true;
+        super::run(&mut t.cx, args, json).unwrap();
+        (t.out.contents(), t.err.contents())
+    }
+
+    const UNSAFE: &str = "skipping feat (branch): has work on no remote";
+
+    #[test]
+    fn a_prefix_of_a_squash_merged_pr_is_pruned_as_merged_via_it() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        // Without `gh` nothing can prove it: today's refusal stands.
+        let unavailable = std::sync::Arc::new(crate::testutil::FakeGh::unavailable());
+        let (_, err) = run_with_gh(&repo, unavailable, &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+
+        // A branch never pushed has no pull request to ask about.
+        diverged_branch(&repo, "wip");
+        let gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let dry = prune_args(true, false, true, false);
+        let (out, _) = run_with_gh(&repo, gh.clone(), &dry, false);
+        assert!(
+            out.contains("would remove feat (branch): merged via #7"),
+            "{out}"
+        );
+        assert!(!out.contains("wip"), "{out}");
+        assert_eq!(gh.calls(), 1);
+        // The real run re-checks the proof under the lock, and deletes it.
+        let (_, err) = run_with_gh(&repo, gh, &prune_args(true, false, false, false), false);
+        assert!(err.contains("feat (branch): merged via #7"), "{err}");
+        assert!(err.contains("pruned 1 item(s)"), "{err}");
+        assert!(!has_branch(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_pr_proven_branch_is_merged_and_safe_in_json_whatever_the_mode() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        let gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let (out, _) = run_with_gh(&repo, gh.clone(), &all_dry_run(), true);
+        let row: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(row["reason"], serde_json::json!("merged via #7"));
+        assert_eq!(row["merged"], serde_json::json!(true));
+        assert_eq!(row["safe"], serde_json::json!(true));
+        // `--gone` picks it as gone, and the proof makes it safe to delete.
+        let gone = PruneArgs {
+            gone: true,
+            ..prune_args(false, false, true, false)
+        };
+        let (out, err) = run_with_gh(&repo, gh, &gone, false);
+        assert!(
+            out.contains("would remove feat (branch): upstream gone"),
+            "{out}{err}"
+        );
+        assert!(!err.contains(UNSAFE), "{err}");
+    }
+
+    #[test]
+    fn no_fetch_never_asks_the_forge() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        let gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let args = PruneArgs {
+            no_fetch: true,
+            ..all_dry_run()
+        };
+        let (_, err) = run_with_gh(&repo, gh.clone(), &args, false);
+        assert!(err.contains(UNSAFE), "{err}");
+        assert_eq!(gh.calls(), 0);
+    }
+
+    #[test]
+    fn a_merged_pr_that_does_not_match_the_branch_proves_nothing() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        let main = repo.git(&["rev-parse", "main"]).trim().to_string();
+        let variants: Vec<(&str, crate::gh::MergedPr)> = vec![
+            // A newer PR reusing the name, not merged.
+            (
+                "open",
+                crate::gh::MergedPr {
+                    state: "OPEN".into(),
+                    ..merged_pr(7, &head)
+                },
+            ),
+            (
+                "other head branch",
+                crate::gh::MergedPr {
+                    head_ref_name: "other".into(),
+                    ..merged_pr(7, &head)
+                },
+            ),
+            (
+                "non-default base",
+                crate::gh::MergedPr {
+                    base_ref_name: "release".into(),
+                    ..merged_pr(7, &head)
+                },
+            ),
+            (
+                "fork",
+                crate::gh::MergedPr {
+                    is_cross_repository: true,
+                    ..merged_pr(7, &head)
+                },
+            ),
+            (
+                "same-named branch on another owner",
+                crate::gh::MergedPr {
+                    head_repository_owner: Some(crate::gh::Author {
+                        login: "fork".into(),
+                    }),
+                    ..merged_pr(7, &head)
+                },
+            ),
+            (
+                "deleted head repository",
+                crate::gh::MergedPr {
+                    head_repository: None,
+                    ..merged_pr(7, &head)
+                },
+            ),
+            // `refs/pull/7/head` is not the head the forge reported.
+            ("reported head differs", merged_pr(7, &main)),
+            ("no reported head", merged_pr(7, "")),
+            // No such PR ref to fetch.
+            ("unfetchable head", merged_pr(70, &head)),
+        ];
+        for (what, pr) in variants {
+            let gh = MergedPrs::new(vec![pr]);
+            let (out, err) = run_with_gh(&repo, gh, &all_dry_run(), false);
+            assert!(err.contains(UNSAFE), "{what}: {out}{err}");
+        }
+        assert!(has_branch(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_tip_the_merged_pr_head_does_not_contain_is_refused() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        // A PR force-pushed over the local history: its head (merged, as
+        // main itself) does not contain the tip.
+        repo.git(&["push", "-q", "origin", "main:refs/pull/8/head"]);
+        let main = repo.git(&["rev-parse", "main"]).trim().to_string();
+        let gh = MergedPrs::new(vec![merged_pr(8, &main)]);
+        let (_, err) = run_with_gh(&repo, gh, &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+        // Local commits made after the last push to the PR.
+        repo.git(&["checkout", "-q", "feat"]);
+        repo.write("late.txt", "late\n");
+        repo.commit_all("late");
+        repo.git(&["checkout", "-q", "main"]);
+        let gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let (_, err) = run_with_gh(&repo, gh, &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+    }
+
+    #[test]
+    fn a_merged_pr_whose_head_is_not_in_the_default_branch_is_refused() {
+        // The forge says merged, but the head's work is not in main.
+        let (repo, _remote, _) = squash_merged_pr_prefix(false);
+        repo.git(&["checkout", "-q", "-b", "unmerged", "feat"]);
+        repo.write("other.txt", "never merged\n");
+        repo.commit_all("unmerged");
+        let unmerged = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["push", "-q", "origin", "HEAD:refs/pull/9/head"]);
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["branch", "-q", "-D", "unmerged"]);
+        let gh = MergedPrs::new(vec![merged_pr(9, &unmerged)]);
+        let (_, err) = run_with_gh(&repo, gh, &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+    }
+
+    #[test]
+    fn a_tip_with_an_empty_net_diff_is_never_vouched_for() {
+        let (repo, _remote, head) = squash_merged_pr_prefix(true);
+        let gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let (_, err) = run_with_gh(&repo, gh, &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+    }
+
+    #[test]
+    fn the_first_merged_pr_that_proves_the_branch_is_the_one_reported() {
+        // The name was reused: an older merged PR does not hold the tip, the
+        // later one does.
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        repo.git(&["push", "-q", "origin", "main:refs/pull/3/head"]);
+        let main = repo.git(&["rev-parse", "main"]).trim().to_string();
+        let gh = MergedPrs::new(vec![merged_pr(3, &main), merged_pr(7, &head)]);
+        let (out, _) = run_with_gh(&repo, gh, &prune_args(true, false, true, false), false);
+        assert!(
+            out.contains("would remove feat (branch): merged via #7"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_pr_proof_that_fails_under_the_lock_keeps_the_branch() {
+        // Main drops the squash commit while the prompt waits, locally and in
+        // its tracking ref, so the PR head is no longer merged.
+        let (repo, _remote, head) = squash_merged_pr_prefix(false);
+        let mut t = crate::testutil::test_cx(&[], repo.root().to_str().unwrap());
+        t.cx.gh = MergedPrs::new(vec![merged_pr(7, &head)]);
+        let root = repo.root().to_path_buf();
+        t.cx.input = Box::new(ActsThenConfirms(Box::new(move || {
+            repo_git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+            repo_git(&root, &["update-ref", "refs/remotes/origin/main", "main"]);
+        })));
+        super::run(&mut t.cx, &prune_args(true, false, false, false), false).unwrap();
+        let err = t.err.contents();
+        assert!(err.contains("feat (branch): merged via #7"), "{err}");
+        assert!(err.contains(UNSAFE), "{err}");
+        assert!(has_branch(&repo, "feat"));
+    }
+
+    #[test]
+    fn a_branch_without_a_hosted_remote_never_asks_the_forge() {
+        // A local-path remote names no repository to look the PR up in.
+        let (repo, _remote) = repo_with_remote();
+        repo.git(&["push", "-q", "origin", ":feat"]);
+        let gh = MergedPrs::new(vec![merged_pr(7, "0000")]);
+        let (_, err) = run_with_gh(&repo, gh.clone(), &all_dry_run(), false);
+        assert!(err.contains(UNSAFE), "{err}");
+        assert_eq!(gh.calls(), 0);
     }
 }

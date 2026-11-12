@@ -364,7 +364,11 @@ pub(crate) struct DropArgs {
 pub(crate) struct PruneArgs {
     /// Include worktrees (detached ones too) and branches merged into the default
     /// branch (local or its `origin` tracking ref), by ancestry or by content — a
-    /// squash or rebase merge counts.
+    /// squash or rebase merge counts. A branch whose upstream is gone and that
+    /// neither check proves is also merged when its tip is in the head of a pull
+    /// request merged into the default branch: that proof asks `gh` for the
+    /// branch's merged pull requests and fetches `refs/pull/N/head`, so it uses
+    /// the network unless `--no-fetch` is given.
     #[arg(long)]
     pub(crate) merged: bool,
     /// Include worktrees and branches whose upstream is gone, and missing worktrees.
@@ -376,14 +380,17 @@ pub(crate) struct PruneArgs {
     pub(crate) pushed: bool,
     /// Include everything deletable without losing work: merged, gone, and pushed
     /// candidates, where a branch counts as safe when its commits are on a remote
-    /// or its changes are already in the default branch.
+    /// or its changes are already in the default branch, or a merged pull request
+    /// proves it merged (as for `--merged`, over the network).
     #[arg(short = 'a', long)]
     pub(crate) all: bool,
     /// Also remove locked worktrees (`git worktree remove --force --force`).
     /// Without it they are listed and skipped.
     #[arg(long)]
     pub(crate) locked: bool,
-    /// Trust the last fetch instead of running `git fetch --all --prune` first.
+    /// Stay offline: trust the last fetch instead of running
+    /// `git fetch --all --prune` first, and skip the merged pull request proof
+    /// (its `gh` lookup and `refs/pull/N/head` fetch).
     #[arg(long = "no-fetch")]
     pub(crate) no_fetch: bool,
     /// Report candidates without removing anything.
@@ -912,7 +919,9 @@ mod tests {
         let pushed = prune(&["prune", "--pushed"]);
         assert!(pushed.includes_pushed());
         assert!(!pushed.includes_merged() && !pushed.includes_gone());
-        // Remote-reading modes fetch unless told not to; `--merged` stays offline.
+        // Remote-reading modes fetch unless told not to. `--merged` runs no
+        // `git fetch --all`, though its merged pull request proof still uses the
+        // network unless `--no-fetch` is given.
         assert!(pushed.needs_fetch());
         assert!(prune(&["prune", "--gone"]).needs_fetch());
         assert!(!prune(&["prune", "--merged"]).needs_fetch());
