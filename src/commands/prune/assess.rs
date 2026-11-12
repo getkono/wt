@@ -507,9 +507,9 @@ impl<'a> Assessor<'a> {
         } else {
             None
         };
-        // Under `--merged` a branch no check has picked yet may still be
+        // Under `--merged` a gone branch no check has picked yet may still be
         // proven merged through its pull request, below.
-        if by_mode.is_none() && !args.includes_pushed() && !args.includes_merged() {
+        if by_mode.is_none() && !args.includes_pushed() && !(args.includes_merged() && gone) {
             return None;
         }
         let recoverable = self.recoverable(&tip);
@@ -521,11 +521,15 @@ impl<'a> Assessor<'a> {
             || (!args.includes_merged() && self.targets.has_content_merge(&self.content, &tip));
         // The pull-request fallback runs only for a branch every check above
         // refused — merged by neither ancestry nor content, and with work on
-        // no remote — and that some selected mode would take once proven.
-        let via =
-            (!merged_locally && !recoverable && (args.includes_merged() || by_mode.is_some()))
-                .then(|| self.merged_via_pr(&name, &tip))
-                .flatten();
+        // no remote — whose upstream is gone (the shape a merge that deleted
+        // the remote branch leaves; a branch never pushed has no pull request
+        // to ask about), and that some selected mode would take once proven.
+        let via = (gone
+            && !merged_locally
+            && !recoverable
+            && (args.includes_merged() || by_mode.is_some()))
+        .then(|| self.merged_via_pr(&name, &tip))
+        .flatten();
         let by_mode = match &via {
             Some(proof) if args.includes_merged() => Some(Reason::MergedViaPr(proof.number)),
             _ => by_mode,
@@ -550,12 +554,12 @@ impl<'a> Assessor<'a> {
 
     /// The merged pull request that proves `name` (whose tip is `tip`) merged,
     /// or `None` — the refusal stands — when there is none, or when it cannot
-    /// be asked: `--no-fetch`, no default branch, no hosted remote the branch
-    /// was pushed to, or `gh` missing, unauthenticated, or offline. Unknown is
-    /// never read as merged.
+    /// be asked: `--no-fetch`, no default branch, no hosted remote the branch's
+    /// upstream was on, or `gh` missing, unauthenticated, or offline. Unknown
+    /// is never read as merged.
     ///
     /// The forge only names candidates: merged pull requests whose head is
-    /// this branch on the repository it was pushed to (so a fork's same-named
+    /// this branch on the repository its upstream was on (so a fork's same-named
     /// branch never matches) and whose base is the default branch. Each one's
     /// head is fetched from `refs/pull/<n>/head` and must equal the head the
     /// forge reported; the rest is proven locally (see
@@ -567,7 +571,7 @@ impl<'a> Assessor<'a> {
         }
         let default = self.targets.default.as_deref()?;
         let tip = self.commit_of(tip)?;
-        let Some((remote, (owner, repo_name))) = self.push_remote(name) else {
+        let Some((remote, (owner, repo_name))) = self.upstream_remote(name) else {
             tracing::debug!(branch = %name, "prune: no hosted remote; merged-PR lookup skipped");
             return None;
         };
@@ -603,16 +607,13 @@ impl<'a> Assessor<'a> {
             })
     }
 
-    /// The remote `name` pushes to, as git resolves it (`branch.<name>.pushRemote`,
-    /// `remote.pushDefault`, `branch.<name>.remote`, then `origin`), with the
-    /// `(owner, name)` its URL names; `None` when that remote has no hosted URL.
-    fn push_remote(&self, name: &str) -> Option<(String, (String, String))> {
+    /// The remote `name`'s upstream was on (`branch.<name>.remote`), with the
+    /// `(owner, name)` its URL names; `None` when there is no such remote or
+    /// its URL is not a hosted one.
+    fn upstream_remote(&self, name: &str) -> Option<(String, (String, String))> {
         let config = self.repo.gix().config_snapshot();
         let read = |key: String| config.string(key.as_str()).map(|v| v.to_string());
-        let remote = read(format!("branch.{name}.pushRemote"))
-            .or_else(|| read("remote.pushDefault".into()))
-            .or_else(|| read(format!("branch.{name}.remote")))
-            .unwrap_or_else(|| "origin".into());
+        let remote = read(format!("branch.{name}.remote"))?;
         let url = read(format!("remote.{remote}.url"))?;
         let slug = remote_slug(&url)?;
         Some((remote, slug))
