@@ -11,6 +11,12 @@ release. See [RELEASING.md](RELEASING.md) for the process.
 
 ## [Unreleased]
 
+## [1.10.0](https://github.com/getkono/wt/compare/v1.9.0...v1.10.0) - 2026-11-12
+
+### Added
+
+- *(prune)* recognise a branch whose tip is a prefix of a squash-merged PR ([#133](https://github.com/getkono/wt/pull/133))
+
 ## [1.9.0](https://github.com/getkono/wt/compare/v1.8.1...v1.9.0) - 2026-11-10
 
 ### Added
